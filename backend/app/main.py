@@ -28,7 +28,7 @@ from PIL import Image as PillowImage
 from PIL import ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
+from telethon.errors import FloodWaitError, RPCError, RpcCallFailError, SessionPasswordNeededError, TimedOutError
 
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
@@ -45,6 +45,7 @@ TASK_WORKERS: dict[int, asyncio.Task[None]] = {}
 DOWNLOAD_DISPATCHER: asyncio.Task[None] | None = None
 THUMBNAIL_WORKER: asyncio.Task[None] | None = None
 DOWNLOAD_CLIENT: TelegramClient | None = None
+DOWNLOAD_CLIENT_RESET_REQUESTED = False
 DOWNLOAD_RUNNING: dict[tuple[int, int], asyncio.Task[None]] = {}
 DOWNLOAD_REQUEUED_CANCELS: set[tuple[int, int]] = set()
 DOWNLOAD_WAKE = asyncio.Event()
@@ -397,8 +398,14 @@ async def open_telegram_client() -> TelegramClient:
         api_id,
         api_hash,
         receive_updates=False,
-        auto_reconnect=False,
-        connection_retries=1,
+        # Downloads can use a different Telegram data centre from the one used
+        # for login. Keep the long-lived download client able to reconnect and
+        # retain the final RPC error so retry classification is not reduced to
+        # Telethon's generic "Request was unsuccessful" ValueError.
+        auto_reconnect=True,
+        connection_retries=5,
+        request_retries=5,
+        raise_last_call_error=True,
     )
     try:
         await client.connect()
@@ -1540,6 +1547,43 @@ async def close_download_client() -> None:
             log_event(logging.INFO, "download.client_closed", "Telegram download client closed")
 
 
+def request_download_client_reset(task_id: int, media_id: int) -> None:
+    """Stop dispatching new work until the shared client can be safely replaced."""
+    global DOWNLOAD_CLIENT_RESET_REQUESTED
+    if DOWNLOAD_CLIENT_RESET_REQUESTED:
+        return
+    DOWNLOAD_CLIENT_RESET_REQUESTED = True
+    log_event(
+        logging.WARNING,
+        "download.client_reset_requested",
+        "Telegram download client will be rebuilt after active downloads finish",
+        task_id=task_id,
+        media_id=media_id,
+        active_download_count=len(DOWNLOAD_RUNNING),
+    )
+    notify_download_dispatcher()
+
+
+async def reset_download_client_if_requested() -> None:
+    """Close the shared client only after no worker can still be using it."""
+    global DOWNLOAD_CLIENT, DOWNLOAD_CLIENT_RESET_REQUESTED
+    if not DOWNLOAD_CLIENT_RESET_REQUESTED or DOWNLOAD_RUNNING:
+        return
+    try:
+        await close_download_client()
+        log_event(logging.INFO, "download.client_reset_completed", "Telegram download client reset completed")
+    except Exception as error:
+        # A failed disconnect must not block the next retry from constructing a
+        # fresh client. close_download_client clears the reference only after
+        # its disconnect call, so clear it explicitly on this recovery path.
+        async with DOWNLOAD_CLIENT_LOCK:
+            DOWNLOAD_CLIENT = None
+        log_event(logging.WARNING, "download.client_reset_failed", "Telegram download client reset failed; a new client will be opened for retry", exc_info=True, error_type=type(error).__name__)
+    finally:
+        DOWNLOAD_CLIENT_RESET_REQUESTED = False
+        notify_download_dispatcher()
+
+
 def claim_next_media(task_id: int) -> sqlite3.Row | None:
     timestamp = now()
     with connection() as db:
@@ -1600,6 +1644,8 @@ def classify_download_error(error: Exception) -> tuple[str, bool, str]:
         return "AUTH", False, "Telegram 登录已失效，请重新连接账号后重试"
     if name in {"FileReferenceExpiredError", "FileReferenceInvalidError", "FileIdInvalidError", "LocationInvalidError", "MessageIdInvalidError", "ChannelPrivateError", "ChannelInvalidError"} or "消息已不可用" in str(error):
         return "UNAVAILABLE", False, "文件不可用、已删除或当前账号无访问权限"
+    if isinstance(error, (RpcCallFailError, TimedOutError)):
+        return "TELEGRAM_SERVER", True, "Telegram 服务暂时无法处理下载请求，将自动重试"
     if isinstance(error, (OSError, asyncio.TimeoutError)) or isinstance(error, RPCError):
         return "NETWORK", True, "网络或 Telegram 服务暂时不可用，将自动重试"
     return "UNKNOWN", True, "下载发生临时错误，将自动重试"
@@ -1721,6 +1767,8 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             return
         category, recoverable, message = classify_download_error(error)
         log_event(logging.ERROR if not recoverable else logging.WARNING, "download.failed", "Telegram media download failed", exc_info=True, task_id=task_id, media_id=media_id, error_type=type(error).__name__, failure_category=category, recoverable=recoverable)
+        if isinstance(error, TimedOutError):
+            request_download_client_reset(task_id, media_id)
         if category == "AUTH":
             mark_session_invalid()
             update_media(task_id, media_id, status="RETRY_WAIT", speed_bytes_per_second=0, failure_category=category, error_message=message)
@@ -1734,11 +1782,12 @@ async def download_media_job(task_id: int, media_id: int) -> None:
                 update_media(task_id, media_id, status="FAILED", attempt_count=attempts, speed_bytes_per_second=0, failure_category=category, error_message="自动重试 3 次后仍失败，可手动重试")
             else:
                 retry_at = datetime.now(UTC) + timedelta(seconds=RETRY_DELAYS_SECONDS[attempts - 1])
-                update_media(task_id, media_id, status="RETRY_WAIT", attempt_count=attempts, speed_bytes_per_second=0, next_retry_at=retry_at.isoformat(), failure_category=category, error_message=f"{message}，将在 {RETRY_DELAYS_SECONDS[attempts - 1]} 秒后自动重试（第 {attempts}/3 次）")
+                update_media(task_id, media_id, status="RETRY_WAIT", attempt_count=attempts, speed_bytes_per_second=0, next_retry_at=retry_at.isoformat(), failure_category=category, error_message=f"{message}（第 {attempts}/3 次）")
         else:
             update_media(task_id, media_id, status="FAILED", speed_bytes_per_second=0, failure_category=category, error_message=message)
     finally:
         DOWNLOAD_RUNNING.pop((task_id, media_id), None)
+        await reset_download_client_if_requested()
         finalize_task_status(task_id)
         notify_download_dispatcher()
 
@@ -1764,7 +1813,7 @@ async def download_dispatcher() -> None:
                     DOWNLOAD_LAST_ERROR_AT = monotonic_now
                     log_event(logging.INFO, "download.concurrency_recovered", "Download concurrency increased after stability window", previous_effective_concurrency=previous, effective_concurrency=DOWNLOAD_EFFECTIVE_CONCURRENCY)
             slots = max(0, DOWNLOAD_EFFECTIVE_CONCURRENCY - len(DOWNLOAD_RUNNING))
-            if slots and not DOWNLOAD_FLOOD_UNTIL and (DEMO_MODE or app_state()["accountConnected"]):
+            if slots and not DOWNLOAD_FLOOD_UNTIL and not DOWNLOAD_CLIENT_RESET_REQUESTED and (DEMO_MODE or app_state()["accountConnected"]):
                 task_ids = eligible_task_ids()
                 if task_ids:
                     offset = DOWNLOAD_ROUND_ROBIN_OFFSET % len(task_ids)
