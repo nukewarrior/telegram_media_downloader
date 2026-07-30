@@ -18,17 +18,17 @@ const loginHint = ref('')
 const error = ref('')
 const loginBusy = ref(false)
 
-const activeTask = computed(() => tasks.value.find((task) => task.status === 'DOWNLOADING'))
-const recentTasks = computed(() => tasks.value.filter((task) => task.status !== 'DOWNLOADING'))
+const activeTask = computed(() => tasks.value.find((task) => ['DOWNLOADING', 'RETRYING', 'WAITING_RATE_LIMIT'].includes(task.status)))
+const recentTasks = computed(() => tasks.value.filter((task) => !['DOWNLOADING', 'RETRYING', 'WAITING_RATE_LIMIT'].includes(task.status)))
 
-const statusLabel: Record<string, string> = { DOWNLOADING: '进行中', PAUSED: '已暂停', COMPLETED: '已完成', FAILED: '失败', PARTIAL_FAILED: '部分失败', QUEUED: '等待中', CANCELLED: '已取消' }
-function bytes(value: number) { return value >= 1_000_000_000 ? `${(value / 1_000_000_000).toFixed(1)} GB` : `${Math.max(1, Math.round(value / 1_000_000))} MB` }
+const statusLabel: Record<string, string> = { SCANNING: '正在扫描', DOWNLOADING: '进行中', RETRYING: '等待自动重试', WAITING_RATE_LIMIT: 'Telegram 限流等待', PAUSED: '已暂停', COMPLETED: '已完成', FAILED: '失败', PARTIAL_FAILED: '部分失败', QUEUED: '等待中', CANCELLED: '已取消' }
+function bytes(value: number) { return value >= 1_000_000_000 ? `${(value / 1_000_000_000).toFixed(1)} GB` : value >= 1_000_000 ? `${Math.round(value / 1_000_000)} MB` : value >= 1_000 ? `${Math.round(value / 1_000)} KB` : `${value} B` }
 function percent(task: Task) { return task.total_bytes ? Math.min(100, Math.round(task.downloaded_bytes / task.total_bytes * 100)) : 0 }
 function statusClass(status: string) { return `status-${status.toLowerCase()}` }
 
-async function load() {
-  loading.value = true
-  try { tasks.value = await api.tasks() } finally { loading.value = false }
+async function load(showLoading = true) {
+  if (showLoading) loading.value = true
+  try { tasks.value = await api.tasks() } finally { if (showLoading) loading.value = false }
 }
 async function taskAction(task: Task, action: 'pause' | 'resume') { await api.action(task.id, action); await load() }
 function closeLogin() {
@@ -54,7 +54,9 @@ async function verifyPassword() {
   error.value = ''; loginBusy.value = true
   try { await api.verifyPassword(attemptId.value, password.value); closeLogin(); emit('state-changed'); await load() } catch (reason) { error.value = reason instanceof Error ? reason.message : '密码无效' } finally { loginBusy.value = false }
 }
-onMounted(load)
+onMounted(async () => {
+  await load()
+})
 </script>
 
 <template>
