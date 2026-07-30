@@ -5,8 +5,10 @@ import os
 import shutil
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 TEST_DATA = Path(tempfile.mkdtemp(prefix="source-browser-test-"))
 os.environ["DATA_DIR"] = str(TEST_DATA)
@@ -78,6 +80,70 @@ class SourceBrowserTests(unittest.TestCase):
         with main.connection() as db:
             self.assertIsNone(db.execute("SELECT id FROM preview_cache WHERE id = ?", (cache_id,)).fetchone())
         self.assertFalse((main.PREVIEW_ROOT / "old.jpg").exists())
+
+    def test_authenticated_read_operations_reuse_the_shared_client(self) -> None:
+        message = SimpleNamespace(id=42, date=datetime.now(UTC))
+
+        class SharedClient:
+            async def is_user_authorized(self) -> bool:
+                return True
+
+            async def get_entity(self, chat_id: int) -> int:
+                return chat_id
+
+            def iter_dialogs(self):
+                async def dialogs():
+                    yield SimpleNamespace(
+                        id=123,
+                        name="Shared source",
+                        is_channel=True,
+                        is_group=False,
+                        entity=SimpleNamespace(username="shared_source"),
+                    )
+                return dialogs()
+
+            def iter_messages(self, *_: object, **__: object):
+                async def messages():
+                    yield message
+                return messages()
+
+            async def get_messages(self, *_: object, **__: object) -> list[object]:
+                return [message]
+
+        shared_client = SharedClient()
+
+        async def exercise() -> None:
+            chats = await main.list_chats()
+            self.assertEqual(chats[0]["id"], "123")
+            scanned = await main.scan_messages(main.ScanRequest(
+                chat_id="123", chat_title="Shared source", filters=main.TaskFilters(media_types=["PHOTO"]),
+            ))
+            self.assertEqual(scanned[0][0], 42)
+            page = await main.browse_source_media("123", media_type="PHOTO")
+            self.assertEqual(page["items"][0]["message_id"], 42)
+            selected = await main.selected_source_messages(main.SelectionTaskRequest(
+                chat_id="123", chat_title="Shared source", message_ids=[42],
+            ))
+            self.assertEqual(selected[0][0], 42)
+
+        previous_demo_mode = main.DEMO_MODE
+        main.DEMO_MODE = False
+        try:
+            with (
+                patch.object(main, "app_state", return_value={"accountConnected": True}),
+                patch.object(main, "get_download_client", new_callable=AsyncMock, return_value=shared_client) as get_client,
+                patch.object(main, "open_telegram_client") as open_client,
+                patch.object(main, "close_telegram_client") as close_client,
+                patch.object(main, "matching_media", return_value=("PHOTO", 128, "image/jpeg")),
+                patch.object(main, "filename_for", return_value="shared.jpg"),
+            ):
+                asyncio.run(exercise())
+        finally:
+            main.DEMO_MODE = previous_demo_mode
+
+        self.assertEqual(get_client.await_count, 4)
+        open_client.assert_not_called()
+        close_client.assert_not_called()
 
 
 if __name__ == "__main__":

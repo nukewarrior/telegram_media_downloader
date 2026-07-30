@@ -1231,23 +1231,17 @@ async def verify_login_password(payload: LoginPasswordVerify) -> dict[str, Any]:
 
 @app.post("/api/telegram/logout")
 async def logout() -> dict[str, Any]:
-    await close_download_client()
     remote_logout_warning: str | None = None
     if not DEMO_MODE and SESSION_PATH.exists():
-        async with TELEGRAM_LOCK:
-            client: TelegramClient | None = None
-            try:
-                client = await open_telegram_client()
-                if await client.is_user_authorized():
-                    await client.log_out()
-            except Exception as error:
-                # The local session still has to be removed: the user explicitly
-                # requested to remove this server's access to their account.
-                remote_logout_warning = "本地会话已清除，但 Telegram 远端注销未能确认。"
-                log_event(logging.ERROR, "telegram.remote_logout_failed", "Telegram remote logout could not be confirmed", exc_info=True, error_type=type(error).__name__)
-            finally:
-                if client:
-                    await close_telegram_client(client)
+        try:
+            async with connected_telegram_client() as client:
+                await client.log_out()
+        except Exception as error:
+            # The local session still has to be removed: the user explicitly
+            # requested to remove this server's access to their account.
+            remote_logout_warning = "本地会话已清除，但 Telegram 远端注销未能确认。"
+            log_event(logging.ERROR, "telegram.remote_logout_failed", "Telegram remote logout could not be confirmed", exc_info=True, error_type=type(error).__name__)
+    await close_download_client()
     clear_local_session()
     pending_logins.clear()
     with connection() as db:
@@ -1273,13 +1267,8 @@ async def list_chats() -> list[dict[str, Any]]:
         log_event(logging.INFO, "telegram.chats_listed", "Demo Telegram chats listed", chat_count=len(chats), demo_mode=True)
         return chats
 
-    async with TELEGRAM_LOCK:
-        client: TelegramClient | None = None
-        try:
-            client = await open_telegram_client()
-            if not await client.is_user_authorized():
-                mark_session_invalid()
-                raise HTTPException(409, "Telegram 登录状态已失效，请重新连接账号")
+    try:
+        async with connected_telegram_client() as client:
             chats: list[dict[str, Any]] = []
             async for dialog in client.iter_dialogs():
                 entity = dialog.entity
@@ -1291,14 +1280,11 @@ async def list_chats() -> list[dict[str, Any]]:
                 })
             log_event(logging.INFO, "telegram.chats_listed", "Telegram chats listed", chat_count=len(chats), demo_mode=False)
             return chats
-        except HTTPException:
-            raise
-        except Exception as error:
-            log_event(logging.ERROR, "telegram.chats_list_failed", "Telegram chat listing failed", exc_info=True, error_type=type(error).__name__)
-            raise_telegram_error(error)
-        finally:
-            if client:
-                await close_telegram_client(client)
+    except HTTPException:
+        raise
+    except Exception as error:
+        log_event(logging.ERROR, "telegram.chats_list_failed", "Telegram chat listing failed", exc_info=True, error_type=type(error).__name__)
+        raise_telegram_error(error)
 
 
 @app.get("/api/tasks")
@@ -1437,13 +1423,8 @@ async def scan_messages(payload: ScanRequest) -> list[tuple[int, str, str, str |
     except ValueError as error:
         raise HTTPException(400, "日期格式无效") from error
     result: list[tuple[int, str, str, str | None, int, str]] = []
-    async with TELEGRAM_LOCK:
-        client: TelegramClient | None = None
-        try:
-            client = await open_telegram_client()
-            if not await client.is_user_authorized():
-                mark_session_invalid()
-                raise HTTPException(409, "Telegram 登录状态已失效，请重新连接账号")
+    try:
+        async with connected_telegram_client() as client:
             entity = await client.get_entity(int(payload.chat_id))
             # Telegram returns newest messages first by default.  Starting at the
             # selected end date and stopping at the start date avoids traversing a
@@ -1456,14 +1437,11 @@ async def scan_messages(payload: ScanRequest) -> list[tuple[int, str, str, str |
                 if match:
                     media_type, size, mime_type = match
                     result.append((message.id, filename_for(message, media_type), media_type, mime_type, size, message.date.isoformat()))
-        except HTTPException:
-            raise
-        except Exception as error:
-            log_event(logging.ERROR, "scan.failed", "Telegram media scan failed", exc_info=True, chat_id=payload.chat_id, chat_title=payload.chat_title, error_type=type(error).__name__)
-            raise_telegram_error(error)
-        finally:
-            if client:
-                await close_telegram_client(client)
+    except HTTPException:
+        raise
+    except Exception as error:
+        log_event(logging.ERROR, "scan.failed", "Telegram media scan failed", exc_info=True, chat_id=payload.chat_id, chat_title=payload.chat_title, error_type=type(error).__name__)
+        raise_telegram_error(error)
     log_event(logging.INFO, "scan.completed", "Telegram media scan completed", chat_id=payload.chat_id, chat_title=payload.chat_title, matched_count=len(result), total_bytes=sum(item[4] for item in result), duration_ms=round((asyncio.get_running_loop().time() - started_at) * 1000))
     return result
 
@@ -1569,13 +1547,8 @@ async def browse_source_media(chat_id: str, cursor: str | None = None, media_typ
     else:
         if not app_state()["accountConnected"]:
             raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
-        async with TELEGRAM_LOCK:
-            client: TelegramClient | None = None
-            try:
-                client = await open_telegram_client()
-                if not await client.is_user_authorized():
-                    mark_session_invalid()
-                    raise HTTPException(409, "Telegram 登录状态已失效，请重新连接账号")
+        try:
+            async with connected_telegram_client() as client:
                 entity = await client.get_entity(int(chat_id))
                 async for message in client.iter_messages(entity, offset_id=offset or 0):
                     match = matching_media(message, filters)
@@ -1584,14 +1557,11 @@ async def browse_source_media(chat_id: str, cursor: str | None = None, media_typ
                         matched.append((message.id, filename_for(message, kind), kind, mime_type, size, message.date.isoformat()))
                     if len(matched) >= page_size + 1:
                         break
-            except HTTPException:
-                raise
-            except Exception as error:
-                log_event(logging.ERROR, "source_media.list_failed", "Unable to list source media", exc_info=True, chat_id=chat_id, error_type=type(error).__name__)
-                raise_telegram_error(error)
-            finally:
-                if client:
-                    await close_telegram_client(client)
+        except HTTPException:
+            raise
+        except Exception as error:
+            log_event(logging.ERROR, "source_media.list_failed", "Unable to list source media", exc_info=True, chat_id=chat_id, error_type=type(error).__name__)
+            raise_telegram_error(error)
     visible, overflow = matched[:page_size], matched[page_size:]
     archive_ids, queued_ids, previews = source_item_states(chat_id, [item[0] for item in visible])
     return {
@@ -1697,30 +1667,50 @@ def notify_download_dispatcher() -> None:
 
 
 async def get_download_client() -> TelegramClient:
+    """Return the sole long-lived client that owns the on-disk Telethon session."""
     global DOWNLOAD_CLIENT
     async with DOWNLOAD_CLIENT_LOCK:
         if DOWNLOAD_CLIENT and DOWNLOAD_CLIENT.is_connected():
             log_event(logging.DEBUG, "download.client_reused", "Reusing connected Telegram download client")
             return DOWNLOAD_CLIENT
-        async with TELEGRAM_LOCK:
-            DOWNLOAD_CLIENT = await open_telegram_client()
-            if not await DOWNLOAD_CLIENT.is_user_authorized():
-                await close_telegram_client(DOWNLOAD_CLIENT)
-                DOWNLOAD_CLIENT = None
-                mark_session_invalid()
-                raise RuntimeError("Telegram 登录状态已失效")
+        DOWNLOAD_CLIENT = await open_telegram_client()
+        if not await DOWNLOAD_CLIENT.is_user_authorized():
+            await close_telegram_client(DOWNLOAD_CLIENT)
+            DOWNLOAD_CLIENT = None
+            mark_session_invalid()
+            raise RuntimeError("Telegram 登录状态已失效")
         log_event(logging.INFO, "download.client_opened", "Telegram download client opened")
         return DOWNLOAD_CLIENT
 
 
+@asynccontextmanager
+async def connected_telegram_client():
+    """Lease the shared authenticated client for a non-download Telegram operation.
+
+    Telethon's SQLiteSession keeps a live SQLite connection and writes session
+    state during reconnects.  Holding this lock for the whole operation prevents
+    a client reset from closing that one client mid-request, and—more
+    importantly—prevents the old per-request clients from opening the same
+    session file alongside it.
+    """
+    async with TELEGRAM_LOCK:
+        client = await get_download_client()
+        if not await client.is_user_authorized():
+            mark_session_invalid()
+            raise HTTPException(409, "Telegram 登录状态已失效，请重新连接账号")
+        yield client
+
+
 async def close_download_client() -> None:
     global DOWNLOAD_CLIENT
-    async with DOWNLOAD_CLIENT_LOCK:
-        if DOWNLOAD_CLIENT:
-            async with TELEGRAM_LOCK:
+    # Keep this order aligned with connected_telegram_client so a reset cannot
+    # close the shared session while a browse/scan/request lease is in flight.
+    async with TELEGRAM_LOCK:
+        async with DOWNLOAD_CLIENT_LOCK:
+            if DOWNLOAD_CLIENT:
                 await close_telegram_client(DOWNLOAD_CLIENT)
-            DOWNLOAD_CLIENT = None
-            log_event(logging.INFO, "download.client_closed", "Telegram download client closed")
+                DOWNLOAD_CLIENT = None
+                log_event(logging.INFO, "download.client_closed", "Telegram download client closed")
 
 
 def request_download_client_reset(task_id: int, media_id: int) -> None:
@@ -2297,13 +2287,8 @@ async def selected_source_messages(payload: SelectionTaskRequest) -> list[tuple[
         return [available[item_id] for item_id in requested_ids if item_id in available]
     if not app_state()["accountConnected"]:
         raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
-    async with TELEGRAM_LOCK:
-        client: TelegramClient | None = None
-        try:
-            client = await open_telegram_client()
-            if not await client.is_user_authorized():
-                mark_session_invalid()
-                raise HTTPException(409, "Telegram 登录状态已失效，请重新连接账号")
+    try:
+        async with connected_telegram_client() as client:
             entity = await client.get_entity(int(payload.chat_id))
             messages = await client.get_messages(entity, ids=requested_ids)
             if not isinstance(messages, list):
@@ -2315,14 +2300,11 @@ async def selected_source_messages(payload: SelectionTaskRequest) -> list[tuple[
                     media_type, size, mime_type = match
                     result.append((message.id, filename_for(message, media_type), media_type, mime_type, size, message.date.isoformat()))
             return result
-        except HTTPException:
-            raise
-        except Exception as error:
-            log_event(logging.ERROR, "source_media.selection_validation_failed", "Unable to validate selected Telegram messages", exc_info=True, chat_id=payload.chat_id, error_type=type(error).__name__)
-            raise_telegram_error(error)
-        finally:
-            if client:
-                await close_telegram_client(client)
+    except HTTPException:
+        raise
+    except Exception as error:
+        log_event(logging.ERROR, "source_media.selection_validation_failed", "Unable to validate selected Telegram messages", exc_info=True, chat_id=payload.chat_id, error_type=type(error).__name__)
+        raise_telegram_error(error)
 
 
 @app.post("/api/tasks/selection")

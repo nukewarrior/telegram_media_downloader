@@ -72,6 +72,47 @@ class DownloadRetryTests(unittest.TestCase):
         self.assertIsNone(main.DOWNLOAD_CLIENT)
         self.assertFalse(main.DOWNLOAD_CLIENT_RESET_REQUESTED)
 
+    def test_client_reset_waits_for_an_active_shared_client_lease(self) -> None:
+        class FakeTelegramClient:
+            def __init__(self) -> None:
+                self.disconnect_calls = 0
+
+            def is_connected(self) -> bool:
+                return True
+
+            async def is_user_authorized(self) -> bool:
+                return True
+
+            async def disconnect(self) -> None:
+                self.disconnect_calls += 1
+
+        client = FakeTelegramClient()
+
+        async def exercise() -> None:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hold_lease() -> None:
+                async with main.connected_telegram_client():
+                    entered.set()
+                    await release.wait()
+
+            main.DOWNLOAD_CLIENT = client  # type: ignore[assignment]
+            main.DOWNLOAD_CLIENT_RESET_REQUESTED = True
+            holder = asyncio.create_task(hold_lease())
+            await entered.wait()
+            reset = asyncio.create_task(main.reset_download_client_if_requested())
+            await asyncio.sleep(0)
+            self.assertEqual(client.disconnect_calls, 0)
+            release.set()
+            await holder
+            await reset
+
+        asyncio.run(exercise())
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertIsNone(main.DOWNLOAD_CLIENT)
+        self.assertFalse(main.DOWNLOAD_CLIENT_RESET_REQUESTED)
+
     def test_download_client_keeps_the_last_rpc_error_and_can_reconnect(self) -> None:
         created: dict[str, object] = {}
 

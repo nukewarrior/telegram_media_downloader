@@ -14,9 +14,12 @@ const dateStart = ref('')
 const dateEnd = ref('')
 const items = ref<SourceMedia[]>([])
 const nextCursor = ref<string | null>(null)
+const loadingSources = ref(false)
 const loading = ref(false)
 const loadingMore = ref(false)
 const error = ref('')
+const sourcesError = ref('')
+const mediaError = ref('')
 const selected = ref(new Map<number, SourceMedia>())
 const previewItem = ref<SourceMedia | null>(null)
 const preview = ref<SourcePreview | null>(null)
@@ -83,7 +86,7 @@ async function load(reset = true) {
   } else {
     loadingMore.value = true
   }
-  error.value = ''
+  mediaError.value = ''
   try {
     const page = await api.sourceMedia(selectedChatId.value, requestQuery)
     if (!isCurrentSourceRequest(epoch, requestEpoch)) return
@@ -91,7 +94,7 @@ async function load(reset = true) {
     nextCursor.value = page.next_cursor
     receivedPage = true
   } catch (reason) {
-    if (isCurrentSourceRequest(epoch, requestEpoch)) error.value = reason instanceof Error ? reason.message : '无法读取来源媒体'
+    if (isCurrentSourceRequest(epoch, requestEpoch)) mediaError.value = reason instanceof Error ? reason.message : '无法读取来源媒体'
   } finally {
     if (isCurrentSourceRequest(epoch, requestEpoch)) {
       loading.value = false
@@ -105,6 +108,21 @@ async function chooseChat(chat: Chat) {
   selected.value = new Map()
   successTaskId.value = null
   await load()
+}
+async function loadSources() {
+  loadingSources.value = true
+  sourcesError.value = ''
+  try {
+    chats.value = await api.chats()
+    if (!sourceChats.value.some((chat) => chat.id === selectedChatId.value)) {
+      selectedChatId.value = sourceChats.value[0]?.id ?? ''
+    }
+    if (selectedChatId.value) await load()
+  } catch (reason) {
+    sourcesError.value = reason instanceof Error ? reason.message : '无法读取群组与频道'
+  } finally {
+    loadingSources.value = false
+  }
 }
 function changeMediaType(type: string) {
   mediaType.value = type
@@ -154,10 +172,7 @@ async function queueSelection() {
   } catch (reason) { error.value = reason instanceof Error ? reason.message : '加入下载队列失败' }
 }
 onMounted(async () => {
-  try {
-    chats.value = await api.chats()
-    if (sourceChats.value[0]) { selectedChatId.value = sourceChats.value[0].id; await load() }
-  } catch (reason) { error.value = reason instanceof Error ? reason.message : '无法读取群组与频道' }
+  await loadSources()
 })
 onBeforeUnmount(() => {
   requestEpoch += 1
@@ -169,11 +184,12 @@ onBeforeUnmount(() => {
 <template>
   <div class="source-page">
     <div class="page-head source-head"><div><p class="eyebrow">Telegram 来源浏览</p><h1>群组与频道</h1><p class="subhead">选择媒体后会创建可暂停、可重试的下载任务。</p></div></div>
+    <p v-if="sourcesError" class="form-error">无法读取群组与频道：{{ sourcesError }} <button class="quiet-button" :disabled="loadingSources" @click="loadSources">{{ loadingSources ? '正在重试…' : '重试加载' }}</button></p>
     <p v-if="error" class="form-error">{{ error }}</p>
     <p v-if="successTaskId" class="success-note source-success">已加入下载队列。<RouterLink :to="`/tasks/${successTaskId}`">查看任务详情</RouterLink></p>
     <section class="source-workbench">
-      <aside class="source-list"><label class="search-input"><Search :size="17" /><input v-model="search" placeholder="搜索群组或频道" /></label><p class="source-count">{{ filteredChats.length }} 个来源</p><button v-for="chat in filteredChats" :key="chat.id" :class="['source-row', { selected: selectedChatId === chat.id }]" @click="chooseChat(chat)"><span class="source-avatar">{{ chat.title.slice(0, 1) }}</span><span><b>{{ chat.title }}</b><small>{{ chat.type === 'CHANNEL' ? '频道' : '群组' }}{{ chat.handle ? ` · ${chat.handle}` : '' }}</small></span><ChevronRight :size="15" /></button><p v-if="!filteredChats.length" class="source-empty">没有可浏览的群组或频道。</p></aside>
-      <main class="source-timeline"><template v-if="currentChat"><header class="source-title"><div><span class="eyebrow">{{ currentChat.type === 'CHANNEL' ? '频道' : '群组' }}</span><h2>{{ currentChat.title }}</h2></div><span>{{ items.length }} 项已载入</span></header><div class="source-filters"><div class="type-filters"><button v-for="type in ['', 'PHOTO', 'VIDEO', 'DOCUMENT']" :key="type" :class="{ selected: mediaType === type }" @click="changeMediaType(type)">{{ type ? typeLabel[type] : '全部' }}</button></div><label>开始日期<input v-model="dateStart" type="date" @change="changeDateFilter" /></label><label>结束日期<input v-model="dateEnd" type="date" @change="changeDateFilter" /></label></div><section ref="mediaScroll" class="source-media-scroll"><section v-if="loading" class="loading-block">正在读取媒体时间流…</section><section v-else-if="!items.length" class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>没有匹配的媒体</h2><p>调整日期或类型筛选后重试。</p></section><template v-else><section v-for="(dayItems, day) in groupedItems" :key="day" class="source-day"><div class="section-title"><h2>{{ day }}</h2><span>{{ dayItems.length }} 项</span></div><div class="source-grid"><article v-for="item in dayItems" :key="item.message_id" :class="['source-card', { checked: selectedState(item), unavailable: item.archived || item.queued }]" @click="openPreview(item)"><button v-if="!item.archived && !item.queued" class="select-box" :aria-label="`选择 ${item.filename}`" @click.stop="toggle(item)"><Check v-if="selectedState(item)" :size="15" /></button><div class="source-card-preview"><img v-if="item.preview?.content_url && item.media_type === 'PHOTO'" :src="resource(item.preview.content_url) ?? undefined" :alt="item.filename" /><component v-else :is="itemIcon(item)" :size="28" /><span v-if="item.media_type === 'VIDEO'" class="play-badge"><Play :size="12" fill="currentColor" /></span></div><div><b>{{ item.filename }}</b><small>{{ typeLabel[item.media_type] }} · {{ bytes(item.size_bytes) }}</small><em v-if="item.archived">已归档</em><em v-else-if="item.queued">已加入队列</em></div></article></div></section><div ref="loadSentinel" class="source-load-state"><template v-if="loadingMore"><LoaderCircle class="spin" :size="16" />正在预载更早的媒体…</template><template v-else-if="!nextCursor">已加载全部媒体</template></div></template></section></template><section v-else class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>没有可用来源</h2><p>连接 Telegram 后会显示已加入的群组与频道。</p></section></main>
+      <aside class="source-list"><label class="search-input"><Search :size="17" /><input v-model="search" placeholder="搜索群组或频道" /></label><p class="source-count">{{ filteredChats.length }} 个来源</p><button v-for="chat in filteredChats" :key="chat.id" :class="['source-row', { selected: selectedChatId === chat.id }]" @click="chooseChat(chat)"><span class="source-avatar">{{ chat.title.slice(0, 1) }}</span><span><b>{{ chat.title }}</b><small>{{ chat.type === 'CHANNEL' ? '频道' : '群组' }}{{ chat.handle ? ` · ${chat.handle}` : '' }}</small></span><ChevronRight :size="15" /></button><p v-if="loadingSources" class="source-empty">正在读取群组与频道…</p><p v-else-if="!filteredChats.length" class="source-empty">没有可浏览的群组或频道。</p></aside>
+      <main class="source-timeline"><template v-if="currentChat"><header class="source-title"><div><span class="eyebrow">{{ currentChat.type === 'CHANNEL' ? '频道' : '群组' }}</span><h2>{{ currentChat.title }}</h2></div><span>{{ items.length }} 项已载入</span></header><div class="source-filters"><div class="type-filters"><button v-for="type in ['', 'PHOTO', 'VIDEO', 'DOCUMENT']" :key="type" :class="{ selected: mediaType === type }" @click="changeMediaType(type)">{{ type ? typeLabel[type] : '全部' }}</button></div><label>开始日期<input v-model="dateStart" type="date" @change="changeDateFilter" /></label><label>结束日期<input v-model="dateEnd" type="date" @change="changeDateFilter" /></label></div><section ref="mediaScroll" class="source-media-scroll"><section v-if="loading" class="loading-block">正在读取媒体时间流…</section><section v-else-if="mediaError && !items.length" class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>媒体时间流加载失败</h2><p>{{ mediaError }}</p><button class="quiet-button" @click="load()">重试加载</button></section><section v-else-if="!items.length" class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>没有匹配的媒体</h2><p>调整日期或类型筛选后重试。</p></section><template v-else><section v-for="(dayItems, day) in groupedItems" :key="day" class="source-day"><div class="section-title"><h2>{{ day }}</h2><span>{{ dayItems.length }} 项</span></div><div class="source-grid"><article v-for="item in dayItems" :key="item.message_id" :class="['source-card', { checked: selectedState(item), unavailable: item.archived || item.queued }]" @click="openPreview(item)"><button v-if="!item.archived && !item.queued" class="select-box" :aria-label="`选择 ${item.filename}`" @click.stop="toggle(item)"><Check v-if="selectedState(item)" :size="15" /></button><div class="source-card-preview"><img v-if="item.preview?.content_url && item.media_type === 'PHOTO'" :src="resource(item.preview.content_url) ?? undefined" :alt="item.filename" /><component v-else :is="itemIcon(item)" :size="28" /><span v-if="item.media_type === 'VIDEO'" class="play-badge"><Play :size="12" fill="currentColor" /></span></div><div><b>{{ item.filename }}</b><small>{{ typeLabel[item.media_type] }} · {{ bytes(item.size_bytes) }}</small><em v-if="item.archived">已归档</em><em v-else-if="item.queued">已加入队列</em></div></article></div></section><div ref="loadSentinel" class="source-load-state"><template v-if="loadingMore"><LoaderCircle class="spin" :size="16" />正在预载更早的媒体…</template><template v-else-if="mediaError"><span>更早的媒体加载失败：{{ mediaError }}</span><button class="quiet-button" @click="load(false)">重试加载</button></template><template v-else-if="!nextCursor">已加载全部媒体</template></div></template></section></template><section v-else class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>没有可用来源</h2><p>连接 Telegram 后会显示已加入的群组与频道。</p></section></main>
       <aside class="selection-basket"><span class="eyebrow">待下载</span><h2>{{ selectedItems.length }} 项</h2><p>{{ selectedItems.length ? bytes(selectedBytes) : '从时间流中选择文件' }}</p><div v-if="selectedItems.length" class="basket-list"><button v-for="item in selectedItems" :key="item.message_id" @click="toggle(item)"><span>{{ item.filename }}</span><X :size="15" /></button></div><p v-else class="basket-empty">选择会跨日期和分页保留。</p><button class="primary-button wide" :disabled="!selectedItems.length" @click="queueSelection"><Download :size="17" />加入下载队列</button><small>文件按来源顺序加入统一下载队列。</small></aside>
     </section>
     <section v-if="previewItem" class="media-lightbox" role="dialog" aria-modal="true" :aria-label="`${previewItem.filename} 预览`" @click.self="closePreview"><button class="lightbox-close" aria-label="关闭预览" @click="closePreview"><X :size="24" /></button><div class="lightbox-panel"><div class="lightbox-media"><template v-if="preview?.status === 'READY' && preview.content_url"><img v-if="previewItem.media_type === 'PHOTO'" :src="resource(preview.content_url) ?? undefined" :alt="previewItem.filename" /><video v-else-if="previewItem.media_type === 'VIDEO'" :src="resource(preview.content_url) ?? undefined" controls autoplay playsinline /><iframe v-else :src="resource(preview.content_url) ?? undefined" :title="previewItem.filename" /></template><div v-else class="lightbox-fallback"><LoaderCircle v-if="preview?.status !== 'FAILED'" class="spin" :size="38" /><FileText v-else :size="40" /><p>{{ preview?.status === 'FAILED' ? preview.error_message || '预览加载失败' : '正在从 Telegram 加载原文件…' }}</p><small v-if="preview">{{ bytes(preview.downloaded_bytes) }} / {{ bytes(preview.size_bytes) }}；关闭会停止并保留断点 24 小时。</small></div></div><div class="lightbox-meta"><div><span class="eyebrow">{{ typeLabel[previewItem.media_type] }} · 原文件预览</span><h2>{{ previewItem.filename }}</h2><p>{{ new Date(previewItem.message_date).toLocaleString('zh-CN') }} · {{ bytes(previewItem.size_bytes) }}</p></div><button v-if="!previewItem.archived && !previewItem.queued" class="quiet-button" @click="toggle(previewItem)">{{ selectedState(previewItem) ? '移出待下载' : '加入待下载' }}</button></div></div></section>
