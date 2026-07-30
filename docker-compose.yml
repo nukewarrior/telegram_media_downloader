@@ -1,0 +1,14 @@
+services:
+  telegram-media-archiver:
+    build: .
+    container_name: telegram-media-archiver
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATA_DIR: /data
+      DOWNLOAD_ROOT: /data/downloads
+      DEMO_MODE: ${DEMO_MODE:-true}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
