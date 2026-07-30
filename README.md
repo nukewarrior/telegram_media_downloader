@@ -27,12 +27,23 @@ cp .env.example .env
 # 使用 NAS 或其他绝对路径
 ./run.sh -d /mnt/nas/telegram-archive restart
 
+# 输出更详细的 JSON 业务日志（默认 INFO）
+./run.sh --log-level DEBUG restart
+
 # 暂停服务 / 移除容器和网络；两者都会保留数据目录
 ./run.sh -d ./data stop
 ./run.sh -d ./data down
 ```
 
 `start` 每次都会构建当前镜像；`restart` 会额外强制重建容器。两者成功后都会持续跟随最近 100 条服务日志，按 `Ctrl+C` 只停止日志显示，不会停止容器。`stop` 与 `down` 在数据目录不存在时会安全失败，防止路径拼写错误。`down` 不会使用 `--volumes`，也不会删除 `-d` 指定目录中的任何文件。
+
+### 运行日志
+
+服务启动、错误、HTTP 访问和业务事件均输出为每行一个 JSON 对象，并同时写入容器输出与 `data/logs/`。日志使用宿主机本地时区（带 UTC 偏移）；容器只读挂载 `/etc/localtime` 来继承该时区。HTTP 访问日志只记录方法、路径、状态、客户端地址和耗时，绝不记录查询参数或请求体。使用 `-l` / `--log-level` 指定 `DEBUG`、`INFO`、`WARNING`、`ERROR` 或 `CRITICAL`，未指定时为 `INFO`。直接使用 Docker Compose 时，可在 `.env` 设置 `LOG_LEVEL` 作为容器默认值；`run.sh` 始终以其参数（或默认的 `INFO`）传入等级。
+
+每天首次写日志时创建 `data/logs/telegram-media-archiver-YYYY-MM-DD.jsonl`；跨日后旧文件会压缩为 `.jsonl.gz`，活动日期在内最多保留 30 天。可用 `zgrep 'download.rate_limited' data/logs/*.jsonl.gz` 检查历史事件。文件日志会在 `run.sh down` 后继续保留；Docker 的实时副本仅保留 3 个、每个最多 10 MiB，供 `docker logs` 快速查看。文件系统不可写、磁盘满或压缩失败时，服务会继续运行并在 stdout 输出限频告警。
+
+业务日志可能包含聊天标题、文件名和归档路径。日志不会写入 API Hash、验证码、两步验证密码、Telegram 会话令牌、HTTP 查询参数或请求体。
 
 ### 下载归档目录
 

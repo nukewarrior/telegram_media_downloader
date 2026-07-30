@@ -10,7 +10,14 @@ services:
       DATA_DIR: /data
       DOWNLOAD_ROOT: /data/downloads
       DEMO_MODE: ${DEMO_MODE:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
     volumes:
       - "${ARCHIVER_DATA_DIR:-./data}:/data"
+      - /etc/localtime:/etc/localtime:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     restart: unless-stopped

@@ -6,10 +6,11 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 calling_dir=$(pwd -P)
 command_name=""
 data_argument="$script_dir/data"
+log_level="INFO"
 
 usage() {
   cat <<'EOF'
-Usage: ./run.sh [-d|--data-dir DATA_DIR] <command>
+Usage: ./run.sh [-d|--data-dir DATA_DIR] [-l|--log-level LEVEL] <command>
 
 Commands:
   start     Build the current image and start the service in the background.
@@ -21,12 +22,16 @@ Options:
   -d, --data-dir PATH  Host directory for SQLite, sessions, downloads, and thumbnails.
                         Defaults to <repository>/data. Relative paths are resolved from
                         the directory where this command is run.
+  -l, --log-level LEVEL
+                        Application log level: DEBUG, INFO, WARNING, ERROR, or CRITICAL.
+                        Defaults to INFO.
   -h, --help            Show this help text.
 
 Examples:
   ./run.sh start
   ./run.sh -d /mnt/nas/telegram-archive start
   ./run.sh -d ./data restart
+  ./run.sh --log-level DEBUG restart
   ./run.sh -d ./data down
 EOF
 }
@@ -39,6 +44,14 @@ while (($#)); do
         exit 2
       fi
       data_argument=$2
+      shift 2
+      ;;
+    -l|--log-level)
+      if (($# < 2)) || [[ -z "${2:-}" ]]; then
+        printf 'Error: %s requires a log level.\n' "$1" >&2
+        exit 2
+      fi
+      log_level=${2^^}
       shift 2
       ;;
     -h|--help)
@@ -66,6 +79,14 @@ if [[ -z "$command_name" ]]; then
   usage >&2
   exit 2
 fi
+
+case "$log_level" in
+  DEBUG|INFO|WARNING|ERROR|CRITICAL) ;;
+  *)
+    printf 'Error: unsupported log level %q (expected DEBUG, INFO, WARNING, ERROR, or CRITICAL).\n' "$log_level" >&2
+    exit 2
+    ;;
+esac
 
 if [[ "$data_argument" != /* ]]; then
   data_argument="$calling_dir/$data_argument"
@@ -103,10 +124,12 @@ fi
 export ARCHIVER_DATA_DIR="$data_dir"
 export APP_UID="$(id -u)"
 export APP_GID="$(id -g)"
+export LOG_LEVEL="$log_level"
 
 compose=(docker compose --project-directory "$script_dir" --file "$script_dir/docker-compose.yml")
 
 printf 'Using data directory: %s\n' "$ARCHIVER_DATA_DIR"
+printf 'Using application log level: %s\n' "$LOG_LEVEL"
 
 follow_logs() {
   printf 'Following service logs (press Ctrl+C to stop viewing logs; the service stays running).\n'

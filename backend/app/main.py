@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sqlite3
+import sys
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -57,6 +61,216 @@ SCAN_CACHE_TTL = timedelta(minutes=10)
 SCAN_CACHE: dict[str, tuple[datetime, list[tuple[int, str, str, str | None, int, str]]]] = {}
 AVAILABLE_TIMEZONES = frozenset(available_timezones())
 UNFINISHED_TASK_STATUSES = ("QUEUED", "SCANNING", "DOWNLOADING", "RETRYING", "WAITING_RATE_LIMIT", "PAUSED")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_ROOT = DATA_DIR / "logs"
+LOG_FILE_PREFIX = "telegram-media-archiver-"
+LOG_RETENTION_DAYS = 30
+LOG_FAILURE_REPORT_INTERVAL = timedelta(minutes=5)
+LOGGER = logging.getLogger("telegram_media_archiver")
+SENSITIVE_LOG_KEY_PARTS = ("api_hash", "password", "code", "session", "token", "attempt_id")
+
+
+def local_now() -> datetime:
+    """Return the host/container local time with its UTC offset."""
+    return datetime.now().astimezone()
+
+
+class JsonLogFormatter(logging.Formatter):
+    """Emit one self-contained JSON object per application log event."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "timestamp": local_now().isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "event": getattr(record, "event", "server.log" if record.name.startswith("uvicorn") else "application_log"),
+            "message": record.getMessage(),
+        }
+        payload.update(getattr(record, "event_data", {}))
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+class DailyCompressedJsonlHandler(logging.Handler):
+    """Persist JSONL by local calendar day without allowing file I/O to stop the service."""
+
+    def __init__(self, directory: Path, fallback_handler: logging.Handler) -> None:
+        super().__init__()
+        self.directory = directory
+        self.fallback_handler = fallback_handler
+        self.stream: Any | None = None
+        self.active_day: date | None = None
+        self.next_retry_at: datetime | None = None
+        self.last_failure_reported_at: datetime | None = None
+        self._prepare_directory()
+
+    def _path_for(self, day: date) -> Path:
+        return self.directory / f"{LOG_FILE_PREFIX}{day.isoformat()}.jsonl"
+
+    def _dated_files(self) -> list[tuple[date, Path]]:
+        pattern = re.compile(rf"^{re.escape(LOG_FILE_PREFIX)}(\d{{4}}-\d{{2}}-\d{{2}})\.jsonl(?:\.gz)?$")
+        try:
+            paths = list(self.directory.iterdir())
+        except OSError as error:
+            self._report_failure("list", error)
+            return []
+        result: list[tuple[date, Path]] = []
+        for path in paths:
+            match = pattern.match(path.name)
+            if not match:
+                continue
+            try:
+                result.append((date.fromisoformat(match.group(1)), path))
+            except ValueError:
+                continue
+        return result
+
+    def _prepare_directory(self) -> None:
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            self._maintain(local_now().date())
+        except OSError as error:
+            self._report_failure("initialize", error)
+
+    def _compress(self, source: Path) -> None:
+        target = source.with_suffix(source.suffix + ".gz")
+        if target.is_file():
+            source.unlink()
+            return
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        try:
+            with source.open("rb") as input_file, gzip.open(temporary, "wb") as output_file:
+                shutil.copyfileobj(input_file, output_file)
+            temporary.replace(target)
+            source.unlink()
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _maintain(self, current_day: date) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        for file_day, path in self._dated_files():
+            if file_day < current_day and path.suffix == ".jsonl":
+                try:
+                    self._compress(path)
+                except OSError as error:
+                    self._report_failure("compress", error)
+        cutoff = current_day - timedelta(days=LOG_RETENTION_DAYS - 1)
+        for file_day, path in self._dated_files():
+            if file_day < cutoff:
+                try:
+                    path.unlink()
+                except OSError as error:
+                    self._report_failure("cleanup", error)
+
+    def _close_stream(self) -> None:
+        if self.stream:
+            try:
+                self.stream.close()
+            except OSError:
+                pass
+        self.stream = None
+        self.active_day = None
+
+    def _report_failure(self, operation: str, error: OSError) -> None:
+        current_time = local_now()
+        if self.last_failure_reported_at and current_time - self.last_failure_reported_at < LOG_FAILURE_REPORT_INTERVAL:
+            return
+        self.last_failure_reported_at = current_time
+        try:
+            fallback = logging.LogRecord(
+                "telegram_media_archiver",
+                logging.ERROR,
+                __file__,
+                0,
+                "Persistent log storage failed; continuing with stdout only",
+                (),
+                None,
+            )
+            fallback.event = "logging.persistence_failed"
+            fallback.event_data = {"operation": operation, "log_directory": str(self.directory), "error_type": type(error).__name__}
+            self.fallback_handler.emit(fallback)
+        except Exception:
+            pass
+
+    def _ensure_stream(self, current_day: date) -> bool:
+        if self.stream and self.active_day == current_day:
+            return True
+        self._close_stream()
+        try:
+            self._maintain(current_day)
+            self.stream = self._path_for(current_day).open("a", encoding="utf-8")
+            self.active_day = current_day
+            self.next_retry_at = None
+            return True
+        except OSError as error:
+            self.next_retry_at = local_now() + timedelta(minutes=1)
+            self._report_failure("open", error)
+            return False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.acquire()
+        try:
+            current_time = local_now()
+            if self.next_retry_at and current_time < self.next_retry_at:
+                return
+            if not self._ensure_stream(current_time.date()):
+                return
+            try:
+                self.stream.write(self.format(record) + "\n")
+                self.stream.flush()
+            except OSError as error:
+                self._close_stream()
+                self.next_retry_at = current_time + timedelta(minutes=1)
+                self._report_failure("write", error)
+        finally:
+            self.release()
+
+    def close(self) -> None:
+        self.acquire()
+        try:
+            self._close_stream()
+            super().close()
+        finally:
+            self.release()
+
+
+def configure_logging() -> None:
+    """Send application and Uvicorn logs to stdout and a durable local JSONL stream."""
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    formatter = JsonLogFormatter()
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(formatter)
+    persistent_handler = DailyCompressedJsonlHandler(LOG_ROOT, stdout_handler)
+    persistent_handler.setFormatter(formatter)
+    for logger in (LOGGER, logging.getLogger("uvicorn")):
+        logger.setLevel(level)
+        logger.propagate = False
+        logger.handlers.clear()
+        logger.addHandler(stdout_handler)
+        logger.addHandler(persistent_handler)
+    uvicorn_error = logging.getLogger("uvicorn.error")
+    uvicorn_error.handlers.clear()
+    uvicorn_error.setLevel(level)
+    uvicorn_error.propagate = True
+    # Access records are emitted by the FastAPI middleware below so that we can
+    # omit query strings and include a duration without duplicate log lines.
+    uvicorn_access = logging.getLogger("uvicorn.access")
+    uvicorn_access.handlers.clear()
+    uvicorn_access.disabled = True
+
+
+def log_event(level: int, event: str, message: str, *, exc_info: bool = False, **context: Any) -> None:
+    """Log structured operational context while rejecting known credential fields."""
+    safe_context = {
+        key: value
+        for key, value in context.items()
+        if not any(part in key.lower().replace("-", "_") for part in SENSITIVE_LOG_KEY_PARTS)
+    }
+    LOGGER.log(level, message, extra={"event": event, "event_data": safe_context}, exc_info=exc_info)
+
+
+configure_logging()
 
 
 @dataclass
@@ -151,6 +365,7 @@ def mark_session_invalid() -> None:
             "UPDATE app_settings SET account_connected = 0, connection_status = 'invalid', updated_at = ? WHERE id = 1",
             (now(),),
         )
+    log_event(logging.WARNING, "telegram.session_invalid", "Telegram session marked invalid")
 
 
 def clear_local_session() -> None:
@@ -187,7 +402,9 @@ async def open_telegram_client() -> TelegramClient:
     )
     try:
         await client.connect()
+        log_event(logging.DEBUG, "telegram.client_connected", "Connected temporary Telegram client")
     except (OSError, asyncio.TimeoutError) as error:
+        log_event(logging.ERROR, "telegram.client_connect_failed", "Unable to connect Telegram client", exc_info=True, error_type=type(error).__name__)
         raise HTTPException(503, "无法连接 Telegram，请检查网络后重试") from error
     finally:
         secure_session_file()
@@ -198,6 +415,7 @@ async def close_telegram_client(client: TelegramClient) -> None:
     try:
         if client.is_connected():
             await client.disconnect()
+            log_event(logging.DEBUG, "telegram.client_disconnected", "Disconnected temporary Telegram client")
     finally:
         secure_session_file()
 
@@ -363,6 +581,7 @@ def initialize_database() -> None:
         if DEMO_MODE and db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0:
             seed_demo_data(db)
     reconcile_thumbnail_records()
+    log_event(logging.INFO, "database.initialized", "Database and runtime directories are ready", data_dir=str(DATA_DIR), download_root=str(DOWNLOAD_ROOT), demo_mode=DEMO_MODE)
 
 
 def seed_demo_data(db: sqlite3.Connection) -> None:
@@ -495,6 +714,8 @@ def set_thumbnail_result(blob_id: int, status: str, *, path: Path | None = None,
             "UPDATE media_blobs SET thumbnail_path = ?, thumbnail_status = ?, thumbnail_error = ? WHERE id = ?",
             (str(path) if path else None, status, error, blob_id),
         )
+    level = logging.INFO if status == "READY" else logging.WARNING
+    log_event(level, "thumbnail.state_changed", "Thumbnail state changed", blob_id=blob_id, status=status, thumbnail_path=str(path) if path else None, error=error)
 
 
 def create_image_thumbnail(source: Path, target: Path) -> None:
@@ -542,11 +763,13 @@ async def generate_thumbnail(blob: sqlite3.Row) -> None:
         return
     target = THUMBNAIL_ROOT / f"{blob['id']}.jpg"
     try:
+        log_event(logging.INFO, "thumbnail.started", "Thumbnail generation started", blob_id=blob["id"], media_type=blob["media_type"], source_path=str(source), target_path=str(target))
         if blob["media_type"] == "PHOTO":
             await asyncio.to_thread(create_image_thumbnail, source, target)
         else:
             await create_video_thumbnail(source, target)
     except (UnidentifiedImageError, OSError, RuntimeError) as error:
+        log_event(logging.ERROR, "thumbnail.failed", "Thumbnail generation failed", exc_info=True, blob_id=blob["id"], media_type=blob["media_type"], source_path=str(source), error_type=type(error).__name__)
         set_thumbnail_result(blob["id"], "FAILED", error=str(error)[:500])
         return
     set_thumbnail_result(blob["id"], "READY", path=target)
@@ -562,6 +785,7 @@ async def thumbnail_worker() -> None:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                log_event(logging.ERROR, "thumbnail.worker_failed", "Thumbnail worker failed", exc_info=True, blob_id=blob["id"], error_type=type(error).__name__)
                 set_thumbnail_result(blob["id"], "FAILED", error=str(error)[:500])
             continue
         THUMBNAIL_WAKE.clear()
@@ -687,21 +911,31 @@ def restore_download_runtime() -> None:
         if future_waits:
             DOWNLOAD_FLOOD_UNTIL = max(future_waits)
             DOWNLOAD_EFFECTIVE_CONCURRENCY = 1
+            log_event(logging.WARNING, "download.rate_limit_restored", "Restored persisted Telegram rate-limit pause", wait_until=DOWNLOAD_FLOOD_UNTIL.isoformat(), effective_concurrency=DOWNLOAD_EFFECTIVE_CONCURRENCY)
         else:
-            db.execute("UPDATE tasks SET status = 'DOWNLOADING', download_wait_until = NULL, updated_at = ? WHERE status = 'WAITING_RATE_LIMIT'", (now(),))
+            resumed = db.execute("UPDATE tasks SET status = 'DOWNLOADING', download_wait_until = NULL, updated_at = ? WHERE status = 'WAITING_RATE_LIMIT'", (now(),)).rowcount
+            if resumed:
+                log_event(logging.INFO, "download.rate_limit_recovered", "Expired persisted rate-limit pause was cleared", task_count=resumed)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global DOWNLOAD_DISPATCHER, THUMBNAIL_WORKER
+    global DOWNLOAD_DISPATCHER, THUMBNAIL_WORKER, DOWNLOAD_WAKE, THUMBNAIL_WAKE
+    # TestClient and development reloads may create a new event loop in the same
+    # process.  These wake-up events must belong to the lifespan that owns the
+    # dispatcher workers, rather than a previous loop.
+    DOWNLOAD_WAKE = asyncio.Event()
+    THUMBNAIL_WAKE = asyncio.Event()
     initialize_database()
     restore_download_runtime()
+    log_event(logging.INFO, "service.started", "Telegram media archiver started", log_level=LOG_LEVEL, demo_mode=DEMO_MODE)
     DOWNLOAD_DISPATCHER = asyncio.create_task(download_dispatcher(), name="telegram-download-dispatcher")
     THUMBNAIL_WORKER = asyncio.create_task(thumbnail_worker(), name="archive-thumbnail-worker")
     wake_thumbnail_worker()
     if DEMO_MODE or app_state()["accountConnected"]:
         start_pending_task_workers()
     yield
+    log_event(logging.INFO, "service.stopping", "Telegram media archiver is stopping", active_downloads=len(DOWNLOAD_RUNNING), task_workers=len(TASK_WORKERS))
     if DOWNLOAD_DISPATCHER:
         DOWNLOAD_DISPATCHER.cancel()
         await asyncio.gather(DOWNLOAD_DISPATCHER, return_exceptions=True)
@@ -715,6 +949,7 @@ async def lifespan(_: FastAPI):
     for worker in tuple(TASK_WORKERS.values()):
         worker.cancel()
     await asyncio.gather(*tuple(TASK_WORKERS.values()), return_exceptions=True)
+    log_event(logging.INFO, "service.stopped", "Telegram media archiver stopped")
 
 
 app = FastAPI(title="Telegram 媒体归档器", version="0.1.0", lifespan=lifespan)
@@ -727,6 +962,39 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def structured_access_log(request: Request, call_next: Any) -> Any:
+    """Log request metadata without persisting query strings or request bodies."""
+    started_at = asyncio.get_running_loop().time()
+    client = request.client.host if request.client else None
+    try:
+        response = await call_next(request)
+    except Exception as error:
+        log_event(
+            logging.ERROR,
+            "http.request_failed",
+            "HTTP request failed before a response was produced",
+            exc_info=True,
+            method=request.method,
+            path=request.url.path,
+            client_address=client,
+            duration_ms=round((asyncio.get_running_loop().time() - started_at) * 1000),
+            error_type=type(error).__name__,
+        )
+        raise
+    log_event(
+        logging.INFO,
+        "http.request_completed",
+        "HTTP request completed",
+        method=request.method,
+        path=request.url.path,
+        client_address=client,
+        status_code=response.status_code,
+        duration_ms=round((asyncio.get_running_loop().time() - started_at) * 1000),
+    )
+    return response
+
+
 @app.get("/api/app-state")
 def get_app_state() -> dict[str, Any]:
     return app_state()
@@ -736,6 +1004,7 @@ def get_app_state() -> dict[str, Any]:
 def save_setup(payload: ApiCredentials) -> dict[str, Any]:
     with connection() as db:
         db.execute("UPDATE app_settings SET api_id = ?, api_hash = ?, updated_at = ? WHERE id = 1", (payload.api_id, payload.api_hash, now()))
+    log_event(logging.INFO, "settings.api_credentials_updated", "Telegram API credentials were updated")
     return app_state()
 
 
@@ -775,10 +1044,11 @@ def update_archive_timezone(payload: ArchiveTimezoneSettings) -> dict[str, Any]:
     placeholders = ", ".join("?" for _ in UNFINISHED_TASK_STATUSES)
     with connection() as db:
         db.execute("UPDATE app_settings SET archive_timezone = ?, updated_at = ? WHERE id = 1", (timezone_name, now()))
-        db.execute(
+        backfilled = db.execute(
             f"UPDATE tasks SET archive_timezone = ? WHERE archive_timezone IS NULL AND status IN ({placeholders})",
             (timezone_name, *UNFINISHED_TASK_STATUSES),
-        )
+        ).rowcount
+    log_event(logging.INFO, "settings.archive_timezone_updated", "Archive timezone was updated", archive_timezone=timezone_name, backfilled_task_count=backfilled)
     return app_state()
 
 
@@ -798,6 +1068,7 @@ async def update_download_concurrency(payload: DownloadConcurrencySettings) -> d
     if cancelled:
         await asyncio.gather(*cancelled, return_exceptions=True)
     DOWNLOAD_WAKE.set()
+    log_event(logging.INFO, "settings.download_concurrency_updated", "Download concurrency setting was updated", previous_max_concurrency=previous, max_concurrency=payload.max_concurrency, effective_concurrency=DOWNLOAD_EFFECTIVE_CONCURRENCY, requeued_download_count=len(cancelled))
     return download_runtime_state()
 
 
@@ -809,6 +1080,7 @@ async def send_login_code(payload: LoginCodeRequest) -> dict[str, Any]:
 
     if DEMO_MODE:
         pending_logins[attempt_id] = PendingLogin(phone=phone, phone_code_hash=None, expires_at=datetime.now(UTC) + LOGIN_ATTEMPT_TTL)
+        log_event(logging.INFO, "telegram.login_code_requested", "Demo Telegram login code requested", demo_mode=True)
         return {"attemptId": attempt_id, "passwordRequired": False, "demoHint": "演示模式：可输入任意六码验证码。"}
 
     async with TELEGRAM_LOCK:
@@ -821,9 +1093,11 @@ async def send_login_code(payload: LoginCodeRequest) -> dict[str, Any]:
                 phone_code_hash=sent_code.phone_code_hash,
                 expires_at=datetime.now(UTC) + LOGIN_ATTEMPT_TTL,
             )
+            log_event(logging.INFO, "telegram.login_code_requested", "Telegram login code requested", demo_mode=False)
         except HTTPException:
             raise
         except Exception as error:
+            log_event(logging.ERROR, "telegram.login_code_failed", "Telegram login code request failed", exc_info=True, error_type=type(error).__name__)
             raise_telegram_error(error, during_authorization=True)
         finally:
             if client:
@@ -842,6 +1116,7 @@ async def verify_login_code(payload: LoginCodeVerify) -> dict[str, Any]:
         update_connected_account(attempt.phone, user=object())
         pending_logins.pop(payload.attempt_id, None)
         start_pending_task_workers()
+        log_event(logging.INFO, "telegram.login_succeeded", "Demo Telegram login completed", demo_mode=True)
         return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
     async with TELEGRAM_LOCK:
@@ -851,15 +1126,19 @@ async def verify_login_code(payload: LoginCodeVerify) -> dict[str, Any]:
             try:
                 await client.sign_in(phone=attempt.phone, code=code, phone_code_hash=attempt.phone_code_hash)
             except SessionPasswordNeededError:
+                log_event(logging.INFO, "telegram.password_required", "Telegram login requires two-step verification")
                 return {"passwordRequired": True, "attemptId": payload.attempt_id}
             user = await client.get_me()
             update_connected_account(attempt.phone, user)
             pending_logins.pop(payload.attempt_id, None)
+            log_event(logging.INFO, "telegram.login_succeeded", "Telegram login completed", account_name=getattr(user, "username", None) or getattr(user, "first_name", None))
         except SessionPasswordNeededError:
+            log_event(logging.INFO, "telegram.password_required", "Telegram login requires two-step verification")
             return {"passwordRequired": True, "attemptId": payload.attempt_id}
         except HTTPException:
             raise
         except Exception as error:
+            log_event(logging.ERROR, "telegram.login_failed", "Telegram login verification failed", exc_info=True, error_type=type(error).__name__)
             raise_telegram_error(error, during_authorization=True)
         finally:
             if client:
@@ -876,6 +1155,7 @@ async def verify_login_password(payload: LoginPasswordVerify) -> dict[str, Any]:
         update_connected_account(attempt.phone, user=object())
         pending_logins.pop(payload.attempt_id, None)
         start_pending_task_workers()
+        log_event(logging.INFO, "telegram.login_succeeded", "Demo Telegram two-step login completed", demo_mode=True)
         return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
     async with TELEGRAM_LOCK:
@@ -885,9 +1165,11 @@ async def verify_login_password(payload: LoginPasswordVerify) -> dict[str, Any]:
             user = await client.sign_in(password=payload.password)
             update_connected_account(attempt.phone, user)
             pending_logins.pop(payload.attempt_id, None)
+            log_event(logging.INFO, "telegram.login_succeeded", "Telegram two-step login completed", account_name=getattr(user, "username", None) or getattr(user, "first_name", None))
         except HTTPException:
             raise
         except Exception as error:
+            log_event(logging.ERROR, "telegram.login_failed", "Telegram two-step login failed", exc_info=True, error_type=type(error).__name__)
             raise_telegram_error(error, during_authorization=True)
         finally:
             if client:
@@ -907,10 +1189,11 @@ async def logout() -> dict[str, Any]:
                 client = await open_telegram_client()
                 if await client.is_user_authorized():
                     await client.log_out()
-            except Exception:
+            except Exception as error:
                 # The local session still has to be removed: the user explicitly
                 # requested to remove this server's access to their account.
                 remote_logout_warning = "本地会话已清除，但 Telegram 远端注销未能确认。"
+                log_event(logging.ERROR, "telegram.remote_logout_failed", "Telegram remote logout could not be confirmed", exc_info=True, error_type=type(error).__name__)
             finally:
                 if client:
                     await close_telegram_client(client)
@@ -922,6 +1205,7 @@ async def logout() -> dict[str, Any]:
                connection_status = 'disconnected', updated_at = ? WHERE id = 1""",
             (now(),),
         )
+    log_event(logging.INFO, "telegram.logout_completed", "Telegram local session was cleared", remote_logout_confirmed=remote_logout_warning is None)
     return {**app_state(), "warning": remote_logout_warning}
 
 
@@ -930,11 +1214,13 @@ async def list_chats() -> list[dict[str, Any]]:
     if not app_state()["accountConnected"]:
         raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
     if DEMO_MODE:
-        return [
+        chats = [
             {"id": "demo-tech", "title": "科技前沿观察", "handle": "@tech_frontier_obs", "type": "CHANNEL"},
             {"id": "demo-design", "title": "设计灵感库", "handle": "@design_inspiration_cn", "type": "CHANNEL"},
             {"id": "demo-study", "title": "学习资料库", "handle": "@study_materials_zh", "type": "GROUP"},
         ]
+        log_event(logging.INFO, "telegram.chats_listed", "Demo Telegram chats listed", chat_count=len(chats), demo_mode=True)
+        return chats
 
     async with TELEGRAM_LOCK:
         client: TelegramClient | None = None
@@ -952,10 +1238,12 @@ async def list_chats() -> list[dict[str, Any]]:
                     "handle": f"@{entity.username}" if getattr(entity, "username", None) else None,
                     "type": "CHANNEL" if dialog.is_channel else "GROUP" if dialog.is_group else "PRIVATE",
                 })
+            log_event(logging.INFO, "telegram.chats_listed", "Telegram chats listed", chat_count=len(chats), demo_mode=False)
             return chats
         except HTTPException:
             raise
         except Exception as error:
+            log_event(logging.ERROR, "telegram.chats_list_failed", "Telegram chat listing failed", exc_info=True, error_type=type(error).__name__)
             raise_telegram_error(error)
         finally:
             if client:
@@ -1082,10 +1370,14 @@ def take_cached_scan(payload: ScanRequest) -> list[tuple[int, str, str, str | No
 
 
 async def scan_messages(payload: ScanRequest) -> list[tuple[int, str, str, str | None, int, str]]:
+    started_at = asyncio.get_running_loop().time()
+    log_event(logging.INFO, "scan.started", "Telegram media scan started", chat_id=payload.chat_id, chat_title=payload.chat_title, filters=payload.filters.model_dump(), demo_mode=DEMO_MODE)
     if DEMO_MODE:
         seed = sum(ord(char) for char in payload.chat_id)
         count, size = 160 + seed % 870, 4_000_000 + seed % 10_000_000
-        return [(index, f"demo-{index}.bin", "DOCUMENT", "application/octet-stream", size, now()) for index in range(count)]
+        result = [(index, f"demo-{index}.bin", "DOCUMENT", "application/octet-stream", size, now()) for index in range(count)]
+        log_event(logging.INFO, "scan.completed", "Demo Telegram media scan completed", chat_id=payload.chat_id, chat_title=payload.chat_title, matched_count=len(result), total_bytes=sum(item[4] for item in result), duration_ms=round((asyncio.get_running_loop().time() - started_at) * 1000))
+        return result
     if not app_state()["accountConnected"]:
         raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
     try:
@@ -1116,10 +1408,12 @@ async def scan_messages(payload: ScanRequest) -> list[tuple[int, str, str, str |
         except HTTPException:
             raise
         except Exception as error:
+            log_event(logging.ERROR, "scan.failed", "Telegram media scan failed", exc_info=True, chat_id=payload.chat_id, chat_title=payload.chat_title, error_type=type(error).__name__)
             raise_telegram_error(error)
         finally:
             if client:
                 await close_telegram_client(client)
+    log_event(logging.INFO, "scan.completed", "Telegram media scan completed", chat_id=payload.chat_id, chat_title=payload.chat_title, matched_count=len(result), total_bytes=sum(item[4] for item in result), duration_ms=round((asyncio.get_running_loop().time() - started_at) * 1000))
     return result
 
 
@@ -1127,6 +1421,7 @@ async def scan_messages(payload: ScanRequest) -> list[tuple[int, str, str, str |
 async def scan_task(payload: ScanRequest) -> dict[str, Any]:
     matched = await scan_messages(payload)
     SCAN_CACHE[scan_cache_key(payload)] = (datetime.now(UTC) + SCAN_CACHE_TTL, matched)
+    log_event(logging.INFO, "scan.cached", "Scan result cached for task creation", chat_id=payload.chat_id, chat_title=payload.chat_title, matched_count=len(matched), cache_ttl_seconds=int(SCAN_CACHE_TTL.total_seconds()))
     return {"chat": payload.model_dump(exclude={"filters"}), "filters": payload.filters.model_dump(), "totalCount": len(matched), "totalBytes": sum(item[4] for item in matched), "duplicateCount": 0}
 
 
@@ -1134,7 +1429,10 @@ def update_task(task_id: int, **values: Any) -> None:
     values["updated_at"] = now()
     assignments = ", ".join(f"{key} = ?" for key in values)
     with connection() as db:
-        db.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", (*values.values(), task_id))
+        previous = db.execute("SELECT status, chat_id, chat_title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        updated = db.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", (*values.values(), task_id)).rowcount
+    if updated and previous and "status" in values and values["status"] != previous["status"]:
+        log_event(logging.INFO, "task.state_changed", "Task state changed", task_id=task_id, chat_id=previous["chat_id"], chat_title=previous["chat_title"], previous_status=previous["status"], status=values["status"])
 
 
 def media_payload(record: sqlite3.Row) -> dict[str, Any]:
@@ -1154,11 +1452,14 @@ def update_media(task_id: int, media_id: int, **values: Any) -> int:
         task = db.execute("SELECT media_revision FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not task:
             raise HTTPException(404, "任务不存在")
+        media = db.execute("SELECT status, filename, message_id, media_type, size_bytes FROM task_media WHERE id = ? AND task_id = ?", (media_id, task_id)).fetchone()
         revision = task["media_revision"] + 1
         values.update(updated_at=timestamp, revision=revision)
         assignments = ", ".join(f"{key} = ?" for key in values)
-        db.execute(f"UPDATE task_media SET {assignments} WHERE id = ? AND task_id = ?", (*values.values(), media_id, task_id))
+        updated = db.execute(f"UPDATE task_media SET {assignments} WHERE id = ? AND task_id = ?", (*values.values(), media_id, task_id)).rowcount
         db.execute("UPDATE tasks SET media_revision = ?, updated_at = ? WHERE id = ?", (revision, timestamp, task_id))
+    if updated and media and "status" in values and values["status"] != media["status"]:
+        log_event(logging.INFO, "media.state_changed", "Task media state changed", task_id=task_id, media_id=media_id, message_id=media["message_id"], filename=media["filename"], media_type=media["media_type"], size_bytes=media["size_bytes"], previous_status=media["status"], status=values["status"], failure_category=values.get("failure_category"), retry_at=values.get("next_retry_at"))
     return revision
 
 
@@ -1216,6 +1517,7 @@ async def get_download_client() -> TelegramClient:
     global DOWNLOAD_CLIENT
     async with DOWNLOAD_CLIENT_LOCK:
         if DOWNLOAD_CLIENT and DOWNLOAD_CLIENT.is_connected():
+            log_event(logging.DEBUG, "download.client_reused", "Reusing connected Telegram download client")
             return DOWNLOAD_CLIENT
         async with TELEGRAM_LOCK:
             DOWNLOAD_CLIENT = await open_telegram_client()
@@ -1224,6 +1526,7 @@ async def get_download_client() -> TelegramClient:
                 DOWNLOAD_CLIENT = None
                 mark_session_invalid()
                 raise RuntimeError("Telegram 登录状态已失效")
+        log_event(logging.INFO, "download.client_opened", "Telegram download client opened")
         return DOWNLOAD_CLIENT
 
 
@@ -1234,12 +1537,13 @@ async def close_download_client() -> None:
             async with TELEGRAM_LOCK:
                 await close_telegram_client(DOWNLOAD_CLIENT)
             DOWNLOAD_CLIENT = None
+            log_event(logging.INFO, "download.client_closed", "Telegram download client closed")
 
 
 def claim_next_media(task_id: int) -> sqlite3.Row | None:
     timestamp = now()
     with connection() as db:
-        task = db.execute("SELECT media_revision FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        task = db.execute("SELECT media_revision, chat_id, chat_title FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not task:
             return None
         media = db.execute("""SELECT * FROM task_media WHERE task_id = ? AND
@@ -1254,7 +1558,10 @@ def claim_next_media(task_id: int) -> sqlite3.Row | None:
         if not claimed:
             return None
         db.execute("UPDATE tasks SET status = 'DOWNLOADING', media_revision = ?, download_wait_until = NULL, updated_at = ? WHERE id = ?", (revision, timestamp, task_id))
-        return db.execute("SELECT * FROM task_media WHERE id = ?", (media["id"],)).fetchone()
+        claimed_media = db.execute("SELECT * FROM task_media WHERE id = ?", (media["id"],)).fetchone()
+    if claimed_media:
+        log_event(logging.INFO, "media.claimed", "Media claimed by download dispatcher", task_id=task_id, media_id=claimed_media["id"], chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=claimed_media["message_id"], filename=claimed_media["filename"], media_type=claimed_media["media_type"], size_bytes=claimed_media["size_bytes"], previous_status=media["status"], status="DOWNLOADING")
+    return claimed_media
 
 
 def eligible_task_ids() -> list[int]:
@@ -1304,9 +1611,12 @@ def register_recoverable_error() -> None:
     DOWNLOAD_ERROR_TIMES.append(current)
     while DOWNLOAD_ERROR_TIMES and DOWNLOAD_ERROR_TIMES[0] < current - 60:
         DOWNLOAD_ERROR_TIMES.popleft()
+    previous = DOWNLOAD_EFFECTIVE_CONCURRENCY
     if len(DOWNLOAD_ERROR_TIMES) >= 2:
         DOWNLOAD_EFFECTIVE_CONCURRENCY = max(1, DOWNLOAD_EFFECTIVE_CONCURRENCY - 1)
         DOWNLOAD_ERROR_TIMES.clear()
+    if DOWNLOAD_EFFECTIVE_CONCURRENCY != previous:
+        log_event(logging.WARNING, "download.concurrency_reduced", "Download concurrency reduced after repeated recoverable errors", previous_effective_concurrency=previous, effective_concurrency=DOWNLOAD_EFFECTIVE_CONCURRENCY)
     DOWNLOAD_LAST_ERROR_AT = current
 
 
@@ -1317,14 +1627,19 @@ def register_flood_wait(seconds: int) -> None:
     DOWNLOAD_FLOOD_UNTIL = max(DOWNLOAD_FLOOD_UNTIL, wait_until) if DOWNLOAD_FLOOD_UNTIL else wait_until
     DOWNLOAD_LAST_ERROR_AT = asyncio.get_running_loop().time()
     with connection() as db:
-        db.execute("UPDATE tasks SET status = 'WAITING_RATE_LIMIT', download_wait_until = ?, speed_bytes_per_second = 0, updated_at = ? WHERE status IN ('DOWNLOADING', 'RETRYING')", (DOWNLOAD_FLOOD_UNTIL.isoformat(), now()))
+        affected = db.execute("UPDATE tasks SET status = 'WAITING_RATE_LIMIT', download_wait_until = ?, speed_bytes_per_second = 0, updated_at = ? WHERE status IN ('DOWNLOADING', 'RETRYING')", (DOWNLOAD_FLOOD_UNTIL.isoformat(), now())).rowcount
+    log_event(logging.WARNING, "download.rate_limited", "Telegram rate limit paused all downloads", wait_seconds=seconds, wait_until=DOWNLOAD_FLOOD_UNTIL.isoformat(), task_count=affected, effective_concurrency=DOWNLOAD_EFFECTIVE_CONCURRENCY)
 
 
 def cancel_task_downloads(task_id: int) -> None:
     """Interrupt active transfers for an explicit pause/cancel action."""
+    cancelled = 0
     for (running_task_id, _), worker in tuple(DOWNLOAD_RUNNING.items()):
         if running_task_id == task_id:
             worker.cancel()
+            cancelled += 1
+    if cancelled:
+        log_event(logging.INFO, "download.cancelled_for_task", "Active downloads cancelled for task action", task_id=task_id, cancelled_download_count=cancelled)
 
 
 def release_excess_downloads(limit: int) -> list[asyncio.Task[None]]:
@@ -1344,6 +1659,7 @@ def stop_all_downloads_for_auth_failure(message: str) -> None:
                    error_message = ?, updated_at = ? WHERE status IN ('DOWNLOADING', 'RETRYING', 'WAITING_RATE_LIMIT')""", (message, now()))
     for worker in tuple(DOWNLOAD_RUNNING.values()):
         worker.cancel()
+    log_event(logging.ERROR, "download.stopped_for_auth_failure", "All downloads stopped because Telegram authorization failed", active_download_count=len(DOWNLOAD_RUNNING))
 
 
 async def download_media_job(task_id: int, media_id: int) -> None:
@@ -1353,6 +1669,7 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             media = db.execute("SELECT * FROM task_media WHERE id = ? AND task_id = ?", (media_id, task_id)).fetchone()
         if not task or not media or current_task_status(task_id) not in {"DOWNLOADING", "RETRYING"}:
             return
+        log_event(logging.INFO, "download.started", "Telegram media download started", task_id=task_id, media_id=media_id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], media_type=media["media_type"], size_bytes=media["size_bytes"])
         client = await get_download_client()
         async with TELEGRAM_LOCK:
             entity = await client.get_entity(int(task["chat_id"]))
@@ -1379,6 +1696,7 @@ async def download_media_job(task_id: int, media_id: int) -> None:
         os.replace(part, destination)
         record_archive(task, media, destination)
         update_media(task_id, media_id, status="COMPLETED", downloaded_bytes=media["size_bytes"], speed_bytes_per_second=0, error_message=None, failure_category=None)
+        log_event(logging.INFO, "download.completed", "Telegram media download completed", task_id=task_id, media_id=media_id, filename=media["filename"], archive_path=str(destination), size_bytes=media["size_bytes"])
     except asyncio.CancelledError:
         status = current_task_status(task_id)
         key = (task_id, media_id)
@@ -1389,6 +1707,7 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             update_media(task_id, media_id, status="PENDING", speed_bytes_per_second=0, error_message=None)
         elif status == "CANCELLED":
             update_media(task_id, media_id, status="PENDING", speed_bytes_per_second=0)
+        log_event(logging.INFO, "download.cancelled", "Telegram media download cancelled", task_id=task_id, media_id=media_id, task_status=status)
         raise
     except FloodWaitError as error:
         seconds = max(1, int(getattr(error, "seconds", 1)))
@@ -1401,6 +1720,7 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             update_media(task_id, media_id, status="RETRY_WAIT", speed_bytes_per_second=0, next_retry_at=DOWNLOAD_FLOOD_UNTIL.isoformat() if DOWNLOAD_FLOOD_UNTIL else now(), failure_category="RATE_LIMIT", error_message=f"Telegram 限流，约 {seconds} 秒后自动继续")
             return
         category, recoverable, message = classify_download_error(error)
+        log_event(logging.ERROR if not recoverable else logging.WARNING, "download.failed", "Telegram media download failed", exc_info=True, task_id=task_id, media_id=media_id, error_type=type(error).__name__, failure_category=category, recoverable=recoverable)
         if category == "AUTH":
             mark_session_invalid()
             update_media(task_id, media_id, status="RETRY_WAIT", speed_bytes_per_second=0, failure_category=category, error_message=message)
@@ -1433,13 +1753,16 @@ async def download_dispatcher() -> None:
             if DOWNLOAD_FLOOD_UNTIL and current_time >= DOWNLOAD_FLOOD_UNTIL:
                 DOWNLOAD_FLOOD_UNTIL = None
                 with connection() as db:
-                    db.execute("UPDATE tasks SET status = 'DOWNLOADING', download_wait_until = NULL, updated_at = ? WHERE status = 'WAITING_RATE_LIMIT'", (now(),))
+                    resumed = db.execute("UPDATE tasks SET status = 'DOWNLOADING', download_wait_until = NULL, updated_at = ? WHERE status = 'WAITING_RATE_LIMIT'", (now(),)).rowcount
                 DOWNLOAD_LAST_ERROR_AT = asyncio.get_running_loop().time()
+                log_event(logging.INFO, "download.rate_limit_recovered", "Telegram rate-limit pause ended", task_count=resumed)
             if not DOWNLOAD_FLOOD_UNTIL and DOWNLOAD_LAST_ERROR_AT is not None:
                 monotonic_now = asyncio.get_running_loop().time()
                 if monotonic_now - DOWNLOAD_LAST_ERROR_AT >= STABILITY_WINDOW_SECONDS and DOWNLOAD_EFFECTIVE_CONCURRENCY < max_concurrency:
+                    previous = DOWNLOAD_EFFECTIVE_CONCURRENCY
                     DOWNLOAD_EFFECTIVE_CONCURRENCY += 1
                     DOWNLOAD_LAST_ERROR_AT = monotonic_now
+                    log_event(logging.INFO, "download.concurrency_recovered", "Download concurrency increased after stability window", previous_effective_concurrency=previous, effective_concurrency=DOWNLOAD_EFFECTIVE_CONCURRENCY)
             slots = max(0, DOWNLOAD_EFFECTIVE_CONCURRENCY - len(DOWNLOAD_RUNNING))
             if slots and not DOWNLOAD_FLOOD_UNTIL and (DEMO_MODE or app_state()["accountConnected"]):
                 task_ids = eligible_task_ids()
@@ -1460,8 +1783,9 @@ async def download_dispatcher() -> None:
                 pass
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
             # Keep the dispatcher alive; individual jobs expose their own error state.
+            log_event(logging.ERROR, "download.dispatcher_failed", "Download dispatcher iteration failed", exc_info=True, error_type=type(error).__name__)
             await asyncio.sleep(1)
 
 
@@ -1487,6 +1811,7 @@ def record_archive(task: sqlite3.Row, media: sqlite3.Row, path: Path) -> None:
         db.execute("""INSERT INTO archive_items (blob_id, chat_id, chat_title, message_id, filename, media_type, mime_type, size_bytes, message_date, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (blob_id, task["chat_id"], task["chat_title"], media["message_id"], media["filename"], media["media_type"], media["mime_type"], media["size_bytes"], media["message_date"], now()))
     wake_thumbnail_worker()
+    log_event(logging.INFO, "archive.recorded", "Downloaded media recorded in archive", task_id=task["id"], media_id=media["id"], blob_id=blob_id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], archive_path=str(path), duplicate_blob=bool(existing))
 
 
 async def download_demo_media_job(task_id: int, media_id: int) -> None:
@@ -1502,6 +1827,7 @@ async def download_demo_media_job(task_id: int, media_id: int) -> None:
             update_parallel_download_progress(task_id, media_id, downloaded, 1_000_000)
             if downloaded >= media["size_bytes"]:
                 update_media(task_id, media_id, status="COMPLETED", downloaded_bytes=media["size_bytes"], speed_bytes_per_second=0, error_message=None, failure_category=None)
+                log_event(logging.INFO, "download.completed", "Demo media download completed", task_id=task_id, media_id=media_id, filename=media["filename"], size_bytes=media["size_bytes"], demo_mode=True)
                 return
             await asyncio.sleep(1)
     except asyncio.CancelledError:
@@ -1546,7 +1872,11 @@ async def run_task_worker(task_id: int) -> None:
         if not planned:
             update_task(task_id, status="SCANNING", current_file=None, speed_bytes_per_second=0)
             payload = task_request(task)
-            matched = take_cached_scan(payload) or await scan_messages(payload)
+            matched = take_cached_scan(payload)
+            if matched is not None:
+                log_event(logging.INFO, "scan.cache_hit", "Task worker reused cached scan result", task_id=task_id, chat_id=task["chat_id"], chat_title=task["chat_title"], matched_count=len(matched))
+            else:
+                matched = await scan_messages(payload)
             with connection() as db:
                 db.executemany("""INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date)
                     VALUES (?, ?, ?, ?, ?, ?, ?)""", [(task_id, *item) for item in matched])
@@ -1556,17 +1886,21 @@ async def run_task_worker(task_id: int) -> None:
         notify_download_dispatcher()
         return
     except asyncio.CancelledError:
+        log_event(logging.INFO, "task.worker_cancelled", "Task worker cancelled", task_id=task_id)
         raise
     except Exception as error:
+        log_event(logging.ERROR, "task.worker_failed", "Task worker failed while preparing download list", exc_info=True, task_id=task_id, error_type=type(error).__name__)
         update_task(task_id, status="FAILED", current_file=None, speed_bytes_per_second=0, error_message=f"创建下载清单失败：{str(error) or '请检查 Telegram 连接后重试'}")
     finally:
         TASK_WORKERS.pop(task_id, None)
+        log_event(logging.DEBUG, "task.worker_stopped", "Task worker stopped", task_id=task_id)
 
 
 def start_task_worker(task_id: int) -> None:
     worker = TASK_WORKERS.get(task_id)
     if not worker or worker.done():
         TASK_WORKERS[task_id] = asyncio.create_task(run_task_worker(task_id), name=f"telegram-download-{task_id}")
+        log_event(logging.INFO, "task.worker_started", "Task worker started", task_id=task_id)
 
 
 def start_pending_task_workers() -> None:
@@ -1575,6 +1909,8 @@ def start_pending_task_workers() -> None:
             WHERE status IN ('QUEUED', 'DOWNLOADING', 'SCANNING', 'RETRYING', 'WAITING_RATE_LIMIT')""").fetchall()]
     for task_id in task_ids:
         start_task_worker(task_id)
+    if task_ids:
+        log_event(logging.INFO, "task.workers_restored", "Pending task workers restored", task_count=len(task_ids))
 
 
 @app.post("/api/tasks")
@@ -1586,14 +1922,14 @@ async def create_task(payload: ScanRequest) -> dict[str, Any]:
             raise HTTPException(409, "请先完成归档时区设置")
         cursor = db.execute("""INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, filters_json, status, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?)""", (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], payload.filters.model_dump_json(), created, created))
+    log_event(logging.INFO, "task.created", "Archive task created", task_id=cursor.lastrowid, chat_id=payload.chat_id, chat_title=payload.chat_title, chat_handle=payload.chat_handle, archive_timezone=setting["archive_timezone"], filters=payload.filters.model_dump())
     start_task_worker(cursor.lastrowid)
     return get_task(cursor.lastrowid)
 
 
 @app.post("/api/tasks/{task_id}/pause")
 async def pause_task(task_id: int) -> dict[str, Any]:
-    with connection() as db:
-        db.execute("UPDATE tasks SET status = 'PAUSED', updated_at = ? WHERE id = ?", (now(), task_id))
+    update_task(task_id, status="PAUSED")
     cancel_task_downloads(task_id)
     notify_download_dispatcher()
     return get_task(task_id)
@@ -1601,8 +1937,7 @@ async def pause_task(task_id: int) -> dict[str, Any]:
 
 @app.post("/api/tasks/{task_id}/resume")
 async def resume_task(task_id: int) -> dict[str, Any]:
-    with connection() as db:
-        db.execute("UPDATE tasks SET status = 'DOWNLOADING', updated_at = ? WHERE id = ?", (now(), task_id))
+    update_task(task_id, status="DOWNLOADING")
     start_task_worker(task_id)
     notify_download_dispatcher()
     return get_task(task_id)
@@ -1610,8 +1945,7 @@ async def resume_task(task_id: int) -> dict[str, Any]:
 
 @app.post("/api/tasks/{task_id}/cancel")
 async def cancel_task(task_id: int) -> dict[str, Any]:
-    with connection() as db:
-        db.execute("UPDATE tasks SET status = 'CANCELLED', updated_at = ? WHERE id = ?", (now(), task_id))
+    update_task(task_id, status="CANCELLED")
     cancel_task_downloads(task_id)
     notify_download_dispatcher()
     return get_task(task_id)
@@ -1624,6 +1958,7 @@ async def retry_task(task_id: int) -> dict[str, Any]:
     for media_id in failed_ids:
         update_media(task_id, media_id, status="PENDING", downloaded_bytes=0, speed_bytes_per_second=0, attempt_count=0, next_retry_at=None, failure_category=None, error_message=None)
     update_task(task_id, status="DOWNLOADING", failed_count=0, error_message=None)
+    log_event(logging.INFO, "task.retry_requested", "Failed task media queued for retry", task_id=task_id, media_count=len(failed_ids))
     start_task_worker(task_id)
     notify_download_dispatcher()
     return get_task(task_id)
