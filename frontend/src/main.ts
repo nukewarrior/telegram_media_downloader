@@ -11,6 +11,7 @@ const router = createRouter({
     { path: '/tasks', component: () => import('./views/TasksView.vue') },
     { path: '/tasks/new', component: () => import('./views/NewTaskView.vue') },
     { path: '/tasks/:id', component: () => import('./views/TaskDetailView.vue') },
+    { path: '/sources', component: () => import('./views/SourcesView.vue') },
     { path: '/archives', component: () => import('./views/ArchivesView.vue') },
     { path: '/settings', component: () => import('./views/SettingsView.vue') },
   ],

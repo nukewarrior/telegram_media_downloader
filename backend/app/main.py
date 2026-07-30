@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import gzip
 import hashlib
 import json
@@ -35,6 +36,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "app.db"
 DOWNLOAD_ROOT = os.getenv("DOWNLOAD_ROOT", str(DATA_DIR / "downloads"))
 THUMBNAIL_ROOT = DATA_DIR / "thumbnails"
+PREVIEW_ROOT = DATA_DIR / "previews"
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 STATIC_DIR = Path(os.getenv("STATIC_DIR", "./static"))
 SESSION_DIR = DATA_DIR / "sessions"
@@ -47,6 +49,7 @@ THUMBNAIL_WORKER: asyncio.Task[None] | None = None
 DOWNLOAD_CLIENT: TelegramClient | None = None
 DOWNLOAD_CLIENT_RESET_REQUESTED = False
 DOWNLOAD_RUNNING: dict[tuple[int, int], asyncio.Task[None]] = {}
+PREVIEW_RUNNING: dict[int, asyncio.Task[None]] = {}
 DOWNLOAD_REQUEUED_CANCELS: set[tuple[int, int]] = set()
 DOWNLOAD_WAKE = asyncio.Event()
 THUMBNAIL_WAKE = asyncio.Event()
@@ -60,6 +63,8 @@ RETRY_DELAYS_SECONDS = (5, 30, 120)
 STABILITY_WINDOW_SECONDS = 5 * 60
 SCAN_CACHE_TTL = timedelta(minutes=10)
 SCAN_CACHE: dict[str, tuple[datetime, list[tuple[int, str, str, str | None, int, str]]]] = {}
+PREVIEW_CACHE_TTL = timedelta(hours=24)
+PREVIEW_LAST_CLEANUP_AT: datetime | None = None
 AVAILABLE_TIMEZONES = frozenset(available_timezones())
 UNFINISHED_TASK_STATUSES = ("QUEUED", "SCANNING", "DOWNLOADING", "RETRYING", "WAITING_RATE_LIMIT", "PAUSED")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -454,6 +459,7 @@ def initialize_database() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     Path(DOWNLOAD_ROOT).mkdir(parents=True, exist_ok=True)
     THUMBNAIL_ROOT.mkdir(parents=True, exist_ok=True)
+    PREVIEW_ROOT.mkdir(parents=True, exist_ok=True)
     ensure_session_storage()
     with connection() as db:
         db.executescript(
@@ -542,7 +548,25 @@ def initialize_database() -> None:
               attempt_count INTEGER NOT NULL DEFAULT 0,
               next_retry_at TEXT,
               failure_category TEXT,
+              preview_cache_id INTEGER,
               UNIQUE(task_id, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS preview_cache (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              chat_id TEXT NOT NULL,
+              message_id INTEGER NOT NULL,
+              filename TEXT NOT NULL,
+              media_type TEXT NOT NULL,
+              mime_type TEXT,
+              size_bytes INTEGER NOT NULL,
+              message_date TEXT NOT NULL,
+              cache_path TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'PENDING',
+              downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+              error_message TEXT,
+              expires_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(chat_id, message_id)
             );
             """
         )
@@ -582,12 +606,15 @@ def initialize_database() -> None:
             db.execute("ALTER TABLE task_media ADD COLUMN next_retry_at TEXT")
         if "failure_category" not in task_media_columns:
             db.execute("ALTER TABLE task_media ADD COLUMN failure_category TEXT")
+        if "preview_cache_id" not in task_media_columns:
+            db.execute("ALTER TABLE task_media ADD COLUMN preview_cache_id INTEGER")
         # A process restart cannot safely resume an in-flight Telethon transfer.
         # Keep completed work and return only the interrupted file to the queue.
         db.execute("UPDATE task_media SET status = 'PENDING', speed_bytes_per_second = 0 WHERE status = 'DOWNLOADING'")
         if DEMO_MODE and db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0:
             seed_demo_data(db)
     reconcile_thumbnail_records()
+    cleanup_preview_cache()
     log_event(logging.INFO, "database.initialized", "Database and runtime directories are ready", data_dir=str(DATA_DIR), download_root=str(DOWNLOAD_ROOT), demo_mode=DEMO_MODE)
 
 
@@ -850,6 +877,21 @@ class ArchiveQuery(BaseModel):
     month: str | None = None
 
 
+class SelectionTaskRequest(BaseModel):
+    chat_id: str
+    chat_title: str = Field(min_length=1, max_length=255)
+    chat_handle: str | None = None
+    message_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+class PreviewRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=180)
+    media_type: Literal["PHOTO", "VIDEO", "AUDIO", "DOCUMENT"]
+    mime_type: str | None = Field(default=None, max_length=255)
+    size_bytes: int = Field(ge=0)
+    message_date: str
+
+
 def masked_api_id(api_id: str | None) -> str | None:
     if not api_id:
         return None
@@ -894,7 +936,7 @@ def download_runtime_state() -> dict[str, Any]:
     return {
         "maxConcurrency": setting["download_concurrency_max"],
         "effectiveConcurrency": min(DOWNLOAD_EFFECTIVE_CONCURRENCY, setting["download_concurrency_max"]),
-        "activeDownloads": len(DOWNLOAD_RUNNING),
+        "activeDownloads": len(DOWNLOAD_RUNNING) + len(PREVIEW_RUNNING),
         "waitUntil": DOWNLOAD_FLOOD_UNTIL.isoformat() if DOWNLOAD_FLOOD_UNTIL else None,
     }
 
@@ -951,7 +993,9 @@ async def lifespan(_: FastAPI):
         await asyncio.gather(THUMBNAIL_WORKER, return_exceptions=True)
     for worker in tuple(DOWNLOAD_RUNNING.values()):
         worker.cancel()
-    await asyncio.gather(*tuple(DOWNLOAD_RUNNING.values()), return_exceptions=True)
+    for worker in tuple(PREVIEW_RUNNING.values()):
+        worker.cancel()
+    await asyncio.gather(*tuple(DOWNLOAD_RUNNING.values()), *tuple(PREVIEW_RUNNING.values()), return_exceptions=True)
     await close_download_client()
     for worker in tuple(TASK_WORKERS.values()):
         worker.cancel()
@@ -1424,6 +1468,138 @@ async def scan_messages(payload: ScanRequest) -> list[tuple[int, str, str, str |
     return result
 
 
+def source_cursor(message_id: int) -> str:
+    return base64.urlsafe_b64encode(str(message_id).encode()).decode().rstrip("=")
+
+
+def parse_source_cursor(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        result = int(base64.urlsafe_b64decode(padded).decode())
+    except (ValueError, UnicodeDecodeError, base64.binascii.Error) as error:
+        raise HTTPException(400, "媒体分页游标无效") from error
+    if result <= 0:
+        raise HTTPException(400, "媒体分页游标无效")
+    return result
+
+
+def source_item_states(chat_id: str, message_ids: list[int]) -> tuple[dict[int, int], set[int], dict[int, sqlite3.Row]]:
+    if not message_ids:
+        return {}, set(), {}
+    placeholders = ", ".join("?" for _ in message_ids)
+    with connection() as db:
+        archived = db.execute(
+            f"SELECT message_id, id FROM archive_items WHERE chat_id = ? AND message_id IN ({placeholders})",
+            (chat_id, *message_ids),
+        ).fetchall()
+        queued = db.execute(
+            f"""SELECT DISTINCT m.message_id FROM task_media m JOIN tasks t ON t.id = m.task_id
+                WHERE t.chat_id = ? AND m.message_id IN ({placeholders})
+                AND t.status IN ('QUEUED', 'SCANNING', 'DOWNLOADING', 'RETRYING', 'WAITING_RATE_LIMIT', 'PAUSED')""",
+            (chat_id, *message_ids),
+        ).fetchall()
+        previews = db.execute(
+            f"SELECT * FROM preview_cache WHERE chat_id = ? AND message_id IN ({placeholders})",
+            (chat_id, *message_ids),
+        ).fetchall()
+    return ({record["message_id"]: record["id"] for record in archived}, {record["message_id"] for record in queued}, {record["message_id"]: record for record in previews})
+
+
+def preview_payload(record: sqlite3.Row) -> dict[str, Any]:
+    payload = dict(record)
+    ready = record["status"] == "READY" and path_in_root(record["cache_path"], PREVIEW_ROOT)
+    payload["content_url"] = f"/api/previews/{record['id']}/content" if ready else None
+    return payload
+
+
+def source_media_payload(item: tuple[int, str, str, str | None, int, str], archive_ids: dict[int, int], queued_ids: set[int], previews: dict[int, sqlite3.Row]) -> dict[str, Any]:
+    message_id, filename, media_type, mime_type, size_bytes, message_date = item
+    preview = previews.get(message_id)
+    preview_data = preview_payload(preview) if preview else None
+    return {
+        "message_id": message_id,
+        "filename": filename,
+        "media_type": media_type,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+        "message_date": message_date,
+        "archived": message_id in archive_ids,
+        "archive_id": archive_ids.get(message_id),
+        "queued": message_id in queued_ids,
+        "thumbnail_status": "READY" if preview_data and preview_data["content_url"] and media_type in {"PHOTO", "VIDEO"} else (preview["status"] if preview else "UNAVAILABLE"),
+        "thumbnail_url": preview_data["content_url"] if preview_data and media_type in {"PHOTO", "VIDEO"} else None,
+        "preview": preview_data,
+    }
+
+
+def demo_source_media(chat_id: str, offset: int | None, media_types: set[str]) -> list[tuple[int, str, str, str | None, int, str]]:
+    upper = offset - 1 if offset else 240
+    result = []
+    for message_id in range(upper, max(0, upper - 120), -1):
+        media_type = ("PHOTO", "VIDEO", "DOCUMENT", "PHOTO")[message_id % 4]
+        if media_type not in media_types:
+            continue
+        extension = {"PHOTO": "jpg", "VIDEO": "mp4", "DOCUMENT": "pdf"}[media_type]
+        result.append((message_id, f"demo-{message_id}.{extension}", media_type, {"PHOTO": "image/jpeg", "VIDEO": "video/mp4", "DOCUMENT": "application/pdf"}[media_type], (message_id % 17 + 1) * 1_000_000, (datetime.now(UTC) - timedelta(hours=message_id)).isoformat()))
+    return result
+
+
+@app.get("/api/sources/{chat_id}/media")
+async def browse_source_media(chat_id: str, cursor: str | None = None, media_type: str | None = None, date_start: str | None = None, date_end: str | None = None, page_size: int = 30) -> dict[str, Any]:
+    if not 1 <= page_size <= 50:
+        raise HTTPException(400, "每页媒体数量必须在 1 到 50 之间")
+    allowed_types = {"PHOTO", "VIDEO", "AUDIO", "DOCUMENT"}
+    requested_types = {media_type} if media_type else allowed_types
+    if not requested_types <= allowed_types:
+        raise HTTPException(400, "媒体类型无效")
+    try:
+        if date_start:
+            date.fromisoformat(date_start)
+        if date_end:
+            date.fromisoformat(date_end)
+        filters = TaskFilters(media_types=list(requested_types), date_start=date_start, date_end=date_end)
+        offset = parse_source_cursor(cursor)
+    except ValueError as error:
+        raise HTTPException(400, "日期格式无效") from error
+    matched: list[tuple[int, str, str, str | None, int, str]] = []
+    if DEMO_MODE:
+        matched = demo_source_media(chat_id, offset, requested_types)
+    else:
+        if not app_state()["accountConnected"]:
+            raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
+        async with TELEGRAM_LOCK:
+            client: TelegramClient | None = None
+            try:
+                client = await open_telegram_client()
+                if not await client.is_user_authorized():
+                    mark_session_invalid()
+                    raise HTTPException(409, "Telegram 登录状态已失效，请重新连接账号")
+                entity = await client.get_entity(int(chat_id))
+                async for message in client.iter_messages(entity, offset_id=offset or 0):
+                    match = matching_media(message, filters)
+                    if match:
+                        kind, size, mime_type = match
+                        matched.append((message.id, filename_for(message, kind), kind, mime_type, size, message.date.isoformat()))
+                    if len(matched) >= page_size + 1:
+                        break
+            except HTTPException:
+                raise
+            except Exception as error:
+                log_event(logging.ERROR, "source_media.list_failed", "Unable to list source media", exc_info=True, chat_id=chat_id, error_type=type(error).__name__)
+                raise_telegram_error(error)
+            finally:
+                if client:
+                    await close_telegram_client(client)
+    visible, overflow = matched[:page_size], matched[page_size:]
+    archive_ids, queued_ids, previews = source_item_states(chat_id, [item[0] for item in visible])
+    return {
+        "items": [source_media_payload(item, archive_ids, queued_ids, previews) for item in visible],
+        "next_cursor": source_cursor(visible[-1][0]) if overflow and visible else None,
+    }
+
+
 @app.post("/api/tasks/scan")
 async def scan_task(payload: ScanRequest) -> dict[str, Any]:
     matched = await scan_messages(payload)
@@ -1559,7 +1735,7 @@ def request_download_client_reset(task_id: int, media_id: int) -> None:
         "Telegram download client will be rebuilt after active downloads finish",
         task_id=task_id,
         media_id=media_id,
-        active_download_count=len(DOWNLOAD_RUNNING),
+        active_download_count=len(DOWNLOAD_RUNNING) + len(PREVIEW_RUNNING),
     )
     notify_download_dispatcher()
 
@@ -1567,7 +1743,7 @@ def request_download_client_reset(task_id: int, media_id: int) -> None:
 async def reset_download_client_if_requested() -> None:
     """Close the shared client only after no worker can still be using it."""
     global DOWNLOAD_CLIENT, DOWNLOAD_CLIENT_RESET_REQUESTED
-    if not DOWNLOAD_CLIENT_RESET_REQUESTED or DOWNLOAD_RUNNING:
+    if not DOWNLOAD_CLIENT_RESET_REQUESTED or DOWNLOAD_RUNNING or PREVIEW_RUNNING:
         return
     try:
         await close_download_client()
@@ -1705,7 +1881,113 @@ def stop_all_downloads_for_auth_failure(message: str) -> None:
                    error_message = ?, updated_at = ? WHERE status IN ('DOWNLOADING', 'RETRYING', 'WAITING_RATE_LIMIT')""", (message, now()))
     for worker in tuple(DOWNLOAD_RUNNING.values()):
         worker.cancel()
+    for worker in tuple(PREVIEW_RUNNING.values()):
+        worker.cancel()
     log_event(logging.ERROR, "download.stopped_for_auth_failure", "All downloads stopped because Telegram authorization failed", active_download_count=len(DOWNLOAD_RUNNING))
+
+
+def preview_part_path(record: sqlite3.Row) -> Path | None:
+    cached = path_in_root(record["cache_path"], PREVIEW_ROOT)
+    return cached.with_suffix(cached.suffix + ".part") if cached else None
+
+
+def cleanup_preview_cache() -> None:
+    """Remove expired preview data that has not been adopted by a download task."""
+    try:
+        with connection() as db:
+            records = db.execute(
+                """SELECT p.* FROM preview_cache p WHERE p.expires_at <= ?
+                   AND NOT EXISTS (SELECT 1 FROM task_media m WHERE m.preview_cache_id = p.id)""",
+                (now(),),
+            ).fetchall()
+            db.executemany("DELETE FROM preview_cache WHERE id = ?", [(record["id"],) for record in records])
+        for record in records:
+            cached = path_in_root(record["cache_path"], PREVIEW_ROOT)
+            part = preview_part_path(record)
+            if cached:
+                cached.unlink(missing_ok=True)
+            if part:
+                part.unlink(missing_ok=True)
+        if records:
+            log_event(logging.INFO, "preview.cache_cleaned", "Expired preview cache removed", cache_count=len(records))
+    except (OSError, sqlite3.Error) as error:
+        log_event(logging.WARNING, "preview.cache_cleanup_failed", "Unable to clean expired preview cache", exc_info=True, error_type=type(error).__name__)
+
+
+def update_preview_cache(cache_id: int, **values: Any) -> None:
+    values["updated_at"] = now()
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with connection() as db:
+        db.execute(f"UPDATE preview_cache SET {assignments} WHERE id = ?", (*values.values(), cache_id))
+
+
+def claim_next_preview() -> sqlite3.Row | None:
+    with connection() as db:
+        record = db.execute("SELECT * FROM preview_cache WHERE status = 'PENDING' ORDER BY updated_at LIMIT 1").fetchone()
+        if not record:
+            return None
+        claimed = db.execute("UPDATE preview_cache SET status = 'DOWNLOADING', error_message = NULL, updated_at = ? WHERE id = ? AND status = 'PENDING'", (now(), record["id"])).rowcount
+        return db.execute("SELECT * FROM preview_cache WHERE id = ?", (record["id"],)).fetchone() if claimed else None
+
+
+async def preview_download_job(cache_id: int) -> None:
+    try:
+        with connection() as db:
+            record = db.execute("SELECT * FROM preview_cache WHERE id = ?", (cache_id,)).fetchone()
+        if not record or record["status"] != "DOWNLOADING":
+            return
+        cached = path_in_root(record["cache_path"], PREVIEW_ROOT)
+        part = preview_part_path(record)
+        if not cached or not part:
+            raise RuntimeError("预览缓存路径无效")
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        if DEMO_MODE:
+            remaining = max(0, record["size_bytes"] - record["downloaded_bytes"])
+            with part.open("ab") as output:
+                output.truncate(record["downloaded_bytes"] + remaining)
+            os.replace(part, cached)
+        else:
+            client = await get_download_client()
+            async with TELEGRAM_LOCK:
+                entity = await client.get_entity(int(record["chat_id"]))
+                message = await client.get_messages(entity, ids=record["message_id"])
+            if not message:
+                raise RuntimeError("消息已不可用")
+            started = asyncio.get_running_loop().time()
+            last_persisted = 0.0
+            base_bytes = part.stat().st_size if part.is_file() else 0
+
+            def progress(current: int, total: int) -> None:
+                nonlocal last_persisted
+                current_time = asyncio.get_running_loop().time()
+                if current != total and current_time - last_persisted < 1:
+                    return
+                last_persisted = current_time
+                update_preview_cache(cache_id, downloaded_bytes=min(record["size_bytes"], base_bytes + current))
+
+            result = await client.download_media(message, file=str(part), progress_callback=progress)
+            if not result:
+                raise RuntimeError("Telegram 未返回预览文件")
+            os.replace(part, cached)
+        update_preview_cache(cache_id, status="READY", downloaded_bytes=record["size_bytes"], error_message=None, expires_at=(datetime.now(UTC) + PREVIEW_CACHE_TTL).isoformat())
+        log_event(logging.INFO, "preview.ready", "Source media preview ready", preview_id=cache_id, chat_id=record["chat_id"], message_id=record["message_id"], size_bytes=record["size_bytes"])
+    except asyncio.CancelledError:
+        with connection() as db:
+            record = db.execute("SELECT * FROM preview_cache WHERE id = ?", (cache_id,)).fetchone()
+        part = preview_part_path(record) if record else None
+        update_preview_cache(cache_id, status="PENDING", downloaded_bytes=part.stat().st_size if part and part.is_file() else 0)
+        raise
+    except FloodWaitError as error:
+        register_flood_wait(max(1, int(getattr(error, "seconds", 1))))
+        update_preview_cache(cache_id, status="PENDING", error_message="Telegram 限流，预览将在等待结束后继续")
+    except Exception as error:
+        category, recoverable, message = classify_download_error(error)
+        update_preview_cache(cache_id, status="FAILED", error_message=message)
+        log_event(logging.WARNING, "preview.failed", "Source media preview failed", exc_info=True, preview_id=cache_id, error_type=type(error).__name__, failure_category=category)
+    finally:
+        PREVIEW_RUNNING.pop(cache_id, None)
+        await reset_download_client_if_requested()
+        notify_download_dispatcher()
 
 
 async def download_media_job(task_id: int, media_id: int) -> None:
@@ -1716,15 +1998,34 @@ async def download_media_job(task_id: int, media_id: int) -> None:
         if not task or not media or current_task_status(task_id) not in {"DOWNLOADING", "RETRYING"}:
             return
         log_event(logging.INFO, "download.started", "Telegram media download started", task_id=task_id, media_id=media_id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], media_type=media["media_type"], size_bytes=media["size_bytes"])
+        destination = archive_destination(task, media)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        part = destination.with_suffix(destination.suffix + ".part")
+        if media["preview_cache_id"]:
+            with connection() as db:
+                preview = db.execute("SELECT * FROM preview_cache WHERE id = ?", (media["preview_cache_id"],)).fetchone()
+            preview_file = path_in_root(preview["cache_path"], PREVIEW_ROOT) if preview else None
+            preview_part = preview_part_path(preview) if preview else None
+            if preview and preview["status"] == "READY" and preview_file and preview_file.is_file():
+                os.replace(preview_file, destination)
+                update_preview_cache(preview["id"], status="CONSUMED", expires_at=now())
+                with connection() as db:
+                    db.execute("UPDATE task_media SET preview_cache_id = NULL WHERE id = ?", (media_id,))
+                record_archive(task, media, destination)
+                update_media(task_id, media_id, status="COMPLETED", downloaded_bytes=media["size_bytes"], speed_bytes_per_second=0, error_message=None, failure_category=None)
+                log_event(logging.INFO, "download.preview_adopted", "Completed preview adopted without another Telegram download", task_id=task_id, media_id=media_id, preview_id=preview["id"])
+                return
+            if preview_part and preview_part.is_file() and not part.exists():
+                os.replace(preview_part, part)
+                update_preview_cache(preview["id"], status="CONSUMED", expires_at=now())
+                with connection() as db:
+                    db.execute("UPDATE task_media SET preview_cache_id = NULL WHERE id = ?", (media_id,))
         client = await get_download_client()
         async with TELEGRAM_LOCK:
             entity = await client.get_entity(int(task["chat_id"]))
             message = await client.get_messages(entity, ids=media["message_id"])
         if not message:
             raise RuntimeError("消息已不可用")
-        destination = archive_destination(task, media)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        part = destination.with_suffix(destination.suffix + ".part")
         started_at = asyncio.get_running_loop().time()
         last_persisted_at = 0.0
 
@@ -1793,12 +2094,15 @@ async def download_media_job(task_id: int, media_id: int) -> None:
 
 
 async def download_dispatcher() -> None:
-    global DOWNLOAD_EFFECTIVE_CONCURRENCY, DOWNLOAD_FLOOD_UNTIL, DOWNLOAD_LAST_ERROR_AT, DOWNLOAD_ROUND_ROBIN_OFFSET
+    global DOWNLOAD_EFFECTIVE_CONCURRENCY, DOWNLOAD_FLOOD_UNTIL, DOWNLOAD_LAST_ERROR_AT, DOWNLOAD_ROUND_ROBIN_OFFSET, PREVIEW_LAST_CLEANUP_AT
     while True:
         try:
             max_concurrency = configured_download_concurrency()
             DOWNLOAD_EFFECTIVE_CONCURRENCY = min(DOWNLOAD_EFFECTIVE_CONCURRENCY, max_concurrency)
             current_time = datetime.now(UTC)
+            if PREVIEW_LAST_CLEANUP_AT is None or current_time - PREVIEW_LAST_CLEANUP_AT >= timedelta(minutes=1):
+                cleanup_preview_cache()
+                PREVIEW_LAST_CLEANUP_AT = current_time
             if DOWNLOAD_FLOOD_UNTIL and current_time >= DOWNLOAD_FLOOD_UNTIL:
                 DOWNLOAD_FLOOD_UNTIL = None
                 with connection() as db:
@@ -1812,8 +2116,16 @@ async def download_dispatcher() -> None:
                     DOWNLOAD_EFFECTIVE_CONCURRENCY += 1
                     DOWNLOAD_LAST_ERROR_AT = monotonic_now
                     log_event(logging.INFO, "download.concurrency_recovered", "Download concurrency increased after stability window", previous_effective_concurrency=previous, effective_concurrency=DOWNLOAD_EFFECTIVE_CONCURRENCY)
-            slots = max(0, DOWNLOAD_EFFECTIVE_CONCURRENCY - len(DOWNLOAD_RUNNING))
+            slots = max(0, DOWNLOAD_EFFECTIVE_CONCURRENCY - len(DOWNLOAD_RUNNING) - len(PREVIEW_RUNNING))
             if slots and not DOWNLOAD_FLOOD_UNTIL and not DOWNLOAD_CLIENT_RESET_REQUESTED and (DEMO_MODE or app_state()["accountConnected"]):
+                # A clicked preview should receive the next available slot, but it
+                # never interrupts a task that is already writing an archive file.
+                while slots:
+                    preview = claim_next_preview()
+                    if not preview:
+                        break
+                    PREVIEW_RUNNING[preview["id"]] = asyncio.create_task(preview_download_job(preview["id"]), name=f"telegram-preview-{preview['id']}")
+                    slots -= 1
                 task_ids = eligible_task_ids()
                 if task_ids:
                     offset = DOWNLOAD_ROUND_ROBIN_OFFSET % len(task_ids)
@@ -1932,6 +2244,8 @@ async def run_task_worker(task_id: int) -> None:
             update_task(task_id, status="DOWNLOADING", total_count=len(matched), total_bytes=sum(item[4] for item in matched), completed_count=0, downloaded_bytes=0, failed_count=0)
             if not matched:
                 finalize_task_status(task_id)
+        else:
+            update_task(task_id, status="DOWNLOADING", current_file=None, speed_bytes_per_second=0)
         notify_download_dispatcher()
         return
     except asyncio.CancelledError:
@@ -1974,6 +2288,144 @@ async def create_task(payload: ScanRequest) -> dict[str, Any]:
     log_event(logging.INFO, "task.created", "Archive task created", task_id=cursor.lastrowid, chat_id=payload.chat_id, chat_title=payload.chat_title, chat_handle=payload.chat_handle, archive_timezone=setting["archive_timezone"], filters=payload.filters.model_dump())
     start_task_worker(cursor.lastrowid)
     return get_task(cursor.lastrowid)
+
+
+async def selected_source_messages(payload: SelectionTaskRequest) -> list[tuple[int, str, str, str | None, int, str]]:
+    requested_ids = list(dict.fromkeys(payload.message_ids))
+    if DEMO_MODE:
+        available = {item[0]: item for item in demo_source_media(payload.chat_id, None, {"PHOTO", "VIDEO", "DOCUMENT", "AUDIO"})}
+        return [available[item_id] for item_id in requested_ids if item_id in available]
+    if not app_state()["accountConnected"]:
+        raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
+    async with TELEGRAM_LOCK:
+        client: TelegramClient | None = None
+        try:
+            client = await open_telegram_client()
+            if not await client.is_user_authorized():
+                mark_session_invalid()
+                raise HTTPException(409, "Telegram 登录状态已失效，请重新连接账号")
+            entity = await client.get_entity(int(payload.chat_id))
+            messages = await client.get_messages(entity, ids=requested_ids)
+            if not isinstance(messages, list):
+                messages = [messages]
+            result = []
+            for message in messages:
+                match = matching_media(message, TaskFilters(media_types=["PHOTO", "VIDEO", "AUDIO", "DOCUMENT"])) if message else None
+                if match:
+                    media_type, size, mime_type = match
+                    result.append((message.id, filename_for(message, media_type), media_type, mime_type, size, message.date.isoformat()))
+            return result
+        except HTTPException:
+            raise
+        except Exception as error:
+            log_event(logging.ERROR, "source_media.selection_validation_failed", "Unable to validate selected Telegram messages", exc_info=True, chat_id=payload.chat_id, error_type=type(error).__name__)
+            raise_telegram_error(error)
+        finally:
+            if client:
+                await close_telegram_client(client)
+
+
+@app.post("/api/tasks/selection")
+async def create_selection_task(payload: SelectionTaskRequest) -> dict[str, Any]:
+    selected = await selected_source_messages(payload)
+    if not selected:
+        raise HTTPException(409, "所选文件已不可用，或不再包含可下载媒体")
+    archive_ids, queued_ids, previews = source_item_states(payload.chat_id, [item[0] for item in selected])
+    accepted = [item for item in selected if item[0] not in archive_ids and item[0] not in queued_ids]
+    if not accepted:
+        raise HTTPException(409, "所选文件已归档或已加入下载队列")
+    preview_workers: list[asyncio.Task[None]] = []
+    for item in accepted:
+        preview = previews.get(item[0])
+        if preview and preview["status"] == "DOWNLOADING":
+            worker = PREVIEW_RUNNING.get(preview["id"])
+            if worker:
+                worker.cancel()
+                preview_workers.append(worker)
+    if preview_workers:
+        await asyncio.gather(*preview_workers, return_exceptions=True)
+    created = now()
+    with connection() as db:
+        setting = db.execute("SELECT archive_timezone FROM app_settings WHERE id = 1").fetchone()
+        if not setting or not setting["archive_timezone"]:
+            raise HTTPException(409, "请先完成归档时区设置")
+        cursor = db.execute(
+            """INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, filters_json, status, total_count, total_bytes, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?)""",
+            (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], json.dumps({"mode": "selection", "message_ids": [item[0] for item in accepted]}, ensure_ascii=False), len(accepted), sum(item[4] for item in accepted), created, created),
+        )
+        task_id = cursor.lastrowid
+        db.executemany(
+            """INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date, preview_cache_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(task_id, *item, previews[item[0]]["id"] if item[0] in previews else None) for item in accepted],
+        )
+    log_event(logging.INFO, "task.selection_created", "Selected media task created", task_id=task_id, chat_id=payload.chat_id, chat_title=payload.chat_title, media_count=len(accepted), skipped_archived=len(selected) - len(accepted))
+    start_task_worker(task_id)
+    return get_task(task_id)
+
+
+@app.post("/api/sources/{chat_id}/media/{message_id}/preview")
+async def start_source_preview(chat_id: str, message_id: int, payload: PreviewRequest) -> dict[str, Any]:
+    if message_id <= 0:
+        raise HTTPException(400, "消息编号无效")
+    cleanup_preview_cache()
+    with connection() as db:
+        record = db.execute("SELECT * FROM preview_cache WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)).fetchone()
+        if record:
+            if record["status"] == "FAILED":
+                db.execute("UPDATE preview_cache SET status = 'PENDING', error_message = NULL, expires_at = ?, updated_at = ? WHERE id = ?", ((datetime.now(UTC) + PREVIEW_CACHE_TTL).isoformat(), now(), record["id"]))
+                record = db.execute("SELECT * FROM preview_cache WHERE id = ?", (record["id"],)).fetchone()
+            else:
+                db.execute("UPDATE preview_cache SET expires_at = ?, updated_at = ? WHERE id = ?", ((datetime.now(UTC) + PREVIEW_CACHE_TTL).isoformat(), now(), record["id"]))
+                record = db.execute("SELECT * FROM preview_cache WHERE id = ?", (record["id"],)).fetchone()
+        else:
+            temporary_path = PREVIEW_ROOT / f"pending-{secrets.token_hex(8)}"
+            cache_id = db.execute(
+                """INSERT INTO preview_cache (chat_id, message_id, filename, media_type, mime_type, size_bytes, message_date, cache_path, expires_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (chat_id, message_id, safe_filename(payload.filename), payload.media_type, payload.mime_type, payload.size_bytes, payload.message_date, str(temporary_path), (datetime.now(UTC) + PREVIEW_CACHE_TTL).isoformat(), now()),
+            ).lastrowid
+            extension = Path(safe_filename(payload.filename)).suffix or ".bin"
+            final_path = PREVIEW_ROOT / f"preview-{cache_id}{extension}"
+            db.execute("UPDATE preview_cache SET cache_path = ? WHERE id = ?", (str(final_path), cache_id))
+            record = db.execute("SELECT * FROM preview_cache WHERE id = ?", (cache_id,)).fetchone()
+    notify_download_dispatcher()
+    return preview_payload(record)
+
+
+@app.get("/api/previews/{cache_id}")
+def get_source_preview(cache_id: int) -> dict[str, Any]:
+    with connection() as db:
+        record = db.execute("SELECT * FROM preview_cache WHERE id = ?", (cache_id,)).fetchone()
+    if not record:
+        raise HTTPException(404, "预览缓存不存在或已过期")
+    return preview_payload(record)
+
+
+@app.delete("/api/previews/{cache_id}")
+async def stop_source_preview(cache_id: int) -> dict[str, Any]:
+    worker = PREVIEW_RUNNING.get(cache_id)
+    if worker:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+    with connection() as db:
+        record = db.execute("SELECT * FROM preview_cache WHERE id = ?", (cache_id,)).fetchone()
+    if not record:
+        raise HTTPException(404, "预览缓存不存在或已过期")
+    return preview_payload(record)
+
+
+@app.get("/api/previews/{cache_id}/content")
+def source_preview_content(cache_id: int) -> FileResponse:
+    with connection() as db:
+        record = db.execute("SELECT * FROM preview_cache WHERE id = ?", (cache_id,)).fetchone()
+    if not record or record["status"] != "READY":
+        raise HTTPException(409, "预览文件尚未准备完成")
+    file_path = path_in_root(record["cache_path"], PREVIEW_ROOT)
+    if not file_path or not file_path.is_file():
+        raise HTTPException(404, "预览缓存文件不存在")
+    return FileResponse(file_path, media_type=record["mime_type"] or mimetypes.guess_type(record["filename"])[0] or "application/octet-stream", filename=record["filename"], content_disposition_type="inline", headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.post("/api/tasks/{task_id}/pause")

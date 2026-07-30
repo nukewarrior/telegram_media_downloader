@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Archive, CheckCircle2, FolderArchive, LayoutList, Settings, ShieldCheck, Wifi } from 'lucide-vue-next'
+import { Archive, CheckCircle2, FolderArchive, LayoutList, Settings, ShieldCheck, UsersRound, Wifi } from 'lucide-vue-next'
 import { api, type AppState } from './api'
 
 const route = useRoute()
@@ -31,6 +31,7 @@ onMounted(refreshState)
       <RouterLink to="/tasks" class="brand"><span class="brand-mark"><Archive :size="20" /></span><span>Telegram 媒体归档</span></RouterLink>
       <nav class="nav-list" aria-label="主导航">
         <RouterLink to="/tasks" class="nav-link"><LayoutList :size="19" />任务中心</RouterLink>
+        <RouterLink to="/sources" class="nav-link"><UsersRound :size="19" />群组与频道</RouterLink>
         <RouterLink to="/archives" class="nav-link"><FolderArchive :size="19" />归档文件</RouterLink>
         <RouterLink to="/settings" class="nav-link"><Settings :size="19" />设置</RouterLink>
       </nav>
