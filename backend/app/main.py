@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +55,8 @@ RETRY_DELAYS_SECONDS = (5, 30, 120)
 STABILITY_WINDOW_SECONDS = 5 * 60
 SCAN_CACHE_TTL = timedelta(minutes=10)
 SCAN_CACHE: dict[str, tuple[datetime, list[tuple[int, str, str, str | None, int, str]]]] = {}
+AVAILABLE_TIMEZONES = frozenset(available_timezones())
+UNFINISHED_TASK_STATUSES = ("QUEUED", "SCANNING", "DOWNLOADING", "RETRYING", "WAITING_RATE_LIMIT", "PAUSED")
 
 
 @dataclass
@@ -240,6 +243,7 @@ def initialize_database() -> None:
               account_name TEXT,
               account_connected INTEGER NOT NULL DEFAULT 0,
               connection_status TEXT NOT NULL DEFAULT 'disconnected',
+              archive_timezone TEXT,
               download_concurrency_max INTEGER NOT NULL DEFAULT 3,
               updated_at TEXT NOT NULL
             );
@@ -254,6 +258,7 @@ def initialize_database() -> None:
               chat_id TEXT NOT NULL,
               chat_title TEXT NOT NULL,
               chat_handle TEXT,
+              archive_timezone TEXT,
               filters_json TEXT NOT NULL,
               status TEXT NOT NULL,
               total_count INTEGER NOT NULL DEFAULT 0,
@@ -324,7 +329,11 @@ def initialize_database() -> None:
             db.execute("UPDATE app_settings SET connection_status = CASE WHEN account_connected = 1 THEN 'invalid' ELSE 'disconnected' END")
         if "download_concurrency_max" not in setting_columns:
             db.execute("ALTER TABLE app_settings ADD COLUMN download_concurrency_max INTEGER NOT NULL DEFAULT 3")
+        if "archive_timezone" not in setting_columns:
+            db.execute("ALTER TABLE app_settings ADD COLUMN archive_timezone TEXT")
         task_columns = {column["name"] for column in db.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "archive_timezone" not in task_columns:
+            db.execute("ALTER TABLE tasks ADD COLUMN archive_timezone TEXT")
         if "media_revision" not in task_columns:
             db.execute("ALTER TABLE tasks ADD COLUMN media_revision INTEGER NOT NULL DEFAULT 0")
         if "download_wait_until" not in task_columns:
@@ -571,6 +580,10 @@ class DownloadConcurrencySettings(BaseModel):
     max_concurrency: int = Field(ge=1, le=5)
 
 
+class ArchiveTimezoneSettings(BaseModel):
+    archive_timezone: str = Field(min_length=1, max_length=64)
+
+
 class LoginCodeRequest(BaseModel):
     phone: str = Field(min_length=5, max_length=32)
 
@@ -612,15 +625,30 @@ def masked_api_id(api_id: str | None) -> str | None:
     return f"••••{api_id[-4:]}"
 
 
+def validated_timezone(value: str) -> str:
+    timezone_name = value.strip()
+    if timezone_name not in AVAILABLE_TIMEZONES:
+        raise HTTPException(422, "请选择有效的 IANA 时区")
+    try:
+        ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as error:
+        raise HTTPException(422, "当前服务不支持该时区") from error
+    return timezone_name
+
+
 def app_state() -> dict[str, Any]:
     with connection() as db:
         setting = db.execute("SELECT * FROM app_settings WHERE id = 1").fetchone()
-    configured = bool(setting["api_id"] and setting["api_hash"])
+    api_configured = bool(setting["api_id"] and setting["api_hash"])
+    archive_timezone = setting["archive_timezone"]
+    configured = api_configured and bool(archive_timezone)
     stored_status = setting["connection_status"]
     connection_status = "unconfigured" if not configured else stored_status
     connected = configured and stored_status == "connected" and bool(setting["account_connected"])
     return {
         "configured": configured,
+        "apiConfigured": api_configured,
+        "archiveTimezone": archive_timezone,
         "accountConnected": connected,
         "accountName": setting["account_name"],
         "connectionStatus": connection_status,
@@ -671,10 +699,8 @@ async def lifespan(_: FastAPI):
     DOWNLOAD_DISPATCHER = asyncio.create_task(download_dispatcher(), name="telegram-download-dispatcher")
     THUMBNAIL_WORKER = asyncio.create_task(thumbnail_worker(), name="archive-thumbnail-worker")
     wake_thumbnail_worker()
-    with connection() as db:
-        task_ids = [record["id"] for record in db.execute("SELECT id FROM tasks WHERE status IN ('QUEUED', 'DOWNLOADING', 'SCANNING', 'RETRYING', 'WAITING_RATE_LIMIT')").fetchall()]
-    for task_id in task_ids:
-        start_task_worker(task_id)
+    if DEMO_MODE or app_state()["accountConnected"]:
+        start_pending_task_workers()
     yield
     if DOWNLOAD_DISPATCHER:
         DOWNLOAD_DISPATCHER.cancel()
@@ -717,11 +743,12 @@ def save_setup(payload: ApiCredentials) -> dict[str, Any]:
 def get_settings() -> dict[str, Any]:
     with connection() as db:
         setting = db.execute("SELECT * FROM app_settings WHERE id = 1").fetchone()
-    configured = bool(setting["api_id"] and setting["api_hash"])
+    configured = bool(setting["api_id"] and setting["api_hash"] and setting["archive_timezone"])
     connected = configured and setting["connection_status"] == "connected" and bool(setting["account_connected"])
     return {
         "apiId": masked_api_id(setting["api_id"]),
         "apiHashConfigured": bool(setting["api_hash"]),
+        "archiveTimezone": setting["archive_timezone"],
         "accountConnected": connected,
         "accountName": setting["account_name"],
         "accountPhone": setting["account_phone"],
@@ -735,6 +762,24 @@ def get_settings() -> dict[str, Any]:
 @app.put("/api/settings/api")
 def update_api_credentials(payload: ApiCredentials) -> dict[str, Any]:
     return save_setup(payload)
+
+
+@app.get("/api/timezones")
+def list_timezones() -> dict[str, list[str]]:
+    return {"timezones": sorted(AVAILABLE_TIMEZONES)}
+
+
+@app.put("/api/settings/archive-timezone")
+def update_archive_timezone(payload: ArchiveTimezoneSettings) -> dict[str, Any]:
+    timezone_name = validated_timezone(payload.archive_timezone)
+    placeholders = ", ".join("?" for _ in UNFINISHED_TASK_STATUSES)
+    with connection() as db:
+        db.execute("UPDATE app_settings SET archive_timezone = ?, updated_at = ? WHERE id = 1", (timezone_name, now()))
+        db.execute(
+            f"UPDATE tasks SET archive_timezone = ? WHERE archive_timezone IS NULL AND status IN ({placeholders})",
+            (timezone_name, *UNFINISHED_TASK_STATUSES),
+        )
+    return app_state()
 
 
 @app.put("/api/settings/download-concurrency")
@@ -796,6 +841,7 @@ async def verify_login_code(payload: LoginCodeVerify) -> dict[str, Any]:
     if DEMO_MODE:
         update_connected_account(attempt.phone, user=object())
         pending_logins.pop(payload.attempt_id, None)
+        start_pending_task_workers()
         return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
     async with TELEGRAM_LOCK:
@@ -818,6 +864,7 @@ async def verify_login_code(payload: LoginCodeVerify) -> dict[str, Any]:
         finally:
             if client:
                 await close_telegram_client(client)
+    start_pending_task_workers()
     return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
 
@@ -828,6 +875,7 @@ async def verify_login_password(payload: LoginPasswordVerify) -> dict[str, Any]:
     if DEMO_MODE:
         update_connected_account(attempt.phone, user=object())
         pending_logins.pop(payload.attempt_id, None)
+        start_pending_task_workers()
         return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
     async with TELEGRAM_LOCK:
@@ -844,6 +892,7 @@ async def verify_login_password(payload: LoginPasswordVerify) -> dict[str, Any]:
         finally:
             if client:
                 await close_telegram_client(client)
+    start_pending_task_workers()
     return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
 
@@ -990,6 +1039,33 @@ def filename_for(message: Any, media_type: str) -> str:
     if supplied:
         return safe_filename(supplied)
     return f"message-{message.id}" + {"PHOTO": ".jpg", "VIDEO": ".mp4", "AUDIO": ".audio", "DOCUMENT": ".bin"}[media_type]
+
+
+def archived_filename(filename: str, message_id: int) -> str:
+    """Make the on-disk name unique while leaving the logical filename unchanged."""
+    sanitized = safe_filename(filename)
+    suffix = Path(sanitized).suffix
+    stem = sanitized[:-len(suffix)] if suffix else sanitized
+    return f"{stem}__msg-{message_id}{suffix}"
+
+
+def archive_destination(task: Any, media: Any) -> Path:
+    """Build the stable on-disk location for a downloaded Telegram message."""
+    timezone_name = task["archive_timezone"]
+    if not timezone_name:
+        raise RuntimeError("任务缺少归档时区，无法开始下载")
+    message_date = datetime.fromisoformat(str(media["message_date"]))
+    if message_date.tzinfo is None:
+        message_date = message_date.replace(tzinfo=UTC)
+    archive_date = message_date.astimezone(ZoneInfo(timezone_name))
+    chat_directory = f"{safe_filename(str(task['chat_title']))}__chat-{task['chat_id']}"
+    return (
+        Path(DOWNLOAD_ROOT)
+        / chat_directory
+        / f"{archive_date:%Y}"
+        / f"{archive_date:%m}"
+        / archived_filename(str(media["filename"]), int(media["message_id"]))
+    )
 
 
 def scan_cache_key(payload: ScanRequest) -> str:
@@ -1283,9 +1359,8 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             message = await client.get_messages(entity, ids=media["message_id"])
         if not message:
             raise RuntimeError("消息已不可用")
-        destination_dir = Path(DOWNLOAD_ROOT) / str(task_id) / safe_filename(task["chat_title"])
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        destination = destination_dir / media["filename"]
+        destination = archive_destination(task, media)
+        destination.parent.mkdir(parents=True, exist_ok=True)
         part = destination.with_suffix(destination.suffix + ".part")
         started_at = asyncio.get_running_loop().time()
         last_persisted_at = 0.0
@@ -1494,12 +1569,23 @@ def start_task_worker(task_id: int) -> None:
         TASK_WORKERS[task_id] = asyncio.create_task(run_task_worker(task_id), name=f"telegram-download-{task_id}")
 
 
+def start_pending_task_workers() -> None:
+    with connection() as db:
+        task_ids = [record["id"] for record in db.execute("""SELECT id FROM tasks
+            WHERE status IN ('QUEUED', 'DOWNLOADING', 'SCANNING', 'RETRYING', 'WAITING_RATE_LIMIT')""").fetchall()]
+    for task_id in task_ids:
+        start_task_worker(task_id)
+
+
 @app.post("/api/tasks")
 async def create_task(payload: ScanRequest) -> dict[str, Any]:
     created = now()
     with connection() as db:
-        cursor = db.execute("""INSERT INTO tasks (chat_id, chat_title, chat_handle, filters_json, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'QUEUED', ?, ?)""", (payload.chat_id, payload.chat_title, payload.chat_handle, payload.filters.model_dump_json(), created, created))
+        setting = db.execute("SELECT archive_timezone FROM app_settings WHERE id = 1").fetchone()
+        if not setting or not setting["archive_timezone"]:
+            raise HTTPException(409, "请先完成归档时区设置")
+        cursor = db.execute("""INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, filters_json, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?)""", (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], payload.filters.model_dump_json(), created, created))
     start_task_worker(cursor.lastrowid)
     return get_task(cursor.lastrowid)
 

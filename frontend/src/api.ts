@@ -4,10 +4,10 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? '/api'
 export const apiResourceUrl = (path: string | null) => path ? `${API_BASE}${path.replace(/^\/api/, '')}` : null
 
 export type ConnectionStatus = 'unconfigured' | 'disconnected' | 'connected' | 'invalid'
-export type AppState = { configured: boolean; accountConnected: boolean; accountName: string | null; connectionStatus: ConnectionStatus; downloadRoot: string; demoMode: boolean }
+export type AppState = { configured: boolean; apiConfigured: boolean; archiveTimezone: string | null; accountConnected: boolean; accountName: string | null; connectionStatus: ConnectionStatus; downloadRoot: string; demoMode: boolean }
 export type LoginResult = AppState & { passwordRequired: boolean; attemptId?: string; accountPhone?: string }
 export type DownloadRuntime = { maxConcurrency: number; effectiveConcurrency: number; activeDownloads: number; waitUntil: string | null }
-export type Settings = { apiId: string | null; apiHashConfigured: boolean; accountConnected: boolean; accountName: string | null; accountPhone: string | null; connectionStatus: ConnectionStatus; downloadRoot: string; trustedLanWarning: string; download: DownloadRuntime }
+export type Settings = { apiId: string | null; apiHashConfigured: boolean; archiveTimezone: string | null; accountConnected: boolean; accountName: string | null; accountPhone: string | null; connectionStatus: ConnectionStatus; downloadRoot: string; trustedLanWarning: string; download: DownloadRuntime }
 export type TaskMedia = { id: number; task_id: number; message_id: number; filename: string; media_type: string; mime_type: string | null; size_bytes: number; message_date: string; status: string; error_message: string | null; downloaded_bytes: number; speed_bytes_per_second: number; updated_at: string; revision: number; percent: number; attempt_count: number; next_retry_at: string | null; failure_category: string | null }
 export type Task = { id: number; chat_id: string; chat_title: string; chat_handle: string | null; status: string; total_count: number; completed_count: number; failed_count: number; total_bytes: number; downloaded_bytes: number; current_file: string | null; speed_bytes_per_second: number; media_revision: number; error_message: string | null; download_wait_until: string | null; filters: Record<string, unknown>; created_at: string; updated_at: string; activeMedia?: TaskMedia[]; downloadRuntime?: DownloadRuntime }
 export type TaskMediaPage = { items: TaskMedia[]; page: number; pageSize: number; total: number; mediaRevision: number }
@@ -26,6 +26,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   state: () => request<AppState>('/app-state'),
   setup: (api_id: string, api_hash: string) => request<AppState>('/setup', { method: 'PUT', body: JSON.stringify({ api_id, api_hash }) }),
+  timezones: () => request<{ timezones: string[] }>('/timezones'),
+  updateArchiveTimezone: (archive_timezone: string) => request<AppState>('/settings/archive-timezone', { method: 'PUT', body: JSON.stringify({ archive_timezone }) }),
   settings: () => request<Settings>('/settings'),
   updateApi: (api_id: string, api_hash: string) => request<AppState>('/settings/api', { method: 'PUT', body: JSON.stringify({ api_id, api_hash }) }),
   updateDownloadConcurrency: (maxConcurrency: number) => request<DownloadRuntime>('/settings/download-concurrency', { method: 'PUT', body: JSON.stringify({ max_concurrency: maxConcurrency }) }),
