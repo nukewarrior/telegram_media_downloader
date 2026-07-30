@@ -9,7 +9,7 @@ services:
     environment:
       DATA_DIR: /data
       DOWNLOAD_ROOT: /data/downloads
-      DEMO_MODE: ${DEMO_MODE:-true}
+      DEMO_MODE: ${DEMO_MODE:-false}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
     volumes:
       - "${ARCHIVER_DATA_DIR:-./data}:/data"

@@ -38,7 +38,7 @@ async function submit() {
         <div><span class="eyebrow">步骤 1 / 3</span><h2>配置 Telegram API</h2><p>在 <a href="https://my.telegram.org" target="_blank" rel="noreferrer">my.telegram.org</a> 创建应用后填写凭据。</p></div>
         <label>API ID<input v-model="apiId" inputmode="numeric" autocomplete="off" placeholder="例如：12345678" required /></label>
         <label>API Hash<div class="input-with-icon"><KeyRound :size="18" /><input v-model="apiHash" type="password" autocomplete="off" placeholder="32 位 API Hash" required /></div></label>
-        <div class="security-callout"><LockKeyhole :size="18" /><span>不会记录验证码、两步验证密码或 API Hash 到浏览器日志。</span></div>
+        <div class="security-callout"><LockKeyhole :size="18" /><span>API Hash、验证码和两步验证密码不会回显或写入应用日志。此服务未启用访问认证，仅可用于可信局域网，绝不可暴露公网。</span></div>
         <p v-if="error" class="form-error" role="alert">{{ error }}</p>
         <button class="primary-button wide" :disabled="saving">{{ saving ? '正在保存…' : '保存并进入任务中心' }}<ArrowRight :size="18" /></button>
       </form>

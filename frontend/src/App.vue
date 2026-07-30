@@ -37,10 +37,11 @@ onMounted(refreshState)
       <section class="connection-card">
         <div class="connection-icon"><Wifi :size="19" /></div>
         <div>
-          <p><span :class="['status-dot', state?.accountConnected ? 'is-good' : 'is-muted']"></span>{{ state?.accountConnected ? 'Telegram 已连接' : '等待连接 Telegram' }}</p>
-          <small>{{ state?.accountConnected ? state.accountName : '完成连接后即可归档' }}</small>
+          <p><span :class="['status-dot', state?.accountConnected ? 'is-good' : state?.connectionStatus === 'invalid' ? 'is-warning' : 'is-muted']"></span>{{ state?.accountConnected ? 'Telegram 已连接' : state?.connectionStatus === 'invalid' ? '登录状态已失效' : '等待连接 Telegram' }}</p>
+          <small>{{ state?.accountConnected ? state.accountName : state?.connectionStatus === 'invalid' ? '请重新连接账号' : '完成连接后即可归档' }}</small>
         </div>
       </section>
+      <div v-if="state?.demoMode" class="demo-badge">演示模式 · 未连接真实 Telegram</div>
       <div class="local-note"><ShieldCheck :size="15" />数据仅存储在本机</div>
     </aside>
     <section class="page-area"><RouterView :key="route.fullPath" :app-state="state" @state-changed="refreshState" /></section>

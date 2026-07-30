@@ -2,7 +2,9 @@
 // that the user opened in their browser (including LAN deployments).
 const API_BASE = import.meta.env.VITE_API_BASE ?? '/api'
 
-export type AppState = { configured: boolean; accountConnected: boolean; accountName: string | null; downloadRoot: string; demoMode: boolean }
+export type ConnectionStatus = 'unconfigured' | 'disconnected' | 'connected' | 'invalid'
+export type AppState = { configured: boolean; accountConnected: boolean; accountName: string | null; connectionStatus: ConnectionStatus; downloadRoot: string; demoMode: boolean }
+export type LoginResult = AppState & { passwordRequired: boolean; attemptId?: string; accountPhone?: string }
 export type Task = { id: number; chat_id: string; chat_title: string; chat_handle: string | null; status: string; total_count: number; completed_count: number; failed_count: number; total_bytes: number; downloaded_bytes: number; current_file: string | null; speed_bytes_per_second: number; error_message: string | null; filters: Record<string, unknown>; created_at: string; updated_at: string }
 export type Chat = { id: string; title: string; handle: string | null; type: string }
 export type ArchiveItem = { id: number; chat_id: string; chat_title: string; message_id: number; filename: string; media_type: string; mime_type: string | null; size_bytes: number; message_date: string; canonical_path: string; thumbnail_path: string | null; thumbnail_status: string }
@@ -22,8 +24,8 @@ export const api = {
   settings: () => request<Record<string, unknown>>('/settings'),
   updateApi: (api_id: string, api_hash: string) => request<AppState>('/settings/api', { method: 'PUT', body: JSON.stringify({ api_id, api_hash }) }),
   sendCode: (phone: string) => request<{ attemptId: string; passwordRequired: boolean; demoHint: string | null }>('/telegram/login/send-code', { method: 'POST', body: JSON.stringify({ phone }) }),
-  verifyCode: (attempt_id: string, code: string) => request<AppState>('/telegram/login/verify-code', { method: 'POST', body: JSON.stringify({ attempt_id, code }) }),
-  verifyPassword: (attempt_id: string, password: string) => request<AppState>('/telegram/login/verify-password', { method: 'POST', body: JSON.stringify({ attempt_id, password }) }),
+  verifyCode: (attempt_id: string, code: string) => request<LoginResult>('/telegram/login/verify-code', { method: 'POST', body: JSON.stringify({ attempt_id, code }) }),
+  verifyPassword: (attempt_id: string, password: string) => request<LoginResult>('/telegram/login/verify-password', { method: 'POST', body: JSON.stringify({ attempt_id, password }) }),
   logout: () => request<AppState>('/telegram/logout', { method: 'POST' }),
   chats: () => request<Chat[]>('/chats'),
   tasks: () => request<Task[]>('/tasks'),

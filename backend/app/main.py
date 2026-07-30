@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import sqlite3
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -15,13 +17,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
 
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "app.db"
 DOWNLOAD_ROOT = os.getenv("DOWNLOAD_ROOT", str(DATA_DIR / "downloads"))
-DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
+DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 STATIC_DIR = Path(os.getenv("STATIC_DIR", "./static"))
+SESSION_DIR = DATA_DIR / "sessions"
+SESSION_PATH = SESSION_DIR / "telegram.session"
+LOGIN_ATTEMPT_TTL = timedelta(minutes=10)
+TELEGRAM_LOCK = asyncio.Lock()
+
+
+@dataclass
+class PendingLogin:
+    phone: str
+    phone_code_hash: str | None
+    expires_at: datetime
+
+
+pending_logins: dict[str, PendingLogin] = {}
 
 
 def now() -> str:
@@ -38,9 +56,152 @@ def rows(items: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(item) for item in items]
 
 
+def ensure_session_storage() -> None:
+    """Create the private directory that contains Telethon's SQLite session."""
+    try:
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(SESSION_DIR, 0o700)
+        if SESSION_PATH.exists():
+            os.chmod(SESSION_PATH, 0o600)
+    except OSError as error:
+        raise RuntimeError("无法保护 Telegram 会话目录；请检查数据目录权限") from error
+
+
+def secure_session_file() -> None:
+    if SESSION_PATH.exists():
+        try:
+            os.chmod(SESSION_PATH, 0o600)
+        except OSError as error:
+            raise RuntimeError("无法保护 Telegram 会话文件；请检查数据目录权限") from error
+
+
+def mask_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) <= 4:
+        return "••••"
+    return f"+{digits[:min(3, len(digits) - 4)]}••••{digits[-4:]}"
+
+
+def normalize_phone(phone: str) -> str:
+    normalized = re.sub(r"[\s()\-]", "", phone)
+    if not re.fullmatch(r"\+\d{5,15}", normalized):
+        raise HTTPException(400, "请输入带国家区号的手机号，例如 +8613800000000")
+    return normalized
+
+
+def discard_expired_attempts() -> None:
+    current_time = datetime.now(UTC)
+    for attempt_id, attempt in list(pending_logins.items()):
+        if attempt.expires_at <= current_time:
+            pending_logins.pop(attempt_id, None)
+
+
+def require_pending_login(attempt_id: str) -> PendingLogin:
+    discard_expired_attempts()
+    attempt = pending_logins.get(attempt_id)
+    if not attempt:
+        raise HTTPException(400, "登录会话已过期，请重新发送验证码")
+    return attempt
+
+
+def get_telegram_credentials() -> tuple[int, str]:
+    with connection() as db:
+        setting = db.execute("SELECT api_id, api_hash FROM app_settings WHERE id = 1").fetchone()
+    if not setting or not setting["api_id"] or not setting["api_hash"]:
+        raise HTTPException(409, "请先配置 Telegram API 凭据")
+    try:
+        api_id = int(setting["api_id"])
+    except (TypeError, ValueError) as error:
+        raise HTTPException(400, "API ID 必须是数字") from error
+    if api_id <= 0:
+        raise HTTPException(400, "API ID 必须是正整数")
+    return api_id, setting["api_hash"]
+
+
+def mark_session_invalid() -> None:
+    with connection() as db:
+        db.execute(
+            "UPDATE app_settings SET account_connected = 0, connection_status = 'invalid', updated_at = ? WHERE id = 1",
+            (now(),),
+        )
+
+
+def clear_local_session() -> None:
+    # SQLite may use either rollback-journal or WAL sidecar files.  Only remove
+    # the known artifacts next to this application's fixed session filename.
+    for path in (SESSION_PATH, Path(f"{SESSION_PATH}-journal"), Path(f"{SESSION_PATH}-wal"), Path(f"{SESSION_PATH}-shm")):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            raise HTTPException(500, "无法删除本地 Telegram 会话文件；请检查数据目录权限") from error
+
+
+def update_connected_account(phone: str, user: Any) -> None:
+    name = " ".join(part for part in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if part).strip()
+    name = name or getattr(user, "username", None) or "已连接的 Telegram 账号"
+    with connection() as db:
+        db.execute(
+            """UPDATE app_settings SET account_phone = ?, account_name = ?, account_connected = 1,
+               connection_status = 'connected', updated_at = ? WHERE id = 1""",
+            (mask_phone(phone), name, now()),
+        )
+
+
+async def open_telegram_client() -> TelegramClient:
+    ensure_session_storage()
+    api_id, api_hash = get_telegram_credentials()
+    client = TelegramClient(
+        str(SESSION_PATH),
+        api_id,
+        api_hash,
+        receive_updates=False,
+        auto_reconnect=False,
+        connection_retries=1,
+    )
+    try:
+        await client.connect()
+    except (OSError, asyncio.TimeoutError) as error:
+        raise HTTPException(503, "无法连接 Telegram，请检查网络后重试") from error
+    finally:
+        secure_session_file()
+    return client
+
+
+async def close_telegram_client(client: TelegramClient) -> None:
+    try:
+        if client.is_connected():
+            await client.disconnect()
+    finally:
+        secure_session_file()
+
+
+def raise_telegram_error(error: Exception, *, during_authorization: bool = False) -> None:
+    """Convert Telegram errors to safe messages without exposing credentials."""
+    error_name = type(error).__name__
+    if isinstance(error, FloodWaitError):
+        seconds = max(1, int(getattr(error, "seconds", 1)))
+        raise HTTPException(429, f"Telegram 要求等待 {seconds} 秒后再试", headers={"Retry-After": str(seconds)}) from error
+    if error_name in {"PhoneNumberInvalidError", "PhoneNumberBannedError"}:
+        raise HTTPException(400, "该手机号无法用于 Telegram 登录，请检查号码和账号状态") from error
+    if error_name in {"PhoneCodeInvalidError", "PhoneCodeExpiredError", "PhoneCodeHashEmptyError", "PhoneCodeHashInvalidError"}:
+        raise HTTPException(400, "验证码无效或已过期，请重新发送验证码") from error
+    if error_name in {"PasswordHashInvalidError"}:
+        raise HTTPException(400, "两步验证密码不正确") from error
+    if error_name in {"AuthKeyUnregisteredError", "SessionRevokedError", "UserDeactivatedError", "UserDeactivatedBanError"}:
+        mark_session_invalid()
+        raise HTTPException(409, "Telegram 登录状态已失效，请重新连接账号") from error
+    if isinstance(error, (OSError, asyncio.TimeoutError)):
+        raise HTTPException(503, "无法连接 Telegram，请检查网络后重试") from error
+    if isinstance(error, RPCError):
+        message = "Telegram 暂时拒绝了此请求，请稍后重试" if during_authorization else "Telegram 登录状态不可用，请重新连接账号"
+        raise HTTPException(400 if during_authorization else 409, message) from error
+    raise HTTPException(503, "Telegram 服务暂时不可用，请稍后重试") from error
+
+
 def initialize_database() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     Path(DOWNLOAD_ROOT).mkdir(parents=True, exist_ok=True)
+    ensure_session_storage()
     with connection() as db:
         db.executescript(
             """
@@ -53,6 +214,7 @@ def initialize_database() -> None:
               account_phone TEXT,
               account_name TEXT,
               account_connected INTEGER NOT NULL DEFAULT 0,
+              connection_status TEXT NOT NULL DEFAULT 'disconnected',
               updated_at TEXT NOT NULL
             );
             INSERT OR IGNORE INTO app_settings (id, updated_at) VALUES (1, CURRENT_TIMESTAMP);
@@ -105,6 +267,12 @@ def initialize_database() -> None:
             );
             """
         )
+        setting_columns = {column["name"] for column in db.execute("PRAGMA table_info(app_settings)").fetchall()}
+        if "connection_status" not in setting_columns:
+            db.execute("ALTER TABLE app_settings ADD COLUMN connection_status TEXT NOT NULL DEFAULT 'disconnected'")
+            # Older versions only had a simulated connected flag.  It cannot be
+            # trusted as a real Telethon session, so require reconnect once.
+            db.execute("UPDATE app_settings SET connection_status = CASE WHEN account_connected = 1 THEN 'invalid' ELSE 'disconnected' END")
         if DEMO_MODE and db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0:
             seed_demo_data(db)
 
@@ -206,10 +374,14 @@ def app_state() -> dict[str, Any]:
     with connection() as db:
         setting = db.execute("SELECT * FROM app_settings WHERE id = 1").fetchone()
     configured = bool(setting["api_id"] and setting["api_hash"])
+    stored_status = setting["connection_status"]
+    connection_status = "unconfigured" if not configured else stored_status
+    connected = configured and stored_status == "connected" and bool(setting["account_connected"])
     return {
         "configured": configured,
-        "accountConnected": bool(setting["account_connected"]),
+        "accountConnected": connected,
         "accountName": setting["account_name"],
+        "connectionStatus": connection_status,
         "downloadRoot": DOWNLOAD_ROOT,
         "demoMode": DEMO_MODE,
     }
@@ -247,14 +419,17 @@ def save_setup(payload: ApiCredentials) -> dict[str, Any]:
 def get_settings() -> dict[str, Any]:
     with connection() as db:
         setting = db.execute("SELECT * FROM app_settings WHERE id = 1").fetchone()
+    configured = bool(setting["api_id"] and setting["api_hash"])
+    connected = configured and setting["connection_status"] == "connected" and bool(setting["account_connected"])
     return {
         "apiId": masked_api_id(setting["api_id"]),
         "apiHashConfigured": bool(setting["api_hash"]),
-        "accountConnected": bool(setting["account_connected"]),
+        "accountConnected": connected,
         "accountName": setting["account_name"],
         "accountPhone": setting["account_phone"],
+        "connectionStatus": "unconfigured" if not configured else setting["connection_status"],
         "downloadRoot": DOWNLOAD_ROOT,
-        "trustedLanWarning": "当前服务未启用应用层认证。仅应部署在可信局域网中。",
+        "trustedLanWarning": "当前服务未启用应用层认证。任何可访问此 HTTP 地址的人都可操作已连接账号和查看归档；仅应部署在可信局域网，绝不可暴露公网。",
     }
 
 
@@ -264,52 +439,159 @@ def update_api_credentials(payload: ApiCredentials) -> dict[str, Any]:
 
 
 @app.post("/api/telegram/login/send-code")
-def send_login_code(payload: LoginCodeRequest) -> dict[str, Any]:
-    if not app_state()["configured"]:
-        raise HTTPException(409, "请先配置 Telegram API 凭据")
-    attempt_id = secrets.token_urlsafe(18)
-    with connection() as db:
-        db.execute("INSERT INTO login_attempts (id, phone, created_at) VALUES (?, ?, ?)", (attempt_id, payload.phone, now()))
-    return {"attemptId": attempt_id, "passwordRequired": False, "demoHint": "演示模式下可输入任意六码验证码" if DEMO_MODE else None}
+async def send_login_code(payload: LoginCodeRequest) -> dict[str, Any]:
+    phone = normalize_phone(payload.phone)
+    get_telegram_credentials()
+    attempt_id = secrets.token_urlsafe(24)
+
+    if DEMO_MODE:
+        pending_logins[attempt_id] = PendingLogin(phone=phone, phone_code_hash=None, expires_at=datetime.now(UTC) + LOGIN_ATTEMPT_TTL)
+        return {"attemptId": attempt_id, "passwordRequired": False, "demoHint": "演示模式：可输入任意六码验证码。"}
+
+    async with TELEGRAM_LOCK:
+        client: TelegramClient | None = None
+        try:
+            client = await open_telegram_client()
+            sent_code = await client.send_code_request(phone)
+            pending_logins[attempt_id] = PendingLogin(
+                phone=phone,
+                phone_code_hash=sent_code.phone_code_hash,
+                expires_at=datetime.now(UTC) + LOGIN_ATTEMPT_TTL,
+            )
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise_telegram_error(error, during_authorization=True)
+        finally:
+            if client:
+                await close_telegram_client(client)
+    return {"attemptId": attempt_id, "passwordRequired": False, "demoHint": None}
 
 
 @app.post("/api/telegram/login/verify-code")
-def verify_login_code(payload: LoginCodeVerify) -> dict[str, Any]:
-    with connection() as db:
-        attempt = db.execute("SELECT * FROM login_attempts WHERE id = ?", (payload.attempt_id,)).fetchone()
-        if not attempt:
-            raise HTTPException(404, "登录会话已过期")
-        if not DEMO_MODE:
-            raise HTTPException(501, "Telegram 网关尚未启用；请将 Telethon 网关接入此部署")
-        db.execute(
-            "UPDATE app_settings SET account_phone = ?, account_name = ?, account_connected = 1, updated_at = ? WHERE id = 1",
-            (attempt["phone"], "已连接的 Telegram 账号", now()),
-        )
-        db.execute("DELETE FROM login_attempts WHERE id = ?", (payload.attempt_id,))
-    return app_state()
+async def verify_login_code(payload: LoginCodeVerify) -> dict[str, Any]:
+    attempt = require_pending_login(payload.attempt_id)
+    code = payload.code.strip()
+    if not code:
+        raise HTTPException(400, "请输入验证码")
+
+    if DEMO_MODE:
+        update_connected_account(attempt.phone, user=object())
+        pending_logins.pop(payload.attempt_id, None)
+        return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
+
+    async with TELEGRAM_LOCK:
+        client: TelegramClient | None = None
+        try:
+            client = await open_telegram_client()
+            try:
+                await client.sign_in(phone=attempt.phone, code=code, phone_code_hash=attempt.phone_code_hash)
+            except SessionPasswordNeededError:
+                return {"passwordRequired": True, "attemptId": payload.attempt_id}
+            user = await client.get_me()
+            update_connected_account(attempt.phone, user)
+            pending_logins.pop(payload.attempt_id, None)
+        except SessionPasswordNeededError:
+            return {"passwordRequired": True, "attemptId": payload.attempt_id}
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise_telegram_error(error, during_authorization=True)
+        finally:
+            if client:
+                await close_telegram_client(client)
+    return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
 
 @app.post("/api/telegram/login/verify-password")
-def verify_login_password(payload: LoginPasswordVerify) -> dict[str, Any]:
-    return verify_login_code(LoginCodeVerify(attempt_id=payload.attempt_id, code="password"))
+async def verify_login_password(payload: LoginPasswordVerify) -> dict[str, Any]:
+    attempt = require_pending_login(payload.attempt_id)
+
+    if DEMO_MODE:
+        update_connected_account(attempt.phone, user=object())
+        pending_logins.pop(payload.attempt_id, None)
+        return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
+
+    async with TELEGRAM_LOCK:
+        client: TelegramClient | None = None
+        try:
+            client = await open_telegram_client()
+            user = await client.sign_in(password=payload.password)
+            update_connected_account(attempt.phone, user)
+            pending_logins.pop(payload.attempt_id, None)
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise_telegram_error(error, during_authorization=True)
+        finally:
+            if client:
+                await close_telegram_client(client)
+    return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
 
 @app.post("/api/telegram/logout")
-def logout() -> dict[str, Any]:
+async def logout() -> dict[str, Any]:
+    remote_logout_warning: str | None = None
+    if not DEMO_MODE and SESSION_PATH.exists():
+        async with TELEGRAM_LOCK:
+            client: TelegramClient | None = None
+            try:
+                client = await open_telegram_client()
+                if await client.is_user_authorized():
+                    await client.log_out()
+            except Exception:
+                # The local session still has to be removed: the user explicitly
+                # requested to remove this server's access to their account.
+                remote_logout_warning = "本地会话已清除，但 Telegram 远端注销未能确认。"
+            finally:
+                if client:
+                    await close_telegram_client(client)
+    clear_local_session()
+    pending_logins.clear()
     with connection() as db:
-        db.execute("UPDATE app_settings SET account_connected = 0, account_name = NULL, account_phone = NULL, updated_at = ? WHERE id = 1", (now(),))
-    return app_state()
+        db.execute(
+            """UPDATE app_settings SET account_connected = 0, account_name = NULL, account_phone = NULL,
+               connection_status = 'disconnected', updated_at = ? WHERE id = 1""",
+            (now(),),
+        )
+    return {**app_state(), "warning": remote_logout_warning}
 
 
 @app.get("/api/chats")
-def list_chats() -> list[dict[str, Any]]:
+async def list_chats() -> list[dict[str, Any]]:
     if not app_state()["accountConnected"]:
-        raise HTTPException(409, "请先连接 Telegram 账号")
-    return [
-        {"id": "demo-tech", "title": "科技前沿观察", "handle": "@tech_frontier_obs", "type": "CHANNEL"},
-        {"id": "demo-design", "title": "设计灵感库", "handle": "@design_inspiration_cn", "type": "CHANNEL"},
-        {"id": "demo-study", "title": "学习资料库", "handle": "@study_materials_zh", "type": "GROUP"},
-    ]
+        raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
+    if DEMO_MODE:
+        return [
+            {"id": "demo-tech", "title": "科技前沿观察", "handle": "@tech_frontier_obs", "type": "CHANNEL"},
+            {"id": "demo-design", "title": "设计灵感库", "handle": "@design_inspiration_cn", "type": "CHANNEL"},
+            {"id": "demo-study", "title": "学习资料库", "handle": "@study_materials_zh", "type": "GROUP"},
+        ]
+
+    async with TELEGRAM_LOCK:
+        client: TelegramClient | None = None
+        try:
+            client = await open_telegram_client()
+            if not await client.is_user_authorized():
+                mark_session_invalid()
+                raise HTTPException(409, "Telegram 登录状态已失效，请重新连接账号")
+            chats: list[dict[str, Any]] = []
+            async for dialog in client.iter_dialogs():
+                entity = dialog.entity
+                chats.append({
+                    "id": str(dialog.id),
+                    "title": dialog.name or "未命名聊天",
+                    "handle": f"@{entity.username}" if getattr(entity, "username", None) else None,
+                    "type": "CHANNEL" if dialog.is_channel else "GROUP" if dialog.is_group else "PRIVATE",
+                })
+            return chats
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise_telegram_error(error)
+        finally:
+            if client:
+                await close_telegram_client(client)
 
 
 @app.get("/api/tasks")
