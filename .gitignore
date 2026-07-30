@@ -1,5 +1,6 @@
 .env
 .venv/
+# Service runtime data (the default run.sh data directory).
 data/
 frontend/node_modules/
 frontend/dist/

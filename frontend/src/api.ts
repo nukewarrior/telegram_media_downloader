@@ -1,4 +1,6 @@
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000/api'
+// Production UI is served by FastAPI, so API requests must stay on the same host
+// that the user opened in their browser (including LAN deployments).
+const API_BASE = import.meta.env.VITE_API_BASE ?? '/api'
 
 export type AppState = { configured: boolean; accountConnected: boolean; accountName: string | null; downloadRoot: string; demoMode: boolean }
 export type Task = { id: number; chat_id: string; chat_title: string; chat_handle: string | null; status: string; total_count: number; completed_count: number; failed_count: number; total_bytes: number; downloaded_bytes: number; current_file: string | null; speed_bytes_per_second: number; error_message: string | null; filters: Record<string, unknown>; created_at: string; updated_at: string }

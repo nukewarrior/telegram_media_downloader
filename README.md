@@ -6,10 +6,33 @@
 
 ```bash
 cp .env.example .env
-docker compose up --build
+./run.sh start
 ```
 
-默认仅监听本机的 `http://127.0.0.1:8000`。如要在局域网访问，请先配置反向代理与认证，再修改 `docker-compose.yml` 的端口绑定。
+默认监听所有本机网卡，因此可通过 `http://<宿主机-IP>:8000`（例如 `http://10.11.11.180:8000`）访问。服务当前没有应用层认证，只应部署在可信局域网；如需限制为本机访问，在 `.env` 设置 `HOST_BIND=127.0.0.1`。
+
+容器使用 Docker 默认的 `bridge` 网络模式；本项目只有一个服务，端口通过 `HOST_BIND:8000` 发布到宿主机。
+
+## 服务管理与数据目录
+
+`run.sh` 管理单个本地实例，并把当前宿主机用户的 UID/GID 传入容器，确保服务可写入 bind mount。默认数据目录是仓库内的 `data/`，已被 Git 忽略；其中会保存 SQLite 数据库、Telegram Session、下载媒体和缩略图。
+
+```bash
+# 构建并后台启动，使用仓库内 data/
+./run.sh start
+
+# 使用当前工作目录下的相对路径（相对路径不以 run.sh 所在目录为准）
+./run.sh -d ./data start
+
+# 使用 NAS 或其他绝对路径
+./run.sh -d /mnt/nas/telegram-archive restart
+
+# 暂停服务 / 移除容器和网络；两者都会保留数据目录
+./run.sh -d ./data stop
+./run.sh -d ./data down
+```
+
+`start` 每次都会构建当前镜像；`restart` 会额外强制重建容器。两者成功后都会持续跟随最近 100 条服务日志，按 `Ctrl+C` 只停止日志显示，不会停止容器。`stop` 与 `down` 在数据目录不存在时会安全失败，防止路径拼写错误。`down` 不会使用 `--volumes`，也不会删除 `-d` 指定目录中的任何文件。
 
 首次访问会依次完成：
 
