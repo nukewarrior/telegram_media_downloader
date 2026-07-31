@@ -48,4 +48,5 @@ input, select { width: 100%; border: 1px solid #cedbda; outline: none; border-ra
 .source-media-scroll .loading-block { min-height: 310px; display: grid; place-items: center; }
 .source-media-scroll .empty-state { margin-top: 25px; }
 .source-load-state { min-height: 58px; display: flex; align-items: center; justify-content: center; gap: 8px; color: #829195; font-size: 12px; }
+.chat-search-row { display: flex; align-items: stretch; gap: 7px; }.chat-search-row .search-input { flex: 1; margin: 0; }.icon-button { align-self: stretch; flex: 0 0 auto; min-width: 42px; min-height: 42px; padding: 0; }.chat-cache-notice { margin: 8px 0 10px; color: #9a7127; font-size: 11px; line-height: 1.55; }.wizard-surface .chat-search-row { max-width: 460px; margin-top: 23px; }.wizard-surface .chat-cache-notice { max-width: 460px; }
 @media (max-width: 1180px) { .source-timeline { padding: 22px 18px 0; } }

@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Archive, CheckCircle2, FolderArchive, LayoutList, Settings, ShieldCheck, UsersRound, Wifi } from 'lucide-vue-next'
 import { api, type AppState } from './api'
+import { clearChatCache } from './chatCache'
 
 const route = useRoute()
 const router = useRouter()
@@ -21,6 +22,7 @@ async function refreshState() {
 }
 
 onMounted(refreshState)
+watch(state, (next) => { if (!next?.accountConnected) clearChatCache() })
 </script>
 
 <template>

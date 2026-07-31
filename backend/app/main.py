@@ -59,12 +59,18 @@ DOWNLOAD_ERROR_TIMES: deque[float] = deque()
 DOWNLOAD_LAST_ERROR_AT: float | None = None
 DOWNLOAD_ROUND_ROBIN_OFFSET = 0
 DOWNLOAD_CLIENT_LOCK = asyncio.Lock()
+CHAT_CACHE_REFRESH_LOCK = asyncio.Lock()
+CHAT_CACHE_SYNC_WORKER: asyncio.Task[None] | None = None
+CHAT_CACHE_REFRESH_TASK: asyncio.Task[None] | None = None
+CHAT_CACHE_REFRESH_IN_FLIGHT: asyncio.Task[dict[str, Any]] | None = None
 RETRY_DELAYS_SECONDS = (5, 30, 120)
 STABILITY_WINDOW_SECONDS = 5 * 60
 SCAN_CACHE_TTL = timedelta(minutes=10)
 SCAN_CACHE: dict[str, tuple[datetime, list[tuple[int, str, str, str | None, int, str]]]] = {}
 PREVIEW_CACHE_TTL = timedelta(hours=24)
 PREVIEW_LAST_CLEANUP_AT: datetime | None = None
+CHAT_CACHE_STALE_AFTER = timedelta(hours=24)
+CHAT_CACHE_SYNC_INTERVAL_SECONDS = 60 * 60
 AVAILABLE_TIMEZONES = frozenset(available_timezones())
 UNFINISHED_TASK_STATUSES = ("QUEUED", "SCANNING", "DOWNLOADING", "RETRYING", "WAITING_RATE_LIMIT", "PAUSED")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -372,6 +378,7 @@ def mark_session_invalid() -> None:
             (now(),),
         )
     log_event(logging.WARNING, "telegram.session_invalid", "Telegram session marked invalid")
+    clear_chat_cache()
 
 
 def clear_local_session() -> None:
@@ -393,6 +400,7 @@ def update_connected_account(phone: str, user: Any) -> None:
                connection_status = 'connected', updated_at = ? WHERE id = 1""",
             (mask_phone(phone), name, now()),
         )
+    clear_chat_cache()
 
 
 async def open_telegram_client() -> TelegramClient:
@@ -568,6 +576,20 @@ def initialize_database() -> None:
               updated_at TEXT NOT NULL,
               UNIQUE(chat_id, message_id)
             );
+            CREATE TABLE IF NOT EXISTS chat_cache_items (
+              chat_id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              handle TEXT,
+              type TEXT NOT NULL,
+              sort_order INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chat_cache_state (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              refreshed_at TEXT,
+              last_attempt_at TEXT,
+              last_error TEXT
+            );
+            INSERT OR IGNORE INTO chat_cache_state (id) VALUES (1);
             """
         )
         setting_columns = {column["name"] for column in db.execute("PRAGMA table_info(app_settings)").fetchall()}
@@ -930,6 +952,148 @@ def app_state() -> dict[str, Any]:
     }
 
 
+def clear_chat_cache() -> None:
+    """Remove the cached dialogs when the authenticated account changes."""
+    with connection() as db:
+        db.execute("DELETE FROM chat_cache_items")
+        db.execute("UPDATE chat_cache_state SET refreshed_at = NULL, last_attempt_at = NULL, last_error = NULL WHERE id = 1")
+
+
+def chat_cache_snapshot() -> dict[str, Any]:
+    with connection() as db:
+        records = db.execute("SELECT chat_id AS id, title, handle, type FROM chat_cache_items ORDER BY sort_order").fetchall()
+        state = db.execute("SELECT refreshed_at, last_attempt_at, last_error FROM chat_cache_state WHERE id = 1").fetchone()
+    refreshed_at = state["refreshed_at"] if state else None
+    stale = bool(state and state["last_error"])
+    if refreshed_at:
+        try:
+            refreshed = datetime.fromisoformat(refreshed_at)
+            refreshed = refreshed if refreshed.tzinfo else refreshed.replace(tzinfo=UTC)
+            stale = stale or datetime.now(UTC) - refreshed >= CHAT_CACHE_STALE_AFTER
+        except ValueError:
+            stale = True
+    else:
+        stale = True
+    return {
+        "chats": rows(records),
+        "refreshedAt": refreshed_at,
+        "isStale": stale,
+        "lastRefreshError": state["last_error"] if state else None,
+    }
+
+
+def chat_cache_has_snapshot(snapshot: dict[str, Any] | None = None) -> bool:
+    return bool((snapshot or chat_cache_snapshot())["refreshedAt"])
+
+
+def replace_chat_cache(chats: list[dict[str, Any]]) -> dict[str, Any]:
+    refreshed_at = now()
+    with connection() as db:
+        db.execute("DELETE FROM chat_cache_items")
+        db.executemany(
+            "INSERT INTO chat_cache_items (chat_id, title, handle, type, sort_order) VALUES (?, ?, ?, ?, ?)",
+            [(chat["id"], chat["title"], chat["handle"], chat["type"], index) for index, chat in enumerate(chats)],
+        )
+        db.execute("UPDATE chat_cache_state SET refreshed_at = ?, last_attempt_at = ?, last_error = NULL WHERE id = 1", (refreshed_at, refreshed_at))
+    return chat_cache_snapshot()
+
+
+def record_chat_cache_failure(message: str) -> dict[str, Any]:
+    with connection() as db:
+        db.execute("UPDATE chat_cache_state SET last_attempt_at = ?, last_error = ? WHERE id = 1", (now(), message))
+    return chat_cache_snapshot()
+
+
+def chat_cache_sync_due() -> bool:
+    with connection() as db:
+        state = db.execute("SELECT last_attempt_at FROM chat_cache_state WHERE id = 1").fetchone()
+    if not state or not state["last_attempt_at"]:
+        return True
+    try:
+        attempted_at = datetime.fromisoformat(state["last_attempt_at"])
+        attempted_at = attempted_at if attempted_at.tzinfo else attempted_at.replace(tzinfo=UTC)
+    except ValueError:
+        return True
+    return datetime.now(UTC) - attempted_at >= CHAT_CACHE_STALE_AFTER
+
+
+async def _refresh_chat_cache() -> dict[str, Any]:
+    """Fetch dialogs once and atomically publish them as the durable cache."""
+    if not app_state()["accountConnected"]:
+        raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
+    async with CHAT_CACHE_REFRESH_LOCK:
+        try:
+            if DEMO_MODE:
+                chats = [
+                    {"id": "demo-tech", "title": "科技前沿观察", "handle": "@tech_frontier_obs", "type": "CHANNEL"},
+                    {"id": "demo-design", "title": "设计灵感库", "handle": "@design_inspiration_cn", "type": "CHANNEL"},
+                    {"id": "demo-study", "title": "学习资料库", "handle": "@study_materials_zh", "type": "GROUP"},
+                ]
+            else:
+                async with connected_telegram_client() as client:
+                    chats = []
+                    async for dialog in client.iter_dialogs():
+                        entity = dialog.entity
+                        chats.append({
+                            "id": str(dialog.id),
+                            "title": dialog.name or "未命名聊天",
+                            "handle": f"@{entity.username}" if getattr(entity, "username", None) else None,
+                            "type": "CHANNEL" if dialog.is_channel else "GROUP" if dialog.is_group else "PRIVATE",
+                        })
+            snapshot = replace_chat_cache(chats)
+            log_event(logging.INFO, "telegram.chats_refreshed", "Telegram chat cache refreshed", chat_count=len(chats), demo_mode=DEMO_MODE)
+            return snapshot
+        except HTTPException as error:
+            snapshot = record_chat_cache_failure(str(error.detail))
+            if chat_cache_has_snapshot(snapshot):
+                return snapshot
+            raise
+        except Exception as error:
+            log_event(logging.ERROR, "telegram.chats_refresh_failed", "Telegram chat cache refresh failed", exc_info=True, error_type=type(error).__name__)
+            snapshot = record_chat_cache_failure("无法更新聊天列表，请稍后重试")
+            if chat_cache_has_snapshot(snapshot):
+                return snapshot
+            raise_telegram_error(error)
+
+
+async def refresh_chat_cache() -> dict[str, Any]:
+    """Coalesce concurrent refresh callers onto one Telegram dialog scan."""
+    global CHAT_CACHE_REFRESH_IN_FLIGHT
+    active = CHAT_CACHE_REFRESH_IN_FLIGHT
+    if active and not active.done():
+        return await asyncio.shield(active)
+    task = asyncio.create_task(_refresh_chat_cache(), name="telegram-chat-cache-refresh")
+    CHAT_CACHE_REFRESH_IN_FLIGHT = task
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if CHAT_CACHE_REFRESH_IN_FLIGHT is task and task.done():
+            CHAT_CACHE_REFRESH_IN_FLIGHT = None
+
+
+async def refresh_chat_cache_in_background(reason: str) -> None:
+    if not app_state()["accountConnected"]:
+        return
+    try:
+        await refresh_chat_cache()
+    except HTTPException as error:
+        log_event(logging.WARNING, "telegram.chats_background_refresh_failed", "Background chat cache refresh failed", reason=reason, status_code=error.status_code)
+
+
+def schedule_chat_cache_refresh(reason: str) -> None:
+    global CHAT_CACHE_REFRESH_TASK
+    if CHAT_CACHE_REFRESH_TASK and not CHAT_CACHE_REFRESH_TASK.done():
+        return
+    CHAT_CACHE_REFRESH_TASK = asyncio.create_task(refresh_chat_cache_in_background(reason), name=f"telegram-chat-cache-{reason}")
+
+
+async def chat_cache_sync_worker() -> None:
+    while True:
+        await asyncio.sleep(CHAT_CACHE_SYNC_INTERVAL_SECONDS)
+        if app_state()["accountConnected"] and chat_cache_sync_due():
+            schedule_chat_cache_refresh("daily")
+
+
 def download_runtime_state() -> dict[str, Any]:
     with connection() as db:
         setting = db.execute("SELECT download_concurrency_max FROM app_settings WHERE id = 1").fetchone()
@@ -969,7 +1133,7 @@ def restore_download_runtime() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global DOWNLOAD_DISPATCHER, THUMBNAIL_WORKER, DOWNLOAD_WAKE, THUMBNAIL_WAKE
+    global DOWNLOAD_DISPATCHER, THUMBNAIL_WORKER, CHAT_CACHE_SYNC_WORKER, DOWNLOAD_WAKE, THUMBNAIL_WAKE
     # TestClient and development reloads may create a new event loop in the same
     # process.  These wake-up events must belong to the lifespan that owns the
     # dispatcher workers, rather than a previous loop.
@@ -980,9 +1144,12 @@ async def lifespan(_: FastAPI):
     log_event(logging.INFO, "service.started", "Telegram media archiver started", log_level=LOG_LEVEL, demo_mode=DEMO_MODE)
     DOWNLOAD_DISPATCHER = asyncio.create_task(download_dispatcher(), name="telegram-download-dispatcher")
     THUMBNAIL_WORKER = asyncio.create_task(thumbnail_worker(), name="archive-thumbnail-worker")
+    CHAT_CACHE_SYNC_WORKER = asyncio.create_task(chat_cache_sync_worker(), name="telegram-chat-cache-sync-worker")
     wake_thumbnail_worker()
     if DEMO_MODE or app_state()["accountConnected"]:
         start_pending_task_workers()
+    if app_state()["accountConnected"]:
+        schedule_chat_cache_refresh("startup")
     yield
     log_event(logging.INFO, "service.stopping", "Telegram media archiver is stopping", active_downloads=len(DOWNLOAD_RUNNING), task_workers=len(TASK_WORKERS))
     if DOWNLOAD_DISPATCHER:
@@ -991,6 +1158,15 @@ async def lifespan(_: FastAPI):
     if THUMBNAIL_WORKER:
         THUMBNAIL_WORKER.cancel()
         await asyncio.gather(THUMBNAIL_WORKER, return_exceptions=True)
+    if CHAT_CACHE_SYNC_WORKER:
+        CHAT_CACHE_SYNC_WORKER.cancel()
+        await asyncio.gather(CHAT_CACHE_SYNC_WORKER, return_exceptions=True)
+    if CHAT_CACHE_REFRESH_TASK:
+        CHAT_CACHE_REFRESH_TASK.cancel()
+        await asyncio.gather(CHAT_CACHE_REFRESH_TASK, return_exceptions=True)
+    if CHAT_CACHE_REFRESH_IN_FLIGHT:
+        CHAT_CACHE_REFRESH_IN_FLIGHT.cancel()
+        await asyncio.gather(CHAT_CACHE_REFRESH_IN_FLIGHT, return_exceptions=True)
     for worker in tuple(DOWNLOAD_RUNNING.values()):
         worker.cancel()
     for worker in tuple(PREVIEW_RUNNING.values()):
@@ -1167,6 +1343,7 @@ async def verify_login_code(payload: LoginCodeVerify) -> dict[str, Any]:
         update_connected_account(attempt.phone, user=object())
         pending_logins.pop(payload.attempt_id, None)
         start_pending_task_workers()
+        schedule_chat_cache_refresh("login")
         log_event(logging.INFO, "telegram.login_succeeded", "Demo Telegram login completed", demo_mode=True)
         return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
@@ -1195,6 +1372,7 @@ async def verify_login_code(payload: LoginCodeVerify) -> dict[str, Any]:
             if client:
                 await close_telegram_client(client)
     start_pending_task_workers()
+    schedule_chat_cache_refresh("login")
     return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
 
@@ -1206,6 +1384,7 @@ async def verify_login_password(payload: LoginPasswordVerify) -> dict[str, Any]:
         update_connected_account(attempt.phone, user=object())
         pending_logins.pop(payload.attempt_id, None)
         start_pending_task_workers()
+        schedule_chat_cache_refresh("login")
         log_event(logging.INFO, "telegram.login_succeeded", "Demo Telegram two-step login completed", demo_mode=True)
         return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
@@ -1226,6 +1405,7 @@ async def verify_login_password(payload: LoginPasswordVerify) -> dict[str, Any]:
             if client:
                 await close_telegram_client(client)
     start_pending_task_workers()
+    schedule_chat_cache_refresh("login")
     return {**app_state(), "accountPhone": mask_phone(attempt.phone), "passwordRequired": False}
 
 
@@ -1250,41 +1430,22 @@ async def logout() -> dict[str, Any]:
                connection_status = 'disconnected', updated_at = ? WHERE id = 1""",
             (now(),),
         )
+    clear_chat_cache()
     log_event(logging.INFO, "telegram.logout_completed", "Telegram local session was cleared", remote_logout_confirmed=remote_logout_warning is None)
     return {**app_state(), "warning": remote_logout_warning}
 
 
 @app.get("/api/chats")
-async def list_chats() -> list[dict[str, Any]]:
+async def list_chats() -> dict[str, Any]:
     if not app_state()["accountConnected"]:
         raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
-    if DEMO_MODE:
-        chats = [
-            {"id": "demo-tech", "title": "科技前沿观察", "handle": "@tech_frontier_obs", "type": "CHANNEL"},
-            {"id": "demo-design", "title": "设计灵感库", "handle": "@design_inspiration_cn", "type": "CHANNEL"},
-            {"id": "demo-study", "title": "学习资料库", "handle": "@study_materials_zh", "type": "GROUP"},
-        ]
-        log_event(logging.INFO, "telegram.chats_listed", "Demo Telegram chats listed", chat_count=len(chats), demo_mode=True)
-        return chats
+    snapshot = chat_cache_snapshot()
+    return snapshot if chat_cache_has_snapshot(snapshot) else await refresh_chat_cache()
 
-    try:
-        async with connected_telegram_client() as client:
-            chats: list[dict[str, Any]] = []
-            async for dialog in client.iter_dialogs():
-                entity = dialog.entity
-                chats.append({
-                    "id": str(dialog.id),
-                    "title": dialog.name or "未命名聊天",
-                    "handle": f"@{entity.username}" if getattr(entity, "username", None) else None,
-                    "type": "CHANNEL" if dialog.is_channel else "GROUP" if dialog.is_group else "PRIVATE",
-                })
-            log_event(logging.INFO, "telegram.chats_listed", "Telegram chats listed", chat_count=len(chats), demo_mode=False)
-            return chats
-    except HTTPException:
-        raise
-    except Exception as error:
-        log_event(logging.ERROR, "telegram.chats_list_failed", "Telegram chat listing failed", exc_info=True, error_type=type(error).__name__)
-        raise_telegram_error(error)
+
+@app.post("/api/chats/refresh")
+async def refresh_chats() -> dict[str, Any]:
+    return await refresh_chat_cache()
 
 
 @app.get("/api/tasks")

@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { CheckCircle2, Clock3, Database, EyeOff, KeyRound, LogOut, RefreshCw, Search, ShieldAlert, Wifi } from 'lucide-vue-next'
 import { api, type Settings } from '../api'
+import { clearChatCache } from '../chatCache'
 
 const settings = ref<Settings | null>(null)
 const edit = ref(false)
@@ -31,7 +32,7 @@ async function load() {
 async function save() { error.value = ''; try { await api.updateApi(apiId.value, apiHash.value); edit.value = false; saved.value = true; await load(); window.setTimeout(() => saved.value = false, 2500) } catch (reason) { error.value = reason instanceof Error ? reason.message : '保存失败' } }
 async function saveConcurrency() { error.value = ''; try { await api.updateDownloadConcurrency(concurrency.value); concurrencySaved.value = true; await load(); window.setTimeout(() => concurrencySaved.value = false, 2500) } catch (reason) { error.value = reason instanceof Error ? reason.message : '保存失败' } }
 async function saveTimezone() { error.value = ''; try { await api.updateArchiveTimezone(archiveTimezone.value); timezoneSaved.value = true; emit('state-changed'); await load(); window.setTimeout(() => timezoneSaved.value = false, 2500) } catch (reason) { error.value = reason instanceof Error ? reason.message : '保存失败' } }
-async function logout() { if (!logoutConfirm.value) { logoutConfirm.value = true; return } await api.logout(); logoutConfirm.value = false; emit('state-changed'); await load() }
+async function logout() { if (!logoutConfirm.value) { logoutConfirm.value = true; return } await api.logout(); clearChatCache(); logoutConfirm.value = false; emit('state-changed'); await load() }
 onMounted(load)
 </script>
 

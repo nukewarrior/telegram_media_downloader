@@ -38,6 +38,8 @@ class SourceBrowserTests(unittest.TestCase):
             db.execute("DELETE FROM archive_items")
             db.execute("DELETE FROM media_blobs")
             db.execute("DELETE FROM preview_cache")
+            db.execute("DELETE FROM chat_cache_items")
+            db.execute("UPDATE chat_cache_state SET refreshed_at = NULL, last_attempt_at = NULL, last_error = NULL WHERE id = 1")
             db.execute("UPDATE app_settings SET archive_timezone = 'Asia/Shanghai', updated_at = ? WHERE id = 1", (main.now(),))
 
     def test_source_media_is_cursor_paginated_and_marks_archive_state(self) -> None:
@@ -113,8 +115,8 @@ class SourceBrowserTests(unittest.TestCase):
         shared_client = SharedClient()
 
         async def exercise() -> None:
-            chats = await main.list_chats()
-            self.assertEqual(chats[0]["id"], "123")
+            snapshot = await main.list_chats()
+            self.assertEqual(snapshot["chats"][0]["id"], "123")
             scanned = await main.scan_messages(main.ScanRequest(
                 chat_id="123", chat_title="Shared source", filters=main.TaskFilters(media_types=["PHOTO"]),
             ))
@@ -144,6 +146,18 @@ class SourceBrowserTests(unittest.TestCase):
         self.assertEqual(get_client.await_count, 4)
         open_client.assert_not_called()
         close_client.assert_not_called()
+
+    def test_chat_list_uses_persisted_snapshot_until_explicit_refresh(self) -> None:
+        async def exercise() -> None:
+            with patch.object(main, "app_state", return_value={"accountConnected": True}):
+                first = await main.list_chats()
+                self.assertEqual(len(first["chats"]), 3)
+                with patch.object(main, "refresh_chat_cache", new_callable=AsyncMock) as refresh:
+                    second = await main.list_chats()
+                refresh.assert_not_awaited()
+            self.assertEqual(first["refreshedAt"], second["refreshedAt"])
+
+        asyncio.run(exercise())
 
 
 if __name__ == "__main__":

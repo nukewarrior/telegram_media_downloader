@@ -12,6 +12,7 @@ export type TaskMedia = { id: number; task_id: number; message_id: number; filen
 export type Task = { id: number; chat_id: string; chat_title: string; chat_handle: string | null; status: string; total_count: number; completed_count: number; failed_count: number; total_bytes: number; downloaded_bytes: number; current_file: string | null; speed_bytes_per_second: number; media_revision: number; error_message: string | null; download_wait_until: string | null; filters: Record<string, unknown>; created_at: string; updated_at: string; activeMedia?: TaskMedia[]; downloadRuntime?: DownloadRuntime }
 export type TaskMediaPage = { items: TaskMedia[]; page: number; pageSize: number; total: number; mediaRevision: number }
 export type Chat = { id: string; title: string; handle: string | null; type: string }
+export type ChatListSnapshot = { chats: Chat[]; refreshedAt: string | null; isStale: boolean; lastRefreshError: string | null }
 export type SourcePreview = { id: number; status: 'PENDING' | 'DOWNLOADING' | 'READY' | 'FAILED' | 'CONSUMED'; downloaded_bytes: number; size_bytes: number; error_message: string | null; content_url: string | null }
 export type SourceMedia = { message_id: number; filename: string; media_type: string; mime_type: string | null; size_bytes: number; message_date: string; archived: boolean; archive_id: number | null; queued: boolean; thumbnail_status: string; thumbnail_url: string | null; preview: SourcePreview | null }
 export type SourceMediaPage = { items: SourceMedia[]; next_cursor: string | null }
@@ -21,7 +22,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, { headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) }, ...init })
   if (!response.ok) {
     const body = await response.json().catch(() => ({}))
-    throw new Error(body.detail ?? '请求失败，请稍后重试')
+    const error = new Error(body.detail ?? '请求失败，请稍后重试') as Error & { status?: number }
+    error.status = response.status
+    throw error
   }
   return response.json() as Promise<T>
 }
@@ -38,7 +41,8 @@ export const api = {
   verifyCode: (attempt_id: string, code: string) => request<LoginResult>('/telegram/login/verify-code', { method: 'POST', body: JSON.stringify({ attempt_id, code }) }),
   verifyPassword: (attempt_id: string, password: string) => request<LoginResult>('/telegram/login/verify-password', { method: 'POST', body: JSON.stringify({ attempt_id, password }) }),
   logout: () => request<AppState>('/telegram/logout', { method: 'POST' }),
-  chats: () => request<Chat[]>('/chats'),
+  chats: () => request<ChatListSnapshot>('/chats'),
+  refreshChats: () => request<ChatListSnapshot>('/chats/refresh', { method: 'POST' }),
   sourceMedia: (chatId: string, query: Record<string, string> = {}) => request<SourceMediaPage>(`/sources/${encodeURIComponent(chatId)}/media?${new URLSearchParams(query)}`),
   preview: (chatId: string, item: SourceMedia) => request<SourcePreview>(`/sources/${encodeURIComponent(chatId)}/media/${item.message_id}/preview`, { method: 'POST', body: JSON.stringify({ filename: item.filename, media_type: item.media_type, mime_type: item.mime_type, size_bytes: item.size_bytes, message_date: item.message_date }) }),
   previewStatus: (id: number) => request<SourcePreview>(`/previews/${id}`),
