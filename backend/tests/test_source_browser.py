@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from fastapi.testclient import TestClient
 
 TEST_DATA = Path(tempfile.mkdtemp(prefix="source-browser-test-"))
 os.environ["DATA_DIR"] = str(TEST_DATA)
@@ -38,6 +40,9 @@ class SourceBrowserTests(unittest.TestCase):
             db.execute("DELETE FROM archive_items")
             db.execute("DELETE FROM media_blobs")
             db.execute("DELETE FROM preview_cache")
+            db.execute("DELETE FROM source_media_pages")
+            db.execute("DELETE FROM source_media_cache")
+            db.execute("DELETE FROM source_thumbnail_cache")
             db.execute("DELETE FROM chat_cache_items")
             db.execute("UPDATE chat_cache_state SET refreshed_at = NULL, last_attempt_at = NULL, last_error = NULL WHERE id = 1")
             db.execute("UPDATE app_settings SET archive_timezone = 'Asia/Shanghai', updated_at = ? WHERE id = 1", (main.now(),))
@@ -57,6 +62,111 @@ class SourceBrowserTests(unittest.TestCase):
         self.assertTrue(refreshed["items"][0]["archived"])
         second = asyncio.run(main.browse_source_media("demo-tech", cursor=first["next_cursor"], page_size=3))
         self.assertLess(second["items"][0]["message_id"], ids[-1])
+
+    def test_source_media_page_is_reused_without_a_second_telegram_read(self) -> None:
+        first = asyncio.run(main.browse_source_media("demo-tech", page_size=3, refresh=True))
+        self.assertEqual(first["cacheStatus"], "REFRESHED")
+        with patch.object(main, "demo_source_media", side_effect=AssertionError("cache miss")):
+            cached = asyncio.run(main.browse_source_media("demo-tech", page_size=3))
+        self.assertEqual(cached["cacheStatus"], "HIT")
+        self.assertEqual([item["message_id"] for item in cached["items"]], [item["message_id"] for item in first["items"]])
+
+    def test_source_thumbnail_lru_keeps_media_index(self) -> None:
+        thumbnail = main.SOURCE_THUMBNAIL_ROOT / "evict.jpg"
+        thumbnail.write_bytes(b"thumbnail")
+        with main.connection() as db:
+            db.execute("UPDATE app_settings SET source_cache_max_bytes = 1 WHERE id = 1")
+            db.execute("""INSERT INTO source_media_cache (chat_id, message_id, filename, media_type, size_bytes, message_date, last_seen_at, accessed_at)
+                          VALUES ('demo-tech', 1, 'x.jpg', 'PHOTO', 1, ?, ?, ?)""", (main.now(), main.now(), main.now()))
+            thumbnail_id = db.execute("""INSERT INTO source_thumbnail_cache (chat_id, message_id, cache_path, status, size_bytes, accessed_at, updated_at)
+                                        VALUES ('demo-tech', 1, ?, 'READY', 9, ?, ?)""", (str(thumbnail), main.now(), main.now())).lastrowid
+        main.cleanup_source_thumbnail_cache()
+        with main.connection() as db:
+            status = db.execute("SELECT status FROM source_thumbnail_cache WHERE id = ?", (thumbnail_id,)).fetchone()[0]
+            indexed = db.execute("SELECT message_id FROM source_media_cache WHERE chat_id = 'demo-tech' AND message_id = 1").fetchone()
+            db.execute("UPDATE app_settings SET source_cache_max_bytes = ? WHERE id = 1", (main.SOURCE_CACHE_DEFAULT_MAX_BYTES,))
+        self.assertEqual(status, "PENDING")
+        self.assertIsNotNone(indexed)
+        self.assertFalse(thumbnail.exists())
+
+    def test_source_thumbnail_is_served_only_from_its_cache_root(self) -> None:
+        thumbnail = main.SOURCE_THUMBNAIL_ROOT / "served.jpg"
+        thumbnail.write_bytes(b"thumbnail")
+        with main.connection() as db:
+            cache_id = db.execute("""INSERT INTO source_thumbnail_cache (chat_id, message_id, cache_path, status, size_bytes, accessed_at, updated_at)
+                                    VALUES ('demo-tech', 2, ?, 'READY', 9, ?, ?)""", (str(thumbnail), main.now(), main.now())).lastrowid
+        with TestClient(main.app) as client:
+            response = client.get(f"/api/source-thumbnails/{cache_id}/content")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/jpeg")
+
+    def test_largest_static_telegram_thumbnail_excludes_video_sizes(self) -> None:
+        class PhotoSize:
+            def __init__(self, width: int, height: int) -> None:
+                self.w, self.h = width, height
+
+        class VideoSize(PhotoSize):
+            pass
+
+        small = PhotoSize(160, 90)
+        largest = PhotoSize(640, 360)
+        message = SimpleNamespace(photo=SimpleNamespace(sizes=[small, VideoSize(1280, 720), largest]))
+        self.assertIs(main.static_telegram_thumbnail(message), largest)
+
+    def test_legacy_source_thumbnail_is_invalidated_for_quality_upgrade(self) -> None:
+        thumbnail = main.SOURCE_THUMBNAIL_ROOT / "legacy.jpg"
+        thumbnail.write_bytes(b"legacy")
+        with main.connection() as db:
+            cache_id = db.execute("""INSERT INTO source_thumbnail_cache (chat_id, message_id, cache_path, status, size_bytes, quality_version, quality_origin, accessed_at, updated_at)
+                                    VALUES ('demo-tech', 3, ?, 'READY', 6, 1, 'TELEGRAM', ?, ?)""", (str(thumbnail), main.now(), main.now())).lastrowid
+        main.reconcile_source_thumbnail_records()
+        with main.connection() as db:
+            record = db.execute("SELECT status, quality_version FROM source_thumbnail_cache WHERE id = ?", (cache_id,)).fetchone()
+        self.assertEqual(record["status"], "PENDING")
+        self.assertEqual(record["quality_version"], main.SOURCE_THUMBNAIL_QUALITY_VERSION)
+        self.assertFalse(thumbnail.exists())
+
+    def test_preview_promotion_creates_a_durable_cover_and_prevents_downgrade(self) -> None:
+        preview_path = main.PREVIEW_ROOT / "promoted.png"
+        main.PillowImage.new("RGB", (1200, 800), (55, 116, 161)).save(preview_path)
+        with main.connection() as db:
+            preview_id = db.execute("""INSERT INTO preview_cache (chat_id, message_id, filename, media_type, size_bytes, message_date, cache_path, expires_at, updated_at)
+                                       VALUES ('demo-tech', 4, 'promoted.png', 'PHOTO', ?, ?, ?, ?, ?)""",
+                                    (preview_path.stat().st_size, main.now(), str(preview_path), "2100-01-01T00:00:00+00:00", main.now())).lastrowid
+            preview = db.execute("SELECT * FROM preview_cache WHERE id = ?", (preview_id,)).fetchone()
+        asyncio.run(main.promote_preview_thumbnail(preview, preview_path))
+        with main.connection() as db:
+            cover = db.execute("SELECT * FROM source_thumbnail_cache WHERE chat_id = 'demo-tech' AND message_id = 4").fetchone()
+        self.assertEqual(cover["quality_origin"], "PREVIEW")
+        self.assertEqual(cover["status"], "READY")
+        self.assertTrue(Path(cover["cache_path"]).is_file())
+        telegram_path = main.SOURCE_THUMBNAIL_ROOT / "late.jpg"
+        telegram_path.write_bytes(b"late")
+        self.assertFalse(main.set_telegram_thumbnail_result(cover["id"], path=telegram_path, size_bytes=4))
+        with main.connection() as db:
+            retained = db.execute("SELECT cache_path, quality_origin FROM source_thumbnail_cache WHERE id = ?", (cover["id"],)).fetchone()
+        self.assertEqual(retained["quality_origin"], "PREVIEW")
+        self.assertEqual(retained["cache_path"], cover["cache_path"])
+
+    def test_video_preview_promotion_extracts_a_durable_cover(self) -> None:
+        preview_path = main.PREVIEW_ROOT / "promoted.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=#416f96:s=640x360:d=2", "-pix_fmt", "yuv420p", str(preview_path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with main.connection() as db:
+            preview_id = db.execute("""INSERT INTO preview_cache (chat_id, message_id, filename, media_type, size_bytes, message_date, cache_path, expires_at, updated_at)
+                                       VALUES ('demo-tech', 5, 'promoted.mp4', 'VIDEO', ?, ?, ?, ?, ?)""",
+                                    (preview_path.stat().st_size, main.now(), str(preview_path), "2100-01-01T00:00:00+00:00", main.now())).lastrowid
+            preview = db.execute("SELECT * FROM preview_cache WHERE id = ?", (preview_id,)).fetchone()
+        asyncio.run(main.promote_preview_thumbnail(preview, preview_path))
+        with main.connection() as db:
+            cover = db.execute("SELECT * FROM source_thumbnail_cache WHERE chat_id = 'demo-tech' AND message_id = 5").fetchone()
+        self.assertEqual(cover["quality_origin"], "PREVIEW")
+        with main.PillowImage.open(cover["cache_path"]) as image:
+            self.assertLessEqual(max(image.size), 640)
 
     def test_exact_selection_creates_only_selected_media_and_reuses_preview_reference(self) -> None:
         page = asyncio.run(main.browse_source_media("demo-tech", page_size=3))

@@ -37,6 +37,7 @@ DB_PATH = DATA_DIR / "app.db"
 DOWNLOAD_ROOT = os.getenv("DOWNLOAD_ROOT", str(DATA_DIR / "downloads"))
 THUMBNAIL_ROOT = DATA_DIR / "thumbnails"
 PREVIEW_ROOT = DATA_DIR / "previews"
+SOURCE_THUMBNAIL_ROOT = DATA_DIR / "source-thumbnails"
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 STATIC_DIR = Path(os.getenv("STATIC_DIR", "./static"))
 SESSION_DIR = DATA_DIR / "sessions"
@@ -50,6 +51,7 @@ DOWNLOAD_CLIENT: TelegramClient | None = None
 DOWNLOAD_CLIENT_RESET_REQUESTED = False
 DOWNLOAD_RUNNING: dict[tuple[int, int], asyncio.Task[None]] = {}
 PREVIEW_RUNNING: dict[int, asyncio.Task[None]] = {}
+SOURCE_THUMBNAIL_RUNNING: dict[int, asyncio.Task[None]] = {}
 DOWNLOAD_REQUEUED_CANCELS: set[tuple[int, int]] = set()
 DOWNLOAD_WAKE = asyncio.Event()
 THUMBNAIL_WAKE = asyncio.Event()
@@ -68,6 +70,8 @@ STABILITY_WINDOW_SECONDS = 5 * 60
 SCAN_CACHE_TTL = timedelta(minutes=10)
 SCAN_CACHE: dict[str, tuple[datetime, list[tuple[int, str, str, str | None, int, str]]]] = {}
 PREVIEW_CACHE_TTL = timedelta(hours=24)
+SOURCE_CACHE_DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024
+SOURCE_THUMBNAIL_QUALITY_VERSION = 2
 PREVIEW_LAST_CLEANUP_AT: datetime | None = None
 CHAT_CACHE_STALE_AFTER = timedelta(hours=24)
 CHAT_CACHE_SYNC_INTERVAL_SECONDS = 60 * 60
@@ -401,6 +405,7 @@ def update_connected_account(phone: str, user: Any) -> None:
             (mask_phone(phone), name, now()),
         )
     clear_chat_cache()
+    clear_source_cache()
 
 
 async def open_telegram_client() -> TelegramClient:
@@ -468,6 +473,7 @@ def initialize_database() -> None:
     Path(DOWNLOAD_ROOT).mkdir(parents=True, exist_ok=True)
     THUMBNAIL_ROOT.mkdir(parents=True, exist_ok=True)
     PREVIEW_ROOT.mkdir(parents=True, exist_ok=True)
+    SOURCE_THUMBNAIL_ROOT.mkdir(parents=True, exist_ok=True)
     ensure_session_storage()
     with connection() as db:
         db.executescript(
@@ -484,6 +490,7 @@ def initialize_database() -> None:
               connection_status TEXT NOT NULL DEFAULT 'disconnected',
               archive_timezone TEXT,
               download_concurrency_max INTEGER NOT NULL DEFAULT 3,
+              source_cache_max_bytes INTEGER NOT NULL DEFAULT 2147483648,
               updated_at TEXT NOT NULL
             );
             INSERT OR IGNORE INTO app_settings (id, updated_at) VALUES (1, CURRENT_TIMESTAMP);
@@ -590,6 +597,41 @@ def initialize_database() -> None:
               last_error TEXT
             );
             INSERT OR IGNORE INTO chat_cache_state (id) VALUES (1);
+            CREATE TABLE IF NOT EXISTS source_media_cache (
+              chat_id TEXT NOT NULL,
+              message_id INTEGER NOT NULL,
+              filename TEXT NOT NULL,
+              media_type TEXT NOT NULL,
+              mime_type TEXT,
+              size_bytes INTEGER NOT NULL,
+              message_date TEXT NOT NULL,
+              last_seen_at TEXT NOT NULL,
+              accessed_at TEXT NOT NULL,
+              PRIMARY KEY (chat_id, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS source_media_pages (
+              chat_id TEXT NOT NULL,
+              query_key TEXT NOT NULL,
+              cursor TEXT NOT NULL DEFAULT '',
+              message_ids_json TEXT NOT NULL,
+              next_cursor TEXT,
+              cached_at TEXT NOT NULL,
+              PRIMARY KEY (chat_id, query_key, cursor)
+            );
+            CREATE TABLE IF NOT EXISTS source_thumbnail_cache (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              chat_id TEXT NOT NULL,
+              message_id INTEGER NOT NULL,
+              cache_path TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'PENDING',
+              size_bytes INTEGER NOT NULL DEFAULT 0,
+              error_message TEXT,
+              quality_version INTEGER NOT NULL DEFAULT 1,
+              quality_origin TEXT NOT NULL DEFAULT 'TELEGRAM',
+              accessed_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(chat_id, message_id)
+            );
             """
         )
         setting_columns = {column["name"] for column in db.execute("PRAGMA table_info(app_settings)").fetchall()}
@@ -600,6 +642,13 @@ def initialize_database() -> None:
             db.execute("UPDATE app_settings SET connection_status = CASE WHEN account_connected = 1 THEN 'invalid' ELSE 'disconnected' END")
         if "download_concurrency_max" not in setting_columns:
             db.execute("ALTER TABLE app_settings ADD COLUMN download_concurrency_max INTEGER NOT NULL DEFAULT 3")
+        if "source_cache_max_bytes" not in setting_columns:
+            db.execute("ALTER TABLE app_settings ADD COLUMN source_cache_max_bytes INTEGER NOT NULL DEFAULT 2147483648")
+        source_thumbnail_columns = {column["name"] for column in db.execute("PRAGMA table_info(source_thumbnail_cache)").fetchall()}
+        if "quality_version" not in source_thumbnail_columns:
+            db.execute("ALTER TABLE source_thumbnail_cache ADD COLUMN quality_version INTEGER NOT NULL DEFAULT 1")
+        if "quality_origin" not in source_thumbnail_columns:
+            db.execute("ALTER TABLE source_thumbnail_cache ADD COLUMN quality_origin TEXT NOT NULL DEFAULT 'TELEGRAM'")
         if "archive_timezone" not in setting_columns:
             db.execute("ALTER TABLE app_settings ADD COLUMN archive_timezone TEXT")
         task_columns = {column["name"] for column in db.execute("PRAGMA table_info(tasks)").fetchall()}
@@ -637,6 +686,8 @@ def initialize_database() -> None:
             seed_demo_data(db)
     reconcile_thumbnail_records()
     cleanup_preview_cache()
+    reconcile_source_thumbnail_records()
+    cleanup_source_thumbnail_cache()
     log_event(logging.INFO, "database.initialized", "Database and runtime directories are ready", data_dir=str(DATA_DIR), download_root=str(DOWNLOAD_ROOT), demo_mode=DEMO_MODE)
 
 
@@ -864,6 +915,10 @@ class ArchiveTimezoneSettings(BaseModel):
     archive_timezone: str = Field(min_length=1, max_length=64)
 
 
+class SourceCacheSettings(BaseModel):
+    max_bytes: int = Field(ge=256 * 1024 * 1024, le=20 * 1024 * 1024 * 1024)
+
+
 class LoginCodeRequest(BaseModel):
     phone: str = Field(min_length=5, max_length=32)
 
@@ -957,6 +1012,19 @@ def clear_chat_cache() -> None:
     with connection() as db:
         db.execute("DELETE FROM chat_cache_items")
         db.execute("UPDATE chat_cache_state SET refreshed_at = NULL, last_attempt_at = NULL, last_error = NULL WHERE id = 1")
+
+
+def clear_source_cache() -> None:
+    """Avoid showing one Telegram account's cached source metadata after logout."""
+    with connection() as db:
+        records = db.execute("SELECT cache_path FROM source_thumbnail_cache").fetchall()
+        db.execute("DELETE FROM source_media_pages")
+        db.execute("DELETE FROM source_media_cache")
+        db.execute("DELETE FROM source_thumbnail_cache")
+    for record in records:
+        path = path_in_root(record["cache_path"], SOURCE_THUMBNAIL_ROOT)
+        if path:
+            path.unlink(missing_ok=True)
 
 
 def chat_cache_snapshot() -> dict[str, Any]:
@@ -1100,7 +1168,7 @@ def download_runtime_state() -> dict[str, Any]:
     return {
         "maxConcurrency": setting["download_concurrency_max"],
         "effectiveConcurrency": min(DOWNLOAD_EFFECTIVE_CONCURRENCY, setting["download_concurrency_max"]),
-        "activeDownloads": len(DOWNLOAD_RUNNING) + len(PREVIEW_RUNNING),
+        "activeDownloads": len(DOWNLOAD_RUNNING) + len(PREVIEW_RUNNING) + len(SOURCE_THUMBNAIL_RUNNING),
         "waitUntil": DOWNLOAD_FLOOD_UNTIL.isoformat() if DOWNLOAD_FLOOD_UNTIL else None,
     }
 
@@ -1171,7 +1239,9 @@ async def lifespan(_: FastAPI):
         worker.cancel()
     for worker in tuple(PREVIEW_RUNNING.values()):
         worker.cancel()
-    await asyncio.gather(*tuple(DOWNLOAD_RUNNING.values()), *tuple(PREVIEW_RUNNING.values()), return_exceptions=True)
+    for worker in tuple(SOURCE_THUMBNAIL_RUNNING.values()):
+        worker.cancel()
+    await asyncio.gather(*tuple(DOWNLOAD_RUNNING.values()), *tuple(PREVIEW_RUNNING.values()), *tuple(SOURCE_THUMBNAIL_RUNNING.values()), return_exceptions=True)
     await close_download_client()
     for worker in tuple(TASK_WORKERS.values()):
         worker.cancel()
@@ -1252,6 +1322,7 @@ def get_settings() -> dict[str, Any]:
         "downloadRoot": DOWNLOAD_ROOT,
         "trustedLanWarning": "当前服务未启用应用层认证。任何可访问此 HTTP 地址的人都可操作已连接账号和查看归档；仅应部署在可信局域网，绝不可暴露公网。",
         "download": download_runtime_state(),
+        "sourceCache": {"maxBytes": setting["source_cache_max_bytes"]},
     }
 
 
@@ -1297,6 +1368,15 @@ async def update_download_concurrency(payload: DownloadConcurrencySettings) -> d
     DOWNLOAD_WAKE.set()
     log_event(logging.INFO, "settings.download_concurrency_updated", "Download concurrency setting was updated", previous_max_concurrency=previous, max_concurrency=payload.max_concurrency, effective_concurrency=DOWNLOAD_EFFECTIVE_CONCURRENCY, requeued_download_count=len(cancelled))
     return download_runtime_state()
+
+
+@app.put("/api/settings/source-cache")
+def update_source_cache_settings(payload: SourceCacheSettings) -> dict[str, Any]:
+    with connection() as db:
+        db.execute("UPDATE app_settings SET source_cache_max_bytes = ?, updated_at = ? WHERE id = 1", (payload.max_bytes, now()))
+    cleanup_source_thumbnail_cache()
+    log_event(logging.INFO, "settings.source_cache_updated", "Source thumbnail cache capacity was updated", max_bytes=payload.max_bytes)
+    return {"maxBytes": payload.max_bytes}
 
 
 @app.post("/api/telegram/login/send-code")
@@ -1431,6 +1511,7 @@ async def logout() -> dict[str, Any]:
             (now(),),
         )
     clear_chat_cache()
+    clear_source_cache()
     log_event(logging.INFO, "telegram.logout_completed", "Telegram local session was cleared", remote_logout_confirmed=remote_logout_warning is None)
     return {**app_state(), "warning": remote_logout_warning}
 
@@ -1653,10 +1734,30 @@ def preview_payload(record: sqlite3.Row) -> dict[str, Any]:
     return payload
 
 
-def source_media_payload(item: tuple[int, str, str, str | None, int, str], archive_ids: dict[int, int], queued_ids: set[int], previews: dict[int, sqlite3.Row]) -> dict[str, Any]:
+def source_thumbnail_records(chat_id: str, message_ids: list[int]) -> dict[int, sqlite3.Row]:
+    if not message_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in message_ids)
+    with connection() as db:
+        records = db.execute(f"SELECT * FROM source_thumbnail_cache WHERE chat_id = ? AND message_id IN ({placeholders})", (chat_id, *message_ids)).fetchall()
+        db.execute(f"UPDATE source_thumbnail_cache SET accessed_at = ? WHERE chat_id = ? AND message_id IN ({placeholders}) AND status = 'READY'", (now(), chat_id, *message_ids))
+    return {record["message_id"]: record for record in records}
+
+
+def source_thumbnail_payload(record: sqlite3.Row | None) -> tuple[str, str | None]:
+    if not record:
+        return "PENDING", None
+    thumbnail = path_in_root(record["cache_path"], SOURCE_THUMBNAIL_ROOT)
+    if record["status"] == "READY" and thumbnail and thumbnail.is_file():
+        return "READY", f"/api/source-thumbnails/{record['id']}/content"
+    return record["status"], None
+
+
+def source_media_payload(item: tuple[int, str, str, str | None, int, str], archive_ids: dict[int, int], queued_ids: set[int], previews: dict[int, sqlite3.Row], thumbnails: dict[int, sqlite3.Row] | None = None) -> dict[str, Any]:
     message_id, filename, media_type, mime_type, size_bytes, message_date = item
     preview = previews.get(message_id)
     preview_data = preview_payload(preview) if preview else None
+    thumbnail_status, thumbnail_url = source_thumbnail_payload((thumbnails or {}).get(message_id)) if media_type in {"PHOTO", "VIDEO"} else ("UNAVAILABLE", None)
     return {
         "message_id": message_id,
         "filename": filename,
@@ -1667,8 +1768,8 @@ def source_media_payload(item: tuple[int, str, str, str | None, int, str], archi
         "archived": message_id in archive_ids,
         "archive_id": archive_ids.get(message_id),
         "queued": message_id in queued_ids,
-        "thumbnail_status": "READY" if preview_data and preview_data["content_url"] and media_type in {"PHOTO", "VIDEO"} else (preview["status"] if preview else "UNAVAILABLE"),
-        "thumbnail_url": preview_data["content_url"] if preview_data and media_type in {"PHOTO", "VIDEO"} else None,
+        "thumbnail_status": thumbnail_status,
+        "thumbnail_url": thumbnail_url,
         "preview": preview_data,
     }
 
@@ -1685,8 +1786,60 @@ def demo_source_media(chat_id: str, offset: int | None, media_types: set[str]) -
     return result
 
 
+def source_page_key(media_type: str | None, date_start: str | None, date_end: str | None, page_size: int) -> str:
+    return json.dumps({"media_type": media_type, "date_start": date_start, "date_end": date_end, "page_size": page_size}, sort_keys=True, separators=(",", ":"))
+
+
+def cached_source_page(chat_id: str, query_key: str, cursor: str | None) -> tuple[list[tuple[int, str, str, str | None, int, str]], str | None] | None:
+    with connection() as db:
+        page = db.execute("SELECT * FROM source_media_pages WHERE chat_id = ? AND query_key = ? AND cursor = ?", (chat_id, query_key, cursor or "")).fetchone()
+        if not page:
+            return None
+        ids = json.loads(page["message_ids_json"])
+        if not ids:
+            return [], page["next_cursor"]
+        placeholders = ", ".join("?" for _ in ids)
+        records = db.execute(f"SELECT * FROM source_media_cache WHERE chat_id = ? AND message_id IN ({placeholders})", (chat_id, *ids)).fetchall()
+        by_id = {record["message_id"]: record for record in records}
+        ordered = [(record["message_id"], record["filename"], record["media_type"], record["mime_type"], record["size_bytes"], record["message_date"]) for item_id in ids if (record := by_id.get(item_id))]
+        db.execute(f"UPDATE source_media_cache SET accessed_at = ? WHERE chat_id = ? AND message_id IN ({placeholders})", (now(), chat_id, *ids))
+    return ordered, page["next_cursor"]
+
+
+def cache_source_page(chat_id: str, query_key: str, cursor: str | None, visible: list[tuple[int, str, str, str | None, int, str]], next_cursor: str | None) -> None:
+    timestamp = now()
+    with connection() as db:
+        db.executemany(
+            """INSERT INTO source_media_cache (chat_id, message_id, filename, media_type, mime_type, size_bytes, message_date, last_seen_at, accessed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(chat_id, message_id) DO UPDATE SET filename=excluded.filename, media_type=excluded.media_type, mime_type=excluded.mime_type, size_bytes=excluded.size_bytes, message_date=excluded.message_date, last_seen_at=excluded.last_seen_at, accessed_at=excluded.accessed_at""",
+            [(chat_id, *item, timestamp, timestamp) for item in visible],
+        )
+        db.execute("""INSERT INTO source_media_pages (chat_id, query_key, cursor, message_ids_json, next_cursor, cached_at)
+                      VALUES (?, ?, ?, ?, ?, ?)
+                      ON CONFLICT(chat_id, query_key, cursor) DO UPDATE SET message_ids_json=excluded.message_ids_json, next_cursor=excluded.next_cursor, cached_at=excluded.cached_at""",
+                   (chat_id, query_key, cursor or "", json.dumps([item[0] for item in visible]), next_cursor, timestamp))
+        for message_id, _, media_type, _, _, _ in visible:
+            if media_type not in {"PHOTO", "VIDEO"}:
+                continue
+            placeholder = SOURCE_THUMBNAIL_ROOT / f"pending-{secrets.token_hex(8)}"
+            db.execute("""INSERT OR IGNORE INTO source_thumbnail_cache (chat_id, message_id, cache_path, quality_version, accessed_at, updated_at)
+                          VALUES (?, ?, ?, ?, ?, ?)""", (chat_id, message_id, str(placeholder), SOURCE_THUMBNAIL_QUALITY_VERSION, timestamp, timestamp))
+        thumbnail_ids = [item[0] for item in visible if item[2] in {"PHOTO", "VIDEO"}]
+        if thumbnail_ids:
+            placeholders = ", ".join("?" for _ in thumbnail_ids)
+            db.execute(f"UPDATE source_thumbnail_cache SET status = 'PENDING', error_message = NULL, updated_at = ? WHERE chat_id = ? AND message_id IN ({placeholders}) AND status = 'FAILED'", (timestamp, chat_id, *thumbnail_ids))
+    DOWNLOAD_WAKE.set()
+
+
+def source_page_response(chat_id: str, visible: list[tuple[int, str, str, str | None, int, str]], next_cursor: str | None, *, cache_status: str) -> dict[str, Any]:
+    archive_ids, queued_ids, previews = source_item_states(chat_id, [item[0] for item in visible])
+    thumbnails = source_thumbnail_records(chat_id, [item[0] for item in visible])
+    return {"items": [source_media_payload(item, archive_ids, queued_ids, previews, thumbnails) for item in visible], "next_cursor": next_cursor, "cacheStatus": cache_status}
+
+
 @app.get("/api/sources/{chat_id}/media")
-async def browse_source_media(chat_id: str, cursor: str | None = None, media_type: str | None = None, date_start: str | None = None, date_end: str | None = None, page_size: int = 30) -> dict[str, Any]:
+async def browse_source_media(chat_id: str, cursor: str | None = None, media_type: str | None = None, date_start: str | None = None, date_end: str | None = None, page_size: int = 30, refresh: bool = False) -> dict[str, Any]:
     if not 1 <= page_size <= 50:
         raise HTTPException(400, "每页媒体数量必须在 1 到 50 之间")
     allowed_types = {"PHOTO", "VIDEO", "AUDIO", "DOCUMENT"}
@@ -1702,12 +1855,17 @@ async def browse_source_media(chat_id: str, cursor: str | None = None, media_typ
         offset = parse_source_cursor(cursor)
     except ValueError as error:
         raise HTTPException(400, "日期格式无效") from error
+    if not DEMO_MODE and not app_state()["accountConnected"]:
+        raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
+    query_key = source_page_key(media_type, date_start, date_end, page_size)
+    if not refresh:
+        cached = cached_source_page(chat_id, query_key, cursor)
+        if cached is not None:
+            return source_page_response(chat_id, *cached, cache_status="HIT")
     matched: list[tuple[int, str, str, str | None, int, str]] = []
     if DEMO_MODE:
         matched = demo_source_media(chat_id, offset, requested_types)
     else:
-        if not app_state()["accountConnected"]:
-            raise HTTPException(409, "Telegram 尚未连接或登录状态已失效，请重新连接账号")
         try:
             async with connected_telegram_client() as client:
                 entity = await client.get_entity(int(chat_id))
@@ -1724,11 +1882,39 @@ async def browse_source_media(chat_id: str, cursor: str | None = None, media_typ
             log_event(logging.ERROR, "source_media.list_failed", "Unable to list source media", exc_info=True, chat_id=chat_id, error_type=type(error).__name__)
             raise_telegram_error(error)
     visible, overflow = matched[:page_size], matched[page_size:]
-    archive_ids, queued_ids, previews = source_item_states(chat_id, [item[0] for item in visible])
-    return {
-        "items": [source_media_payload(item, archive_ids, queued_ids, previews) for item in visible],
-        "next_cursor": source_cursor(visible[-1][0]) if overflow and visible else None,
-    }
+    next_cursor = source_cursor(visible[-1][0]) if overflow and visible else None
+    cache_source_page(chat_id, query_key, cursor, visible, next_cursor)
+    return source_page_response(chat_id, visible, next_cursor, cache_status="REFRESHED")
+
+
+@app.get("/api/source-thumbnails/{cache_id}/content")
+def source_thumbnail_content(cache_id: int) -> FileResponse:
+    with connection() as db:
+        record = db.execute("SELECT * FROM source_thumbnail_cache WHERE id = ?", (cache_id,)).fetchone()
+        if record:
+            db.execute("UPDATE source_thumbnail_cache SET accessed_at = ? WHERE id = ?", (now(), cache_id))
+    if not record or record["status"] != "READY":
+        raise HTTPException(404, "来源缩略图暂不可用")
+    file_path = path_in_root(record["cache_path"], SOURCE_THUMBNAIL_ROOT)
+    if not file_path or not file_path.is_file():
+        raise HTTPException(404, "来源缩略图不存在")
+    return FileResponse(file_path, media_type="image/jpeg", content_disposition_type="inline", headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.get("/api/sources/{chat_id}/thumbnails")
+def source_thumbnail_statuses(chat_id: str, message_ids: str) -> dict[str, dict[str, str | None]]:
+    try:
+        ids = list(dict.fromkeys(int(value) for value in message_ids.split(",") if value))
+    except ValueError as error:
+        raise HTTPException(400, "缩略图消息编号无效") from error
+    if not ids or len(ids) > 50 or any(value <= 0 for value in ids):
+        raise HTTPException(400, "缩略图消息编号无效")
+    records = source_thumbnail_records(chat_id, ids)
+    result: dict[str, dict[str, str | None]] = {}
+    for message_id in ids:
+        status, url = source_thumbnail_payload(records.get(message_id))
+        result[str(message_id)] = {"status": status, "url": url}
+    return result
 
 
 @app.post("/api/tasks/scan")
@@ -1886,7 +2072,7 @@ def request_download_client_reset(task_id: int, media_id: int) -> None:
         "Telegram download client will be rebuilt after active downloads finish",
         task_id=task_id,
         media_id=media_id,
-        active_download_count=len(DOWNLOAD_RUNNING) + len(PREVIEW_RUNNING),
+        active_download_count=len(DOWNLOAD_RUNNING) + len(PREVIEW_RUNNING) + len(SOURCE_THUMBNAIL_RUNNING),
     )
     notify_download_dispatcher()
 
@@ -1894,7 +2080,7 @@ def request_download_client_reset(task_id: int, media_id: int) -> None:
 async def reset_download_client_if_requested() -> None:
     """Close the shared client only after no worker can still be using it."""
     global DOWNLOAD_CLIENT, DOWNLOAD_CLIENT_RESET_REQUESTED
-    if not DOWNLOAD_CLIENT_RESET_REQUESTED or DOWNLOAD_RUNNING or PREVIEW_RUNNING:
+    if not DOWNLOAD_CLIENT_RESET_REQUESTED or DOWNLOAD_RUNNING or PREVIEW_RUNNING or SOURCE_THUMBNAIL_RUNNING:
         return
     try:
         await close_download_client()
@@ -2034,7 +2220,9 @@ def stop_all_downloads_for_auth_failure(message: str) -> None:
         worker.cancel()
     for worker in tuple(PREVIEW_RUNNING.values()):
         worker.cancel()
-    log_event(logging.ERROR, "download.stopped_for_auth_failure", "All downloads stopped because Telegram authorization failed", active_download_count=len(DOWNLOAD_RUNNING))
+    for worker in tuple(SOURCE_THUMBNAIL_RUNNING.values()):
+        worker.cancel()
+    log_event(logging.ERROR, "download.stopped_for_auth_failure", "All downloads stopped because Telegram authorization failed", active_download_count=len(DOWNLOAD_RUNNING) + len(PREVIEW_RUNNING) + len(SOURCE_THUMBNAIL_RUNNING))
 
 
 def preview_part_path(record: sqlite3.Row) -> Path | None:
@@ -2063,6 +2251,182 @@ def cleanup_preview_cache() -> None:
             log_event(logging.INFO, "preview.cache_cleaned", "Expired preview cache removed", cache_count=len(records))
     except (OSError, sqlite3.Error) as error:
         log_event(logging.WARNING, "preview.cache_cleanup_failed", "Unable to clean expired preview cache", exc_info=True, error_type=type(error).__name__)
+
+
+def cleanup_source_thumbnail_cache() -> None:
+    """Evict least-recently-used source thumbnails without discarding their media index."""
+    try:
+        with connection() as db:
+            maximum = db.execute("SELECT source_cache_max_bytes FROM app_settings WHERE id = 1").fetchone()[0]
+            records = db.execute("SELECT * FROM source_thumbnail_cache WHERE status = 'READY' ORDER BY accessed_at ASC").fetchall()
+            total = sum(record["size_bytes"] for record in records)
+            evicted: list[sqlite3.Row] = []
+            for record in records:
+                if total <= maximum:
+                    break
+                total -= record["size_bytes"]
+                evicted.append(record)
+            db.executemany("UPDATE source_thumbnail_cache SET status = 'PENDING', size_bytes = 0, error_message = NULL, updated_at = ? WHERE id = ?", [(now(), record["id"]) for record in evicted])
+        for record in evicted:
+            path = path_in_root(record["cache_path"], SOURCE_THUMBNAIL_ROOT)
+            if path:
+                path.unlink(missing_ok=True)
+        if evicted:
+            log_event(logging.INFO, "source_thumbnail.cache_evicted", "Source thumbnail cache evicted least-recently-used files", thumbnail_count=len(evicted), remaining_bytes=total)
+    except (OSError, sqlite3.Error) as error:
+        log_event(logging.WARNING, "source_thumbnail.cache_cleanup_failed", "Unable to clean source thumbnail cache", exc_info=True, error_type=type(error).__name__)
+
+
+def reconcile_source_thumbnail_records() -> None:
+    """Discard legacy tiny Telegram thumbnails once, while preserving promoted covers."""
+    try:
+        with connection() as db:
+            records = db.execute("SELECT * FROM source_thumbnail_cache").fetchall()
+            stale = []
+            for record in records:
+                path = path_in_root(record["cache_path"], SOURCE_THUMBNAIL_ROOT)
+                if record["quality_version"] < SOURCE_THUMBNAIL_QUALITY_VERSION or (record["status"] == "READY" and (not path or not path.is_file())):
+                    stale.append(record)
+            db.executemany(
+                """UPDATE source_thumbnail_cache SET status = 'PENDING', size_bytes = 0, error_message = NULL,
+                   quality_version = ?, quality_origin = 'TELEGRAM', updated_at = ? WHERE id = ?""",
+                [(SOURCE_THUMBNAIL_QUALITY_VERSION, now(), record["id"]) for record in stale],
+            )
+        for record in stale:
+            path = path_in_root(record["cache_path"], SOURCE_THUMBNAIL_ROOT)
+            if path:
+                path.unlink(missing_ok=True)
+        if stale:
+            log_event(logging.INFO, "source_thumbnail.quality_upgraded", "Legacy source thumbnails invalidated for a quality upgrade", thumbnail_count=len(stale))
+    except (OSError, sqlite3.Error) as error:
+        log_event(logging.WARNING, "source_thumbnail.reconcile_failed", "Unable to reconcile source thumbnail cache", exc_info=True, error_type=type(error).__name__)
+
+
+def claim_next_source_thumbnail() -> sqlite3.Row | None:
+    with connection() as db:
+        record = db.execute("SELECT * FROM source_thumbnail_cache WHERE status = 'PENDING' ORDER BY updated_at LIMIT 1").fetchone()
+        if not record:
+            return None
+        if not db.execute("UPDATE source_thumbnail_cache SET status = 'DOWNLOADING', error_message = NULL, updated_at = ? WHERE id = ? AND status = 'PENDING'", (now(), record["id"])).rowcount:
+            return None
+        return db.execute("SELECT * FROM source_thumbnail_cache WHERE id = ?", (record["id"],)).fetchone()
+
+
+def update_source_thumbnail(cache_id: int, **values: Any) -> None:
+    values["updated_at"] = now()
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with connection() as db:
+        db.execute(f"UPDATE source_thumbnail_cache SET {assignments} WHERE id = ?", (*values.values(), cache_id))
+
+
+def static_telegram_thumbnail(message: Any) -> Any | None:
+    """Return Telegram's largest image thumbnail, never a video thumbnail."""
+    media = getattr(message, "photo", None) or getattr(message, "document", None)
+    sizes = list(getattr(media, "sizes", None) or getattr(media, "thumbs", None) or [])
+    candidates = [
+        size for size in sizes
+        if "video" not in type(size).__name__.lower() and hasattr(size, "w") and hasattr(size, "h")
+    ]
+    return max(candidates, key=lambda size: int(getattr(size, "w", 0)) * int(getattr(size, "h", 0)), default=None)
+
+
+def set_telegram_thumbnail_result(cache_id: int, *, path: Path, size_bytes: int) -> bool:
+    """Never allow a late Telegram worker to downgrade a preview-derived cover."""
+    with connection() as db:
+        updated = db.execute(
+            """UPDATE source_thumbnail_cache SET status = 'READY', cache_path = ?, size_bytes = ?, error_message = NULL,
+               quality_version = ?, quality_origin = 'TELEGRAM', accessed_at = ?, updated_at = ?
+               WHERE id = ? AND quality_origin != 'PREVIEW'""",
+            (str(path), size_bytes, SOURCE_THUMBNAIL_QUALITY_VERSION, now(), now(), cache_id),
+        ).rowcount
+    return bool(updated)
+
+
+def set_telegram_thumbnail_status(cache_id: int, status: str, error_message: str | None = None) -> None:
+    with connection() as db:
+        db.execute(
+            """UPDATE source_thumbnail_cache SET status = ?, error_message = ?, quality_version = ?,
+               quality_origin = 'TELEGRAM', updated_at = ? WHERE id = ? AND quality_origin != 'PREVIEW'""",
+            (status, error_message, SOURCE_THUMBNAIL_QUALITY_VERSION, now(), cache_id),
+        )
+
+
+async def promote_preview_thumbnail(record: sqlite3.Row, source: Path) -> None:
+    """Turn an already downloaded original preview into the durable card cover."""
+    if record["media_type"] not in {"PHOTO", "VIDEO"}:
+        return
+    with connection() as db:
+        thumbnail = db.execute("SELECT * FROM source_thumbnail_cache WHERE chat_id = ? AND message_id = ?", (record["chat_id"], record["message_id"])).fetchone()
+        if not thumbnail:
+            placeholder = SOURCE_THUMBNAIL_ROOT / f"pending-{secrets.token_hex(8)}"
+            thumbnail_id = db.execute("""INSERT INTO source_thumbnail_cache (chat_id, message_id, cache_path, quality_version, accessed_at, updated_at)
+                                        VALUES (?, ?, ?, ?, ?, ?)""", (record["chat_id"], record["message_id"], str(placeholder), SOURCE_THUMBNAIL_QUALITY_VERSION, now(), now())).lastrowid
+            thumbnail = db.execute("SELECT * FROM source_thumbnail_cache WHERE id = ?", (thumbnail_id,)).fetchone()
+    if not thumbnail:
+        return
+    target = SOURCE_THUMBNAIL_ROOT / f"source-preview-{thumbnail['id']}.jpg"
+    if record["media_type"] == "PHOTO":
+        await asyncio.to_thread(create_image_thumbnail, source, target)
+    else:
+        await create_video_thumbnail(source, target)
+    previous = path_in_root(thumbnail["cache_path"], SOURCE_THUMBNAIL_ROOT)
+    with connection() as db:
+        db.execute(
+            """UPDATE source_thumbnail_cache SET cache_path = ?, status = 'READY', size_bytes = ?, error_message = NULL,
+               quality_version = ?, quality_origin = 'PREVIEW', accessed_at = ?, updated_at = ? WHERE id = ?""",
+            (str(target), target.stat().st_size, SOURCE_THUMBNAIL_QUALITY_VERSION, now(), now(), thumbnail["id"]),
+        )
+    if previous and previous != target:
+        previous.unlink(missing_ok=True)
+    cleanup_source_thumbnail_cache()
+    log_event(logging.INFO, "source_thumbnail.promoted", "Source thumbnail promoted from a completed preview", thumbnail_id=thumbnail["id"], chat_id=record["chat_id"], message_id=record["message_id"], media_type=record["media_type"])
+
+
+async def source_thumbnail_job(cache_id: int) -> None:
+    part: Path | None = None
+    try:
+        with connection() as db:
+            record = db.execute("SELECT * FROM source_thumbnail_cache WHERE id = ?", (cache_id,)).fetchone()
+        if not record or record["status"] != "DOWNLOADING":
+            return
+        target = SOURCE_THUMBNAIL_ROOT / f"source-telegram-{cache_id}.jpg"
+        part = target.with_suffix(".part")
+        if DEMO_MODE:
+            await asyncio.to_thread(create_demo_thumbnail, cache_id + 1000, "PHOTO")
+            demo = THUMBNAIL_ROOT / f"demo-{cache_id + 1000}.jpg"
+            shutil.copyfile(demo, target)
+        else:
+            client = await get_download_client()
+            async with TELEGRAM_LOCK:
+                entity = await client.get_entity(int(record["chat_id"]))
+                message = await client.get_messages(entity, ids=record["message_id"])
+            if not message:
+                raise RuntimeError("消息已不可用")
+            thumbnail_size = static_telegram_thumbnail(message)
+            if not thumbnail_size:
+                set_telegram_thumbnail_status(cache_id, "UNAVAILABLE", "Telegram 未提供静态缩略图")
+                return
+            downloaded = await client.download_media(message, file=str(part), thumb=thumbnail_size)
+            if not downloaded or not part.is_file():
+                raise RuntimeError("Telegram 未提供可用缩略图")
+            await asyncio.to_thread(create_image_thumbnail, part, target)
+        if not set_telegram_thumbnail_result(cache_id, path=target, size_bytes=target.stat().st_size):
+            target.unlink(missing_ok=True)
+            return
+        cleanup_source_thumbnail_cache()
+        log_event(logging.INFO, "source_thumbnail.ready", "Source media thumbnail ready", thumbnail_id=cache_id, chat_id=record["chat_id"], message_id=record["message_id"])
+    except asyncio.CancelledError:
+        set_telegram_thumbnail_status(cache_id, "PENDING")
+        raise
+    except Exception as error:
+        set_telegram_thumbnail_status(cache_id, "FAILED", "缩略图暂不可用")
+        log_event(logging.WARNING, "source_thumbnail.failed", "Source media thumbnail failed", exc_info=True, thumbnail_id=cache_id, error_type=type(error).__name__)
+    finally:
+        if part:
+            part.unlink(missing_ok=True)
+        SOURCE_THUMBNAIL_RUNNING.pop(cache_id, None)
+        await reset_download_client_if_requested()
+        DOWNLOAD_WAKE.set()
 
 
 def update_preview_cache(cache_id: int, **values: Any) -> None:
@@ -2120,6 +2484,11 @@ async def preview_download_job(cache_id: int) -> None:
             if not result:
                 raise RuntimeError("Telegram 未返回预览文件")
             os.replace(part, cached)
+        try:
+            await promote_preview_thumbnail(record, cached)
+        except (UnidentifiedImageError, OSError, RuntimeError) as error:
+            # A cover failure must not make the original-file preview unusable.
+            log_event(logging.WARNING, "source_thumbnail.promotion_failed", "Unable to promote preview into a source thumbnail", exc_info=True, preview_id=cache_id, chat_id=record["chat_id"], message_id=record["message_id"], media_type=record["media_type"], error_type=type(error).__name__)
         update_preview_cache(cache_id, status="READY", downloaded_bytes=record["size_bytes"], error_message=None, expires_at=(datetime.now(UTC) + PREVIEW_CACHE_TTL).isoformat())
         log_event(logging.INFO, "preview.ready", "Source media preview ready", preview_id=cache_id, chat_id=record["chat_id"], message_id=record["message_id"], size_bytes=record["size_bytes"])
     except asyncio.CancelledError:
@@ -2288,6 +2657,12 @@ async def download_dispatcher() -> None:
                             runner = download_demo_media_job if DEMO_MODE else download_media_job
                             DOWNLOAD_RUNNING[key] = asyncio.create_task(runner(*key), name=f"telegram-media-{task_id}-{media['id']}")
                     DOWNLOAD_ROUND_ROBIN_OFFSET += 1
+                # Source thumbnails are deliberately opportunistic: a media
+                # task or clicked original preview always wins the next slot.
+                if slots and not DOWNLOAD_RUNNING and not PREVIEW_RUNNING and not SOURCE_THUMBNAIL_RUNNING:
+                    thumbnail = claim_next_source_thumbnail()
+                    if thumbnail:
+                        SOURCE_THUMBNAIL_RUNNING[thumbnail["id"]] = asyncio.create_task(source_thumbnail_job(thumbnail["id"]), name=f"telegram-source-thumbnail-{thumbnail['id']}")
             DOWNLOAD_WAKE.clear()
             try:
                 await asyncio.wait_for(DOWNLOAD_WAKE.wait(), timeout=0.5)
