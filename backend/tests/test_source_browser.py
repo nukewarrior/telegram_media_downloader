@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
+from telethon.client.downloads import DownloadMethods
+from telethon.tl import types as telegram_types
 
 TEST_DATA = Path(tempfile.mkdtemp(prefix="source-browser-test-"))
 os.environ["DATA_DIR"] = str(TEST_DATA)
@@ -34,6 +36,7 @@ class SourceBrowserTests(unittest.TestCase):
 
     def setUp(self) -> None:
         main.PREVIEW_RUNNING.clear()
+        main.SOURCE_THUMBNAIL_RUNNING.clear()
         with main.connection() as db:
             db.execute("DELETE FROM task_media")
             db.execute("DELETE FROM tasks")
@@ -101,17 +104,95 @@ class SourceBrowserTests(unittest.TestCase):
         self.assertEqual(response.headers["content-type"], "image/jpeg")
 
     def test_largest_static_telegram_thumbnail_excludes_video_sizes(self) -> None:
-        class PhotoSize:
-            def __init__(self, width: int, height: int) -> None:
-                self.w, self.h = width, height
+        small = telegram_types.PhotoSize(type="m", w=160, h=90, size=1_000)
+        largest = telegram_types.PhotoSizeProgressive(type="x", w=640, h=360, sizes=[1_000, 2_000])
+        video = telegram_types.VideoSize(type="v", w=1280, h=720, size=4_000)
+        message = SimpleNamespace(photo=SimpleNamespace(sizes=[small, video, largest]))
+        selected = main.static_telegram_thumbnail(message)
+        self.assertIs(selected, largest)
+        self.assertIs(DownloadMethods._get_thumb([small, largest, video], selected.type), largest)
 
-        class VideoSize(PhotoSize):
-            pass
+    def _source_thumbnail_record(self, message_id: int) -> int:
+        placeholder = main.SOURCE_THUMBNAIL_ROOT / f"test-pending-{message_id}"
+        with main.connection() as db:
+            return db.execute(
+                """INSERT INTO source_thumbnail_cache (chat_id, message_id, cache_path, status, quality_version, accessed_at, updated_at)
+                   VALUES ('91000', ?, ?, 'DOWNLOADING', ?, ?, ?)""",
+                (message_id, str(placeholder), main.SOURCE_THUMBNAIL_QUALITY_VERSION, main.now(), main.now()),
+            ).lastrowid
 
-        small = PhotoSize(160, 90)
-        largest = PhotoSize(640, 360)
-        message = SimpleNamespace(photo=SimpleNamespace(sizes=[small, VideoSize(1280, 720), largest]))
-        self.assertIs(main.static_telegram_thumbnail(message), largest)
+    def test_source_thumbnail_marks_telegram_no_result_unavailable_without_retry(self) -> None:
+        progressive = telegram_types.PhotoSizeProgressive(type="x", w=1280, h=720, sizes=[1_000, 2_000])
+        message = SimpleNamespace(photo=SimpleNamespace(sizes=[progressive]))
+
+        class NoThumbnailClient:
+            async def get_entity(self, chat_id: int) -> int:
+                return chat_id
+
+            async def get_messages(self, _: int, *, ids: int) -> object:
+                return message
+
+            async def download_media(self, *_: object, **__: object) -> None:
+                return None
+
+        cache_id = self._source_thumbnail_record(91_001)
+        previous_demo_mode = main.DEMO_MODE
+        main.DEMO_MODE = False
+        try:
+            with (
+                patch.object(main, "get_download_client", new_callable=AsyncMock, return_value=NoThumbnailClient()),
+                patch.object(main, "log_event") as log_event,
+            ):
+                asyncio.run(main.source_thumbnail_job(cache_id))
+        finally:
+            main.DEMO_MODE = previous_demo_mode
+
+        with main.connection() as db:
+            record = db.execute("SELECT status, error_message FROM source_thumbnail_cache WHERE id = ?", (cache_id,)).fetchone()
+        self.assertEqual(record["status"], "UNAVAILABLE")
+        self.assertEqual(record["error_message"], "Telegram 未返回可用静态缩略图")
+        self.assertTrue(any(call.args[1] == "source_thumbnail.unavailable" for call in log_event.call_args_list))
+        self.assertFalse(any(call.args[1] == "source_thumbnail.failed" for call in log_event.call_args_list))
+
+        main.cache_source_page("91000", "{}", None, [(91_001, "x.jpg", "PHOTO", "image/jpeg", 1, main.now())], None)
+        with main.connection() as db:
+            status = db.execute("SELECT status FROM source_thumbnail_cache WHERE id = ?", (cache_id,)).fetchone()[0]
+        self.assertEqual(status, "UNAVAILABLE")
+
+    def test_source_thumbnail_downloads_progressive_type_and_generates_jpeg(self) -> None:
+        progressive = telegram_types.PhotoSizeProgressive(type="x", w=1280, h=720, sizes=[1_000, 2_000])
+        message = SimpleNamespace(photo=SimpleNamespace(sizes=[progressive]))
+
+        class ThumbnailClient:
+            thumb: str | None = None
+
+            async def get_entity(self, chat_id: int) -> int:
+                return chat_id
+
+            async def get_messages(self, _: int, *, ids: int) -> object:
+                return message
+
+            async def download_media(self, _: object, *, file: str, thumb: str) -> str:
+                self.thumb = thumb
+                main.PillowImage.new("RGB", (1280, 720), (55, 116, 161)).save(file, format="JPEG")
+                return file
+
+        client = ThumbnailClient()
+        cache_id = self._source_thumbnail_record(91_002)
+        previous_demo_mode = main.DEMO_MODE
+        main.DEMO_MODE = False
+        try:
+            with patch.object(main, "get_download_client", new_callable=AsyncMock, return_value=client):
+                asyncio.run(main.source_thumbnail_job(cache_id))
+        finally:
+            main.DEMO_MODE = previous_demo_mode
+
+        with main.connection() as db:
+            record = db.execute("SELECT status, cache_path FROM source_thumbnail_cache WHERE id = ?", (cache_id,)).fetchone()
+        self.assertEqual(client.thumb, "x")
+        self.assertEqual(record["status"], "READY")
+        with main.PillowImage.open(record["cache_path"]) as thumbnail:
+            self.assertEqual(thumbnail.format, "JPEG")
 
     def test_legacy_source_thumbnail_is_invalidated_for_quality_upgrade(self) -> None:
         thumbnail = main.SOURCE_THUMBNAIL_ROOT / "legacy.jpg"

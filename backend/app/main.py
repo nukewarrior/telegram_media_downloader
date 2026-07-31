@@ -2320,12 +2320,15 @@ def update_source_thumbnail(cache_id: int, **values: Any) -> None:
 
 
 def static_telegram_thumbnail(message: Any) -> Any | None:
-    """Return Telegram's largest image thumbnail, never a video thumbnail."""
+    """Return Telegram's largest static image thumbnail, never a video thumbnail."""
     media = getattr(message, "photo", None) or getattr(message, "document", None)
     sizes = list(getattr(media, "sizes", None) or getattr(media, "thumbs", None) or [])
     candidates = [
         size for size in sizes
-        if "video" not in type(size).__name__.lower() and hasattr(size, "w") and hasattr(size, "h")
+        if "video" not in type(size).__name__.lower()
+        and hasattr(size, "w")
+        and hasattr(size, "h")
+        and isinstance(getattr(size, "type", None), str)
     ]
     return max(candidates, key=lambda size: int(getattr(size, "w", 0)) * int(getattr(size, "h", 0)), default=None)
 
@@ -2406,9 +2409,16 @@ async def source_thumbnail_job(cache_id: int) -> None:
             if not thumbnail_size:
                 set_telegram_thumbnail_status(cache_id, "UNAVAILABLE", "Telegram 未提供静态缩略图")
                 return
-            downloaded = await client.download_media(message, file=str(part), thumb=thumbnail_size)
-            if not downloaded or not part.is_file():
-                raise RuntimeError("Telegram 未提供可用缩略图")
+            # Telethon accepts a thumbnail type identifier for every static
+            # size, including PhotoSizeProgressive. Passing that object
+            # directly makes Telethon 1.44 return None for progressive sizes.
+            downloaded = await client.download_media(message, file=str(part), thumb=thumbnail_size.type)
+            if not downloaded:
+                set_telegram_thumbnail_status(cache_id, "UNAVAILABLE", "Telegram 未返回可用静态缩略图")
+                log_event(logging.INFO, "source_thumbnail.unavailable", "Telegram did not return a source media thumbnail", thumbnail_id=cache_id, chat_id=record["chat_id"], message_id=record["message_id"], thumbnail_type=thumbnail_size.type)
+                return
+            if not part.is_file():
+                raise RuntimeError("Telegram 缩略图下载完成后未生成输出文件")
             await asyncio.to_thread(create_image_thumbnail, part, target)
         if not set_telegram_thumbnail_result(cache_id, path=target, size_bytes=target.stat().st_size):
             target.unlink(missing_ok=True)
