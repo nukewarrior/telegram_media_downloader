@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import os
 import shutil
@@ -383,6 +384,64 @@ class DestinationTests(unittest.TestCase):
             self.assertEqual(first_item["destination"]["id"], first_id)
             self.assertEqual(second_item["destination"]["id"], second_id)
 
+    def test_record_archive_uses_precomputed_hash_without_rescanning_and_keeps_fingerprint_guard(self) -> None:
+        destination_id = self.create_local_destination("prehashed-local")
+        destination = Destination.from_row(main.destination_row(destination_id, include_disabled=True))
+        version_id = main.current_destination_version_id(destination_id)
+        with main.connection() as db:
+            task_id = db.execute(
+                """INSERT INTO tasks (chat_id, chat_title, archive_timezone, destination_id, destination_version_id, filters_json, status, created_at, updated_at)
+                   VALUES ('prehashed-chat', '预计算聊天', 'Asia/Shanghai', ?, ?, '{}', 'DOWNLOADING', ?, ?)""",
+                (destination_id, version_id, main.now(), main.now()),
+            ).lastrowid
+            media_id = db.execute(
+                """INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date, status)
+                   VALUES (?, 601, 'prehashed.bin', 'DOCUMENT', 'application/octet-stream', 11, ?, 'DOWNLOADING')""",
+                (task_id, "2026-07-30T04:00:00+00:00"),
+            ).lastrowid
+            task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            media = db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone()
+
+        relative = Path("prehashed.bin")
+        path = destination.local_path(relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"precomputed")
+        expected_hash = main.file_sha256(path)
+        original_fingerprint = main.file_stat_fingerprint(path)
+        path.write_bytes(b"changed-data")
+
+        with patch.object(main, "file_sha256", side_effect=AssertionError("record_archive rescanned the file")) as hasher:
+            with self.assertRaisesRegex(StorageError, "索引前发生变化"):
+                main.record_archive(
+                    task,
+                    media,
+                    path,
+                    relative,
+                    destination=destination,
+                    destination_version_id=version_id,
+                    content_hash=expected_hash,
+                    content_fingerprint=original_fingerprint,
+                )
+            hasher.assert_not_called()
+
+        path.write_bytes(b"precomputed")
+        with patch.object(main, "file_sha256", side_effect=AssertionError("record_archive rescanned the file")) as hasher:
+            main.record_archive(
+                task,
+                media,
+                path,
+                relative,
+                destination=destination,
+                destination_version_id=version_id,
+                content_hash=expected_hash,
+                content_fingerprint=main.file_stat_fingerprint(path),
+            )
+            hasher.assert_not_called()
+
+        with main.connection() as db:
+            blob = db.execute("SELECT content_hash FROM media_blobs WHERE content_hash = ?", (expected_hash,)).fetchone()
+        self.assertIsNotNone(blob)
+
     def test_same_path_with_different_content_keeps_two_archive_items_and_matching_previews(self) -> None:
         destination_id = self.create_local_destination("collision-local")
         destination = Destination.from_row(main.destination_row(destination_id, include_disabled=True))
@@ -525,7 +584,17 @@ class DestinationTests(unittest.TestCase):
         staged = main.archive_stage_path(task, media, destination, relative)
         staged.parent.mkdir(parents=True, exist_ok=True)
         staged.write_bytes(b"data")
+        expected_hash = main.file_sha256(staged)
+        to_thread_calls: list[object] = []
+        original_to_thread = asyncio.to_thread
+
+        async def capture_to_thread(func: object, *args: object, **kwargs: object) -> object:
+            to_thread_calls.append(func)
+            return await original_to_thread(func, *args, **kwargs)  # type: ignore[arg-type]
+
         with (
+            patch.object(main.asyncio, "to_thread", new=capture_to_thread),
+            patch.object(main, "file_sha256", wraps=main.file_sha256) as hasher,
             patch.object(Destination, "upload_file", new_callable=AsyncMock) as upload,
             patch.object(main, "get_download_client", new_callable=AsyncMock) as telegram_client,
         ):
@@ -533,12 +602,115 @@ class DestinationTests(unittest.TestCase):
 
         upload.assert_awaited_once()
         telegram_client.assert_not_awaited()
+        hasher.assert_called_once_with(staged)
+        self.assertIn(hasher, to_thread_calls)
         with main.connection() as db:
             status = db.execute("SELECT status FROM task_media WHERE id = ?", (media_id,)).fetchone()[0]
             location = db.execute("SELECT destination_id, canonical_path FROM archive_locations WHERE destination_id = ?", (destination_id,)).fetchone()
+            blob = db.execute("SELECT content_hash FROM media_blobs WHERE content_hash = ?", (expected_hash,)).fetchone()
         self.assertEqual(status, "COMPLETED")
         self.assertEqual(location["destination_id"], destination_id)
+        self.assertIsNotNone(blob)
         self.assertFalse(staged.exists())
+
+    def test_preview_adoption_is_hashed_once_and_archived(self) -> None:
+        destination_id = self.create_local_destination("preview-adopt-local")
+        destination = Destination.from_row(main.destination_row(destination_id, include_disabled=True))
+        version_id = main.current_destination_version_id(destination_id)
+        preview_path = main.PREVIEW_ROOT / "adopted.bin"
+        preview_path.write_bytes(b"preview-data")
+        with main.connection() as db:
+            preview_id = db.execute(
+                """INSERT INTO preview_cache (chat_id, message_id, filename, media_type, mime_type, size_bytes, message_date, cache_path, status, expires_at, updated_at)
+                   VALUES ('preview-adopt-chat', 602, 'adopted.bin', 'DOCUMENT', 'application/octet-stream', 12, ?, ?, 'READY', '2100-01-01T00:00:00+00:00', ?)""",
+                (main.now(), str(preview_path), main.now()),
+            ).lastrowid
+            task_id = db.execute(
+                """INSERT INTO tasks (chat_id, chat_title, archive_timezone, destination_id, destination_version_id, filters_json, status, total_count, total_bytes, created_at, updated_at)
+                   VALUES ('preview-adopt-chat', '预览接管聊天', 'Asia/Shanghai', ?, ?, '{}', 'DOWNLOADING', 1, 12, ?, ?)""",
+                (destination_id, version_id, main.now(), main.now()),
+            ).lastrowid
+            media_id = db.execute(
+                """INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date, status, preview_cache_id)
+                   VALUES (?, 602, 'adopted.bin', 'DOCUMENT', 'application/octet-stream', 12, ?, 'DOWNLOADING', ?)""",
+                (task_id, main.now(), preview_id),
+            ).lastrowid
+            task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            media = db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone()
+
+        relative = main.archive_relative_path(task, media)
+        staged = main.archive_stage_path(task, media, destination, relative)
+        expected_hash = main.file_sha256(preview_path)
+        with (
+            patch.object(main, "file_sha256", wraps=main.file_sha256) as hasher,
+            patch.object(main, "get_download_client", new_callable=AsyncMock) as telegram_client,
+        ):
+            asyncio.run(main.download_media_job(task_id, media_id))
+
+        hasher.assert_called_once_with(staged)
+        telegram_client.assert_not_awaited()
+        final_path = destination.local_path(relative)
+        self.assertEqual(final_path.read_bytes(), b"preview-data")
+        self.assertFalse(preview_path.exists())
+        self.assertFalse(staged.exists())
+        with main.connection() as db:
+            status = db.execute("SELECT status, preview_cache_id FROM task_media WHERE id = ?", (media_id,)).fetchone()
+            preview = db.execute("SELECT status FROM preview_cache WHERE id = ?", (preview_id,)).fetchone()
+            blob = db.execute("SELECT content_hash FROM media_blobs WHERE content_hash = ?", (expected_hash,)).fetchone()
+        self.assertEqual(status["status"], "COMPLETED")
+        self.assertIsNone(status["preview_cache_id"])
+        self.assertEqual(preview["status"], "CONSUMED")
+        self.assertIsNotNone(blob)
+
+    def test_fresh_telegram_download_hashes_staging_once_before_archive(self) -> None:
+        destination_id = self.create_local_destination("fresh-download-local")
+        destination = Destination.from_row(main.destination_row(destination_id, include_disabled=True))
+        version_id = main.current_destination_version_id(destination_id)
+        with main.connection() as db:
+            task_id = db.execute(
+                """INSERT INTO tasks (chat_id, chat_title, archive_timezone, destination_id, destination_version_id, filters_json, status, total_count, total_bytes, created_at, updated_at)
+                   VALUES ('-100603', '新下载聊天', 'Asia/Shanghai', ?, ?, '{}', 'DOWNLOADING', 1, 10, ?, ?)""",
+                (destination_id, version_id, main.now(), main.now()),
+            ).lastrowid
+            media_id = db.execute(
+                """INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date, status)
+                   VALUES (?, 603, 'fresh.bin', 'DOCUMENT', 'application/octet-stream', 10, ?, 'DOWNLOADING')""",
+                (task_id, "2026-07-30T04:00:00+00:00"),
+            ).lastrowid
+            task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            media = db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone()
+
+        class FakeTelegramClient:
+            async def get_entity(self, chat_id: int) -> int:
+                return chat_id
+
+            async def get_messages(self, entity: int, ids: int) -> object:
+                return object()
+
+            async def download_media(self, message: object, file: str, progress_callback: object = None) -> str:
+                Path(file).write_bytes(b"fresh-data")
+                if progress_callback:
+                    progress_callback(10, 10)  # type: ignore[operator]
+                return file
+
+        expected_hash = hashlib.sha256(b"fresh-data").hexdigest()
+        fake_client = FakeTelegramClient()
+        with (
+            patch.object(main, "get_download_client", new_callable=AsyncMock, return_value=fake_client) as telegram_client,
+            patch.object(main, "file_sha256", wraps=main.file_sha256) as hasher,
+        ):
+            asyncio.run(main.download_media_job(task_id, media_id))
+
+        relative = main.archive_relative_path(task, media)
+        final_path = destination.local_path(relative)
+        self.assertEqual(final_path.read_bytes(), b"fresh-data")
+        hasher.assert_called_once_with(main.archive_stage_path(task, media, destination, relative))
+        telegram_client.assert_awaited_once()
+        with main.connection() as db:
+            status = db.execute("SELECT status FROM task_media WHERE id = ?", (media_id,)).fetchone()[0]
+            blob = db.execute("SELECT content_hash FROM media_blobs WHERE content_hash = ?", (expected_hash,)).fetchone()
+        self.assertEqual(status, "COMPLETED")
+        self.assertIsNotNone(blob)
 
     def test_webdav_upload_failure_keeps_staging_file_for_retry(self) -> None:
         with main.connection() as db:

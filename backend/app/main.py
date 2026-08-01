@@ -2198,6 +2198,25 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+FileFingerprint = tuple[int, int, int, int]
+
+
+def file_stat_fingerprint(path: Path) -> FileFingerprint:
+    """Capture cheap identity metadata for a file that was already hashed."""
+    info = path.stat()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def assert_file_fingerprint(path: Path, expected: FileFingerprint, message: str) -> None:
+    """Reject a file that was replaced or modified after its content was hashed."""
+    try:
+        actual = file_stat_fingerprint(path)
+    except OSError as error:
+        raise StorageError(message) from error
+    if actual != expected:
+        raise StorageError(message)
+
+
 def archive_path_text(path: str | Path) -> str:
     return str(path).replace(os.sep, "/")
 
@@ -3245,7 +3264,16 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             result = await client.download_media(message, file=str(part), progress_callback=progress)
             if not result:
                 raise RuntimeError("Telegram 未返回下载文件")
-        content_hash = file_sha256(part)
+        if not part.is_file():
+            raise RuntimeError("下载完成后未生成有效暂存文件")
+        staging_fingerprint = file_stat_fingerprint(part)
+        content_hash = await asyncio.to_thread(file_sha256, part)
+        assert_file_fingerprint(
+            part,
+            staging_fingerprint,
+            "归档文件在哈希期间发生变化，已拒绝写入归档索引",
+        )
+        content_fingerprint = staging_fingerprint
         prepared_thumbnail: Path | None = None
         thumbnail_error: str | None = None
         thumbnail_attempted = media["media_type"] in ARCHIVE_THUMBNAIL_MEDIA_TYPES
@@ -3257,6 +3285,11 @@ async def download_media_job(task_id: int, media_id: int) -> None:
                     task_id=task_id,
                     media_id=media_id,
                 )
+            assert_file_fingerprint(
+                part,
+                content_fingerprint,
+                "归档文件在交付前发生变化，已拒绝上传",
+            )
             async with archive_delivery_guard(destination.id, base_relative_path):
                 relative_path = resolve_archive_relative_path(destination, base_relative_path, content_hash)
                 final_path = destination.local_path(relative_path) if destination.is_local else None
@@ -3272,6 +3305,7 @@ async def download_media_job(task_id: int, media_id: int) -> None:
                     destination=destination,
                     destination_version_id=destination_version_id,
                     content_hash=content_hash,
+                    content_fingerprint=content_fingerprint,
                     prepared_thumbnail=prepared_thumbnail,
                     thumbnail_error=thumbnail_error,
                     thumbnail_attempted=thumbnail_attempted,
@@ -3415,6 +3449,7 @@ def record_archive(
     destination: Destination | None = None,
     destination_version_id: int | None = None,
     content_hash: str | None = None,
+    content_fingerprint: FileFingerprint | None = None,
     prepared_thumbnail: Path | None = None,
     thumbnail_error: str | None = None,
     thumbnail_attempted: bool = False,
@@ -3432,10 +3467,28 @@ def record_archive(
             relative_path = archive_relative_path(task, media)
     location_path = archive_path_text(relative_path)
     legacy_blob_path = str(path) if destination.is_local else location_path
-    actual_digest = file_sha256(path)
-    if content_hash and content_hash != actual_digest:
-        raise StorageError("归档文件在索引前发生变化，已拒绝写入归档索引")
-    digest = actual_digest
+    if content_hash:
+        # The normal download path hashes its staging snapshot once, then
+        # passes that digest here.  The fingerprint keeps the old
+        # hash-then-index stability guard without scanning the whole file a
+        # second time.  Direct callers that do not provide a hash retain the
+        # legacy full-scan fallback below.
+        if content_fingerprint is not None:
+            assert_file_fingerprint(
+                path,
+                content_fingerprint,
+                "归档文件在索引前发生变化，已拒绝写入归档索引",
+            )
+        else:
+            try:
+                if not path.is_file():
+                    raise OSError("archive path is not a regular file")
+                path.stat()
+            except OSError as error:
+                raise StorageError("归档文件不存在，已拒绝写入归档索引") from error
+        digest = content_hash
+    else:
+        digest = file_sha256(path)
     media_type = str(media["media_type"])
     thumbnail_capable = media_type in ARCHIVE_THUMBNAIL_MEDIA_TYPES
     thumbnail_status = "UNAVAILABLE" if not thumbnail_capable else "PENDING"
