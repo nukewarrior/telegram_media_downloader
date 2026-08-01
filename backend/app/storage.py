@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,16 +103,29 @@ class Destination:
             raise StorageError("归档路径超出目的地目录") from error
         return candidate
 
-    def _base_url(self) -> str:
+    def _service_url(self) -> str:
         if self.is_local or not self.webdav_url:
             raise StorageError("该目的地不是 WebDAV")
         parsed = urlsplit(self.webdav_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
             raise StorageError("WebDAV URL 无效，必须包含 http 或 https 地址")
-        base = self.webdav_url.rstrip("/")
+        return self.webdav_url.rstrip("/")
+
+    def _remote_root_parts(self) -> list[str]:
         root = self.remote_root.strip("/")
-        if root:
-            base = f"{base}/{quote(root, safe='/')}"
+        if not root:
+            return []
+        try:
+            return _relative_text(root).split("/")
+        except StorageError as error:
+            raise StorageError("WebDAV 根路径无效") from error
+
+    def _base_url(self) -> str:
+        base = self._service_url()
+        root_parts = self._remote_root_parts()
+        if root_parts:
+            encoded_root = "/".join(quote(part, safe="-._~") for part in root_parts)
+            base = f"{base}/{encoded_root}"
         return base
 
     def remote_url(self, relative: str | Path) -> str:
@@ -140,24 +154,67 @@ class Destination:
             except Exception:
                 detail = ""
             suffix = f"：{detail}" if detail else ""
-            raise StorageError(f"WebDAV {operation} 失败（HTTP {response.status_code}）{suffix}")
+            if response.status_code in {401, 403}:
+                raise StorageError(f"WebDAV {operation}权限不足（HTTP {response.status_code}）{suffix}")
+            raise StorageError(f"WebDAV {operation}失败（HTTP {response.status_code}）{suffix}")
+
+    @staticmethod
+    async def _propfind_collection(client: httpx.AsyncClient, url: str) -> httpx.Response:
+        return await client.request("PROPFIND", url, headers={"Depth": "0"})
+
+    async def _require_collection(self, client: httpx.AsyncClient, url: str, operation: str) -> None:
+        response = await self._propfind_collection(client, url)
+        if 200 <= response.status_code < 300:
+            return
+        if response.status_code in {401, 403}:
+            self._check_response(response, operation)
+        if response.status_code == 404:
+            raise StorageError(f"WebDAV {operation}不存在（HTTP 404）")
+        self._check_response(response, operation)
+
+    async def _ensure_collection(self, client: httpx.AsyncClient, url: str, operation: str) -> None:
+        response = await self._propfind_collection(client, url)
+        if 200 <= response.status_code < 300:
+            return
+        if response.status_code in {401, 403}:
+            self._check_response(response, operation)
+        if response.status_code != 404:
+            self._check_response(response, operation)
+
+        response = await client.request("MKCOL", url)
+        if 200 <= response.status_code < 300:
+            return
+        if response.status_code == 405:
+            confirmation = await self._propfind_collection(client, url)
+            if 200 <= confirmation.status_code < 300:
+                return
+            if confirmation.status_code in {401, 403}:
+                self._check_response(confirmation, operation)
+            raise StorageError(f"WebDAV {operation}创建后无法确认目录（HTTP {confirmation.status_code}）")
+        if response.status_code in {401, 403}:
+            self._check_response(response, f"创建{operation}")
+        self._check_response(response, f"创建{operation}")
 
     async def _ensure_remote_directories(self, client: httpx.AsyncClient, relative: str | Path) -> None:
         relative_text = _relative_text(relative)
-        base_url = self.webdav_url.rstrip("/") if self.webdav_url else self._base_url()
-        base_response = await client.request("MKCOL", base_url)
-        self._check_response(base_response, "创建远端根目录", accepted={200, 201, 204, 405})
-        remote_root_parts = [part for part in self.remote_root.strip("/").split("/") if part]
-        current_url = base_url
-        for part in remote_root_parts:
+        service_url = self._service_url()
+        await self._require_collection(client, service_url, "WebDAV 服务入口")
+        current_url = service_url
+        for part in self._remote_root_parts():
             current_url = f"{current_url}/{quote(part, safe='-._~')}"
-            response = await client.request("MKCOL", current_url)
-            self._check_response(response, "创建远端根目录", accepted={200, 201, 204, 405})
+            await self._ensure_collection(client, current_url, "远端根目录")
         parents = relative_text.split("/")[:-1]
         for index in range(1, len(parents) + 1):
             directory = "/".join(parents[:index])
-            response = await client.request("MKCOL", self.remote_url(directory))
-            self._check_response(response, "创建目录", accepted={200, 201, 204, 405})
+            await self._ensure_collection(client, self.remote_url(directory), "归档目录")
+
+    async def _best_effort_delete(self, client: httpx.AsyncClient, relative: str) -> None:
+        try:
+            response = await client.request("DELETE", self.remote_url(relative))
+            if response.status_code not in set(range(200, 300)) | {404}:
+                return
+        except httpx.HTTPError:
+            return
 
     async def test_connection(self) -> None:
         if self.is_local:
@@ -173,10 +230,24 @@ class Destination:
             return
         try:
             async with await self._client() as client:
-                response = await client.request("PROPFIND", self._base_url(), headers={"Depth": "0"})
-                self._check_response(response, "连接测试", accepted=set(range(200, 300)) | {401, 403, 404, 405, 501})
-                if response.status_code >= 400:
-                    raise StorageError(f"WebDAV 连接测试失败（HTTP {response.status_code}）")
+                probe_relative = f".telegram-media-archiver-probe-{secrets.token_hex(8)}"
+                temporary_relative = f"{probe_relative}.part"
+                await self._ensure_remote_directories(client, probe_relative)
+                try:
+                    response = await client.put(self.remote_url(temporary_relative), content=b"telegram-media-archiver-probe")
+                    self._check_response(response, "上传连接测试文件")
+                    response = await client.request(
+                        "MOVE",
+                        self.remote_url(temporary_relative),
+                        headers={"Destination": self.remote_url(probe_relative), "Overwrite": "T"},
+                    )
+                    self._check_response(response, "提交连接测试文件")
+                    response = await client.request("DELETE", self.remote_url(probe_relative))
+                    self._check_response(response, "清理连接测试文件")
+                except Exception:
+                    await self._best_effort_delete(client, probe_relative)
+                    await self._best_effort_delete(client, temporary_relative)
+                    raise
         except httpx.HTTPError as error:
             raise StorageError(f"无法连接 WebDAV：{error}") from error
 

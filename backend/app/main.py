@@ -1624,7 +1624,10 @@ def enable_destination(destination_id: int) -> dict[str, Any]:
 async def test_destination(payload: DestinationSettings) -> dict[str, Any]:
     values = validate_destination_payload(payload)
     candidate = Destination(id=0, **values)
-    await candidate.test_connection()
+    try:
+        await candidate.test_connection()
+    except StorageError as error:
+        raise HTTPException(502, str(error)) from error
     return {"ok": True, "message": "目的地连接正常"}
 
 
@@ -1633,7 +1636,10 @@ async def test_saved_destination(destination_id: int) -> dict[str, Any]:
     record = destination_row(destination_id, include_disabled=True)
     if not record:
         raise HTTPException(404, "归档目的地不存在")
-    await Destination.from_row(record).test_connection()
+    try:
+        await Destination.from_row(record).test_connection()
+    except StorageError as error:
+        raise HTTPException(502, str(error)) from error
     return {"ok": True, "message": "目的地连接正常"}
 
 

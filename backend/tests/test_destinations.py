@@ -18,30 +18,60 @@ os.environ["DOWNLOAD_ROOT"] = str(TEST_DATA / "downloads")
 from fastapi.testclient import TestClient
 
 from app import main
-from app.storage import Destination
+from app.storage import Destination, StorageError
 
 
 class MockWebDAV:
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
         self.requests: list[tuple[str, str]] = []
+        self.collections: set[str] = {"/dav", "/dav/archive", "/dav/archive/root"}
+        self.propfind_overrides: dict[str, int] = {}
+        self.propfind_sequences: dict[str, list[int]] = {}
+        self.mkcol_overrides: dict[str, int] = {"/dav": 403}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         path = unquote(urlsplit(str(request.url)).path)
         self.requests.append((request.method, path))
         if request.method == "PROPFIND":
-            return httpx.Response(207, request=request)
+            sequence = self.propfind_sequences.get(path)
+            if sequence:
+                status = sequence.pop(0)
+            else:
+                status = self.propfind_overrides.get(path, 207 if path in self.collections else 404)
+            return httpx.Response(status, request=request)
         if request.method == "MKCOL":
+            if path in self.mkcol_overrides:
+                return httpx.Response(self.mkcol_overrides[path], request=request)
+            if path in self.collections:
+                return httpx.Response(405, request=request)
+            parent = path.rsplit("/", 1)[0]
+            if parent not in self.collections:
+                return httpx.Response(409, request=request)
+            self.collections.add(path)
             return httpx.Response(201, request=request)
         if request.method == "PUT":
+            if path.rsplit("/", 1)[0] not in self.collections:
+                return httpx.Response(409, request=request)
             self.files[path] = await request.aread()
             return httpx.Response(201, request=request)
         if request.method == "MOVE":
             source = path
             target = unquote(urlsplit(request.headers["Destination"]).path)
+            if source not in self.files:
+                return httpx.Response(404, request=request)
+            if target.rsplit("/", 1)[0] not in self.collections:
+                return httpx.Response(409, request=request)
             self.files[target] = self.files.pop(source)
             return httpx.Response(201, request=request)
+        if request.method == "DELETE":
+            if path not in self.files:
+                return httpx.Response(404, request=request)
+            self.files.pop(path)
+            return httpx.Response(204, request=request)
         if request.method == "GET":
+            if path not in self.files:
+                return httpx.Response(404, request=request)
             content = self.files[path]
             range_header = request.headers.get("Range")
             if range_header:
@@ -240,8 +270,77 @@ class DestinationTests(unittest.TestCase):
         self.assertEqual(server.files["/dav/archive/root/nested/file.bin"], b"0123456789")
         self.assertEqual(target.read_bytes(), b"0123456789")
         self.assertEqual(ranged, b"2345")
+        self.assertNotIn(("MKCOL", "/dav"), server.requests)
+        self.assertEqual(server.requests.count(("MKCOL", "/dav/archive/root/nested")), 1)
+        self.assertTrue(any(method == "DELETE" for method, _ in server.requests))
         self.assertIn(("PUT", "/dav/archive/root/nested/file.bin.part"), server.requests)
         self.assertIn(("MOVE", "/dav/archive/root/nested/file.bin.part"), server.requests)
+
+    def test_webdav_mkcol_405_is_confirmed_with_propfind(self) -> None:
+        server = MockWebDAV()
+        directory = "/dav/archive/root/mkcol-405"
+        server.collections.add(directory)
+        server.propfind_sequences[directory] = [404, 207]
+        server.mkcol_overrides[directory] = 405
+
+        async def client_factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        destination = Destination(id=30, name="dav", kind="WEBDAV", webdav_url="https://dav.example.test/dav", remote_root="archive/root")
+        source = TEST_DATA / "mkcol-405.bin"
+        source.write_bytes(b"405-confirmed")
+        with patch.object(Destination, "_client", client_factory):
+            asyncio.run(destination.upload_file(source, Path("mkcol-405/file.bin")))
+        self.assertEqual(server.files["/dav/archive/root/mkcol-405/file.bin"], b"405-confirmed")
+        self.assertEqual(server.requests.count(("MKCOL", directory)), 1)
+        self.assertEqual(server.requests.count(("PROPFIND", directory)), 2)
+
+    def test_webdav_permission_and_missing_service_errors_are_actionable(self) -> None:
+        source = TEST_DATA / "permission-probe.bin"
+        source.write_bytes(b"data")
+
+        for status in (401, 403):
+            server = MockWebDAV()
+            server.propfind_overrides["/dav/archive/root"] = status
+
+            async def client_factory(_: Destination, server: MockWebDAV = server) -> httpx.AsyncClient:
+                return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+            destination = Destination(id=10 + status, name="dav", kind="WEBDAV", webdav_url="https://dav.example.test/dav", remote_root="archive/root")
+            with patch.object(Destination, "_client", client_factory):
+                with self.assertRaisesRegex(StorageError, "权限不足"):
+                    asyncio.run(destination.upload_file(source, Path("nested/file.bin")))
+
+        server = MockWebDAV()
+        server.collections.remove("/dav")
+
+        async def client_factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        destination = Destination(id=20, name="dav", kind="WEBDAV", webdav_url="https://dav.example.test/dav", remote_root="archive/root")
+        with patch.object(Destination, "_client", client_factory):
+            with self.assertRaisesRegex(StorageError, "服务入口不存在"):
+                asyncio.run(destination.test_connection())
+
+    def test_destination_connection_api_exposes_remote_write_permission_error(self) -> None:
+        server = MockWebDAV()
+        server.propfind_overrides["/dav/archive/root"] = 403
+
+        async def client_factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        payload = {
+            "name": "permission-dav",
+            "kind": "WEBDAV",
+            "webdav_url": "https://dav.example.test/dav",
+            "webdav_username": "user",
+            "webdav_password": "password",
+            "remote_root": "archive/root",
+        }
+        with patch.object(Destination, "_client", client_factory), TestClient(main.app) as client:
+            response = client.post("/api/destinations/test", json=payload)
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("权限不足", response.json()["detail"])
 
 
 if __name__ == "__main__":
