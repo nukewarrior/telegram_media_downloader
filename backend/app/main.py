@@ -1692,12 +1692,16 @@ async def test_destination(payload: DestinationSettings) -> dict[str, Any]:
 
 
 @app.post("/api/destinations/{destination_id}/test")
-async def test_saved_destination(destination_id: int) -> dict[str, Any]:
+async def test_saved_destination(destination_id: int, payload: DestinationUpdateSettings | None = None) -> dict[str, Any]:
     record = destination_row(destination_id, include_disabled=True)
     if not record:
         raise HTTPException(404, "归档目的地不存在")
+    candidate = Destination.from_row(record)
+    if payload is not None:
+        values = validate_destination_payload(payload, existing=record)
+        candidate = Destination(id=destination_id, **values)
     try:
-        await Destination.from_row(record).test_connection()
+        await candidate.test_connection()
     except StorageError as error:
         raise HTTPException(502, str(error)) from error
     return {"ok": True, "message": "目的地连接正常"}

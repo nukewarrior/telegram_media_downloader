@@ -124,9 +124,17 @@ input, select { width: 100%; border: 1px solid #cedbda; outline: none; border-ra
 .destination-row b, .destination-row small { display: block; }
 .destination-row small { margin-top: 4px; color: #7d8d90; font-size: 12px; overflow-wrap: anywhere; }
 .destination-status { color: #258a66; font-size: 12px; white-space: nowrap; }
+.destination-status.disabled { color: #9a7127; }
+.destination-row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.destination-test-result { grid-column: 1 / -1; margin: 0; font-size: 12px; line-height: 1.5; }
+.destination-test-result.success { color: #24985d; }
+.destination-test-result.error { color: #bd5149; }
 .destination-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0 0 49px; padding-top: 16px; border-top: 1px solid #e9efee; }
+.destination-form-title { grid-column: 1 / -1; margin: 0; color: #365159; font-size: 13px; font-weight: 700; }
 .destination-form label { display: grid; gap: 7px; color: #52646a; font-size: 13px; font-weight: 600; }
 .destination-form input, .destination-form select { min-width: 0; }
+.destination-field-hint, .destination-test-hint { color: #7d8d90; font-size: 11px; line-height: 1.5; }
+.destination-test-hint { grid-column: 1 / -1; margin: -5px 0 0; }
 .destination-actions { display: flex; align-items: end; justify-content: flex-end; gap: 8px; grid-column: 1 / -1; }
 .destination-form + .form-error { margin: 14px 0 0 49px; }
 .destination-choice { display: grid; gap: 7px; max-width: 420px; margin-top: 22px; color: #52646a; font-size: 13px; font-weight: 600; }
@@ -135,7 +143,8 @@ input, select { width: 100%; border: 1px solid #cedbda; outline: none; border-ra
   .destination-list, .destination-form { margin-left: 0; }
   .destination-form { grid-template-columns: 1fr; }
   .destination-row { grid-template-columns: minmax(0, 1fr) auto; }
-  .destination-row button { grid-column: 2; grid-row: 1; }
-  .destination-actions { justify-content: stretch; }
+  .destination-row-actions { grid-column: 1 / -1; justify-content: stretch; }
+  .destination-row-actions button { flex: 1; }
+  .destination-actions { justify-content: stretch; flex-wrap: wrap; }
   .destination-actions button { flex: 1; }
 }

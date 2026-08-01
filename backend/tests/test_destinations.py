@@ -105,6 +105,15 @@ class DestinationTests(unittest.TestCase):
             )
             return int(cursor.lastrowid)
 
+    def create_webdav_destination(self, name: str, *, enabled: bool = True, password: str = "stored-password") -> int:
+        with main.connection() as db:
+            cursor = db.execute(
+                """INSERT INTO destinations (name, kind, webdav_url, webdav_username, webdav_password, remote_root, enabled, is_system, created_at, updated_at)
+                   VALUES (?, 'WEBDAV', 'https://dav.example.test/dav', 'user', ?, 'archive/root', ?, 0, ?, ?)""",
+                (name, password, int(enabled), main.now(), main.now()),
+            )
+            return int(cursor.lastrowid)
+
     def add_task_and_media(self, destination_id: int, task_id_hint: int) -> tuple[object, object]:
         with main.connection() as db:
             task_id = db.execute(
@@ -147,6 +156,100 @@ class DestinationTests(unittest.TestCase):
             self.assertFalse(listed["enabled"])
             enabled = client.post(f"/api/destinations/{destination['id']}/enable")
             self.assertTrue(enabled.json()["enabled"])
+
+    def test_webdav_destination_update_keeps_id_password_and_disabled_state(self) -> None:
+        destination_id = self.create_webdav_destination("editable-dav", enabled=False)
+        with main.connection() as db:
+            task_id = db.execute(
+                """INSERT INTO tasks (chat_id, chat_title, archive_timezone, destination_id, filters_json, status, created_at, updated_at)
+                   VALUES ('editable-chat', '可编辑聊天', 'Asia/Shanghai', ?, '{}', 'PAUSED', ?, ?)""",
+                (destination_id, main.now(), main.now()),
+            ).lastrowid
+            task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+        with TestClient(main.app) as client:
+            response = client.put(
+                f"/api/destinations/{destination_id}",
+                json={
+                    "name": "updated-dav",
+                    "kind": "WEBDAV",
+                    "webdav_url": "https://dav.example.test/updated-dav",
+                    "webdav_username": "updated-user",
+                    "remote_root": "archive/updated",
+                    "enabled": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        updated = response.json()
+        self.assertEqual(updated["id"], destination_id)
+        self.assertEqual(updated["name"], "updated-dav")
+        self.assertEqual(updated["webdav_url"], "https://dav.example.test/updated-dav")
+        self.assertFalse(updated["enabled"])
+        self.assertTrue(updated["webdav_password_configured"])
+        self.assertNotIn("webdav_password", updated)
+        self.assertEqual(main.destination_for_task(task).webdav_url, "https://dav.example.test/updated-dav")
+        with main.connection() as db:
+            stored = db.execute("SELECT webdav_password, enabled FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+        self.assertEqual(stored["webdav_password"], "stored-password")
+        self.assertFalse(stored["enabled"])
+
+    def test_saved_webdav_candidate_test_uses_stored_password_without_persisting(self) -> None:
+        destination_id = self.create_webdav_destination("candidate-dav")
+        server = MockWebDAV()
+        seen_passwords: list[str | None] = []
+
+        async def client_factory(destination: Destination) -> httpx.AsyncClient:
+            seen_passwords.append(destination.webdav_password)
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        payload = {
+            "name": "candidate-only",
+            "kind": "WEBDAV",
+            "webdav_url": "https://dav.example.test/dav",
+            "webdav_username": "user",
+            "remote_root": "archive/root",
+            "enabled": True,
+        }
+        with patch.object(Destination, "_client", client_factory), TestClient(main.app) as client:
+            current = client.post(f"/api/destinations/{destination_id}/test")
+            candidate = client.post(f"/api/destinations/{destination_id}/test", json=payload)
+
+        self.assertEqual(current.status_code, 200)
+        self.assertEqual(candidate.status_code, 200)
+        self.assertEqual(seen_passwords, ["stored-password", "stored-password"])
+        self.assertTrue(any(method == "PUT" for method, _ in server.requests))
+        with main.connection() as db:
+            stored = db.execute("SELECT name, webdav_password FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+        self.assertEqual(stored["name"], "candidate-dav")
+        self.assertEqual(stored["webdav_password"], "stored-password")
+
+    def test_saved_webdav_candidate_test_failure_does_not_persist_changes(self) -> None:
+        destination_id = self.create_webdav_destination("candidate-failure-dav")
+        server = MockWebDAV()
+        server.propfind_overrides["/dav/archive/root"] = 403
+
+        async def client_factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        with patch.object(Destination, "_client", client_factory), TestClient(main.app) as client:
+            response = client.post(
+                f"/api/destinations/{destination_id}/test",
+                json={
+                    "name": "failed-candidate",
+                    "kind": "WEBDAV",
+                    "webdav_url": "https://dav.example.test/dav",
+                    "webdav_username": "user",
+                    "remote_root": "archive/root",
+                    "enabled": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 502)
+        with main.connection() as db:
+            stored = db.execute("SELECT name, webdav_password FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+        self.assertEqual(stored["name"], "candidate-failure-dav")
+        self.assertEqual(stored["webdav_password"], "stored-password")
 
     def test_same_message_can_be_recorded_and_read_from_two_destinations(self) -> None:
         first_id = self.create_local_destination("destination-a")
