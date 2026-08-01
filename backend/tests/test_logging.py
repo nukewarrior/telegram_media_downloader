@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.responses import Response
 TEST_DATA = Path(tempfile.mkdtemp(prefix="logging-test-"))
@@ -139,6 +140,14 @@ class StructuredLoggingTests(unittest.TestCase):
         event = next(record for record in reversed(records) if record["message"] == "test uvicorn event")
         self.assertEqual(event["logger"], "uvicorn.error")
         self.assertEqual(event["event"], "server.log")
+
+    def test_cryptg_unavailable_does_not_block_startup(self) -> None:
+        with patch.object(main, "CRYPTG_AVAILABLE", False):
+            with TestClient(main.app):
+                pass
+
+        event = next(event for event in self.events() if event["event"] == "telegram.crypto_acceleration")
+        self.assertFalse(event["cryptg_available"])
 
 
 class DailyCompressedJsonlHandlerTests(unittest.TestCase):

@@ -33,6 +33,13 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError, RpcCallFailError, SessionPasswordNeededError, TimedOutError
 from app.storage import Destination, StorageError
 
+try:
+    import cryptg
+except (ImportError, OSError):
+    CRYPTG_AVAILABLE = False
+else:
+    CRYPTG_AVAILABLE = True
+
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "app.db"
@@ -1570,6 +1577,12 @@ async def lifespan(_: FastAPI):
     # dispatcher workers, rather than a previous loop.
     DOWNLOAD_WAKE = asyncio.Event()
     THUMBNAIL_WAKE = asyncio.Event()
+    log_event(
+        logging.INFO,
+        "telegram.crypto_acceleration",
+        "Telegram cryptg acceleration availability checked",
+        cryptg_available=CRYPTG_AVAILABLE,
+    )
     initialize_database()
     restore_download_runtime()
     log_event(logging.INFO, "service.started", "Telegram media archiver started", log_level=LOG_LEVEL, demo_mode=DEMO_MODE)
