@@ -18,7 +18,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, AsyncIterator, Literal
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from fastapi import FastAPI, HTTPException, Request
@@ -30,6 +31,7 @@ from PIL import ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError, RpcCallFailError, SessionPasswordNeededError, TimedOutError
+from app.storage import Destination, StorageError
 
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
@@ -38,6 +40,7 @@ DOWNLOAD_ROOT = os.getenv("DOWNLOAD_ROOT", str(DATA_DIR / "downloads"))
 THUMBNAIL_ROOT = DATA_DIR / "thumbnails"
 PREVIEW_ROOT = DATA_DIR / "previews"
 SOURCE_THUMBNAIL_ROOT = DATA_DIR / "source-thumbnails"
+STAGING_ROOT = DATA_DIR / "staging"
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 STATIC_DIR = Path(os.getenv("STATIC_DIR", "./static"))
 SESSION_DIR = DATA_DIR / "sessions"
@@ -332,6 +335,85 @@ def secure_session_file() -> None:
             raise RuntimeError("无法保护 Telegram 会话文件；请检查数据目录权限") from error
 
 
+def ensure_system_local_destination(db: sqlite3.Connection) -> int:
+    """Create the compatibility destination that owns the original download root."""
+    existing = db.execute("SELECT id FROM destinations WHERE is_system = 1 AND kind = 'LOCAL' ORDER BY id LIMIT 1").fetchone()
+    if existing:
+        return int(existing["id"])
+    timestamp = now()
+    cursor = db.execute(
+        """INSERT INTO destinations (name, kind, local_root, enabled, is_system, created_at, updated_at)
+           VALUES ('本地归档', 'LOCAL', ?, 1, 1, ?, ?)""",
+        (str(Path(DOWNLOAD_ROOT)), timestamp, timestamp),
+    )
+    return int(cursor.lastrowid)
+
+
+def backfill_archive_locations(db: sqlite3.Connection, local_destination_id: int) -> None:
+    """Give legacy blobs and archive rows a physical location without moving files."""
+    blobs = db.execute("SELECT id, canonical_path, created_at FROM media_blobs").fetchall()
+    for blob in blobs:
+        location = db.execute("SELECT id FROM archive_locations WHERE blob_id = ? AND destination_id = ?", (blob["id"], local_destination_id)).fetchone()
+        if not location:
+            try:
+                db.execute(
+                    """INSERT INTO archive_locations (blob_id, destination_id, canonical_path, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (blob["id"], local_destination_id, blob["canonical_path"], blob["created_at"] or now()),
+                )
+            except sqlite3.IntegrityError:
+                # A legacy database may already contain an identical physical path.
+                location = db.execute("SELECT id FROM archive_locations WHERE destination_id = ? AND canonical_path = ?", (local_destination_id, blob["canonical_path"])).fetchone()
+        location = db.execute("SELECT id FROM archive_locations WHERE blob_id = ? AND destination_id = ?", (blob["id"], local_destination_id)).fetchone()
+        if location:
+            db.execute("UPDATE archive_items SET location_id = ? WHERE blob_id = ? AND location_id IS NULL", (location["id"], blob["id"]))
+
+
+def destination_row(destination_id: int | None = None, *, include_disabled: bool = False) -> sqlite3.Row | None:
+    with connection() as db:
+        if destination_id is None:
+            record = db.execute("SELECT * FROM destinations WHERE is_system = 1 AND kind = 'LOCAL' ORDER BY id LIMIT 1").fetchone()
+        else:
+            record = db.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+    if record and not include_disabled and not record["enabled"]:
+        return None
+    return record
+
+
+def resolved_destination_id(destination_id: int | None, *, require_enabled: bool = True) -> int:
+    record = destination_row(destination_id, include_disabled=not require_enabled)
+    if not record:
+        raise HTTPException(409, "归档目的地不存在或已停用")
+    return int(record["id"])
+
+
+def destination_payload(record: sqlite3.Row, *, include_secret: bool = False) -> dict[str, Any]:
+    payload = {
+        "id": record["id"],
+        "name": record["name"],
+        "kind": record["kind"],
+        "local_root": record["local_root"],
+        "webdav_url": record["webdav_url"],
+        "webdav_username": record["webdav_username"],
+        "remote_root": record["remote_root"],
+        "enabled": bool(record["enabled"]),
+        "is_system": bool(record["is_system"]),
+    }
+    if include_secret:
+        payload["webdav_password"] = record["webdav_password"]
+    else:
+        payload["webdav_password_configured"] = bool(record["webdav_password"])
+    return payload
+
+
+def destination_for_task(task: Any) -> Destination:
+    destination_id = task["destination_id"] if "destination_id" in task.keys() else None
+    record = destination_row(int(destination_id) if destination_id is not None else None, include_disabled=True)
+    if not record:
+        raise RuntimeError("任务归档目的地不存在或已停用")
+    return Destination.from_row(record)
+
+
 def mask_phone(phone: str) -> str:
     digits = re.sub(r"\D", "", phone)
     if len(digits) <= 4:
@@ -474,6 +556,7 @@ def initialize_database() -> None:
     THUMBNAIL_ROOT.mkdir(parents=True, exist_ok=True)
     PREVIEW_ROOT.mkdir(parents=True, exist_ok=True)
     SOURCE_THUMBNAIL_ROOT.mkdir(parents=True, exist_ok=True)
+    STAGING_ROOT.mkdir(parents=True, exist_ok=True)
     ensure_session_storage()
     with connection() as db:
         db.executescript(
@@ -499,12 +582,29 @@ def initialize_database() -> None:
               phone TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS destinations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              kind TEXT NOT NULL CHECK (kind IN ('LOCAL', 'WEBDAV')),
+              local_root TEXT,
+              webdav_url TEXT,
+              webdav_username TEXT,
+              webdav_password TEXT,
+              remote_root TEXT NOT NULL DEFAULT '',
+              enabled INTEGER NOT NULL DEFAULT 1,
+              is_system INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              CHECK ((kind = 'LOCAL' AND local_root IS NOT NULL AND webdav_url IS NULL)
+                     OR (kind = 'WEBDAV' AND local_root IS NULL AND webdav_url IS NOT NULL))
+            );
             CREATE TABLE IF NOT EXISTS tasks (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               chat_id TEXT NOT NULL,
               chat_title TEXT NOT NULL,
               chat_handle TEXT,
               archive_timezone TEXT,
+              destination_id INTEGER REFERENCES destinations(id),
               filters_json TEXT NOT NULL,
               status TEXT NOT NULL,
               total_count INTEGER NOT NULL DEFAULT 0,
@@ -531,9 +631,19 @@ def initialize_database() -> None:
               media_type TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS archive_locations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              blob_id INTEGER NOT NULL REFERENCES media_blobs(id) ON DELETE CASCADE,
+              destination_id INTEGER NOT NULL REFERENCES destinations(id),
+              canonical_path TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(blob_id, destination_id),
+              UNIQUE(destination_id, canonical_path)
+            );
             CREATE TABLE IF NOT EXISTS archive_items (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               blob_id INTEGER REFERENCES media_blobs(id),
+              location_id INTEGER REFERENCES archive_locations(id),
               chat_id TEXT NOT NULL,
               chat_title TEXT NOT NULL,
               message_id INTEGER NOT NULL,
@@ -654,6 +764,8 @@ def initialize_database() -> None:
         task_columns = {column["name"] for column in db.execute("PRAGMA table_info(tasks)").fetchall()}
         if "archive_timezone" not in task_columns:
             db.execute("ALTER TABLE tasks ADD COLUMN archive_timezone TEXT")
+        if "destination_id" not in task_columns:
+            db.execute("ALTER TABLE tasks ADD COLUMN destination_id INTEGER REFERENCES destinations(id)")
         if "media_revision" not in task_columns:
             db.execute("ALTER TABLE tasks ADD COLUMN media_revision INTEGER NOT NULL DEFAULT 0")
         if "download_wait_until" not in task_columns:
@@ -662,6 +774,9 @@ def initialize_database() -> None:
         blob_columns = {column["name"] for column in db.execute("PRAGMA table_info(media_blobs)").fetchall()}
         if "thumbnail_error" not in blob_columns:
             db.execute("ALTER TABLE media_blobs ADD COLUMN thumbnail_error TEXT")
+        archive_item_columns = {column["name"] for column in db.execute("PRAGMA table_info(archive_items)").fetchall()}
+        if "location_id" not in archive_item_columns:
+            db.execute("ALTER TABLE archive_items ADD COLUMN location_id INTEGER REFERENCES archive_locations(id)")
         if "downloaded_bytes" not in task_media_columns:
             db.execute("ALTER TABLE task_media ADD COLUMN downloaded_bytes INTEGER NOT NULL DEFAULT 0")
         if "speed_bytes_per_second" not in task_media_columns:
@@ -684,6 +799,9 @@ def initialize_database() -> None:
         db.execute("UPDATE task_media SET status = 'PENDING', speed_bytes_per_second = 0 WHERE status = 'DOWNLOADING'")
         if DEMO_MODE and db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0:
             seed_demo_data(db)
+        local_destination_id = ensure_system_local_destination(db)
+        db.execute("UPDATE tasks SET destination_id = ? WHERE destination_id IS NULL", (local_destination_id,))
+        backfill_archive_locations(db, local_destination_id)
     reconcile_thumbnail_records()
     cleanup_preview_cache()
     reconcile_source_thumbnail_records()
@@ -770,6 +888,15 @@ def path_in_root(path_value: str | Path, root: str | Path) -> Path | None:
     return path
 
 
+def blob_location(blob_id: int) -> tuple[sqlite3.Row, Destination] | None:
+    with connection() as db:
+        location = db.execute("SELECT * FROM archive_locations WHERE blob_id = ? ORDER BY id LIMIT 1", (blob_id,)).fetchone()
+        if not location:
+            return None
+        destination_record = db.execute("SELECT * FROM destinations WHERE id = ?", (location["destination_id"],)).fetchone()
+    return (location, Destination.from_row(destination_record)) if destination_record else None
+
+
 def reconcile_thumbnail_records() -> None:
     """Repair old rows that predate real thumbnail generation or were interrupted mid-job."""
     with connection() as db:
@@ -782,8 +909,19 @@ def reconcile_thumbnail_records() -> None:
             thumbnail = path_in_root(blob["thumbnail_path"], THUMBNAIL_ROOT) if blob["thumbnail_path"] else None
             if blob["thumbnail_status"] == "READY" and thumbnail and thumbnail.is_file():
                 continue
+            location_data = blob_location(blob["id"])
             source = path_in_root(blob["canonical_path"], DOWNLOAD_ROOT)
-            if source and source.is_file():
+            remote_location = False
+            if location_data:
+                location, destination = location_data
+                if destination.is_local:
+                    try:
+                        source = destination.resolve_local_location(location["canonical_path"])
+                    except StorageError:
+                        source = None
+                else:
+                    remote_location = True
+            if (source and source.is_file()) or remote_location:
                 db.execute(
                     "UPDATE media_blobs SET thumbnail_path = NULL, thumbnail_status = 'PENDING', thumbnail_error = NULL WHERE id = ?",
                     (blob["id"],),
@@ -864,7 +1002,26 @@ async def create_video_thumbnail(source: Path, target: Path) -> None:
 
 
 async def generate_thumbnail(blob: sqlite3.Row) -> None:
-    source = path_in_root(blob["canonical_path"], DOWNLOAD_ROOT)
+    temporary_source: Path | None = None
+    location_data = blob_location(blob["id"])
+    if location_data:
+        location, destination = location_data
+        if destination.is_local and destination.local_root:
+            try:
+                source = destination.resolve_local_location(location["canonical_path"])
+            except StorageError:
+                source = None
+        else:
+            temporary_source = PREVIEW_ROOT / f"archive-thumbnail-source-{blob['id']}-{secrets.token_hex(6)}"
+            try:
+                await destination.download_to_file(location["canonical_path"], temporary_source)
+                source = temporary_source
+            except StorageError as error:
+                temporary_source.unlink(missing_ok=True)
+                set_thumbnail_result(blob["id"], "FAILED", error=str(error)[:500])
+                return
+    else:
+        source = path_in_root(blob["canonical_path"], DOWNLOAD_ROOT)
     if not source or not source.is_file():
         set_thumbnail_result(blob["id"], "UNAVAILABLE", error="原始归档文件不存在")
         return
@@ -879,6 +1036,9 @@ async def generate_thumbnail(blob: sqlite3.Row) -> None:
         log_event(logging.ERROR, "thumbnail.failed", "Thumbnail generation failed", exc_info=True, blob_id=blob["id"], media_type=blob["media_type"], source_path=str(source), error_type=type(error).__name__)
         set_thumbnail_result(blob["id"], "FAILED", error=str(error)[:500])
         return
+    finally:
+        if temporary_source:
+            temporary_source.unlink(missing_ok=True)
     set_thumbnail_result(blob["id"], "READY", path=target)
 
 
@@ -915,6 +1075,21 @@ class ArchiveTimezoneSettings(BaseModel):
     archive_timezone: str = Field(min_length=1, max_length=64)
 
 
+class DestinationSettings(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    kind: Literal["LOCAL", "WEBDAV"]
+    local_root: str | None = Field(default=None, max_length=500)
+    webdav_url: str | None = Field(default=None, max_length=1000)
+    webdav_username: str | None = Field(default=None, max_length=255)
+    webdav_password: str | None = Field(default=None, max_length=255)
+    remote_root: str = Field(default="", max_length=500)
+    enabled: bool = True
+
+
+class DestinationUpdateSettings(DestinationSettings):
+    webdav_password: str | None = Field(default=None, max_length=255)
+
+
 class SourceCacheSettings(BaseModel):
     max_bytes: int = Field(ge=256 * 1024 * 1024, le=20 * 1024 * 1024 * 1024)
 
@@ -946,6 +1121,7 @@ class ScanRequest(BaseModel):
     chat_title: str
     chat_handle: str | None = None
     filters: TaskFilters
+    destination_id: int | None = Field(default=None, gt=0)
 
 
 class ArchiveQuery(BaseModel):
@@ -959,6 +1135,7 @@ class SelectionTaskRequest(BaseModel):
     chat_title: str = Field(min_length=1, max_length=255)
     chat_handle: str | None = None
     message_ids: list[int] = Field(min_length=1, max_length=500)
+    destination_id: int | None = Field(default=None, gt=0)
 
 
 class PreviewRequest(BaseModel):
@@ -1309,6 +1486,7 @@ def save_setup(payload: ApiCredentials) -> dict[str, Any]:
 def get_settings() -> dict[str, Any]:
     with connection() as db:
         setting = db.execute("SELECT * FROM app_settings WHERE id = 1").fetchone()
+        destination_records = db.execute("SELECT * FROM destinations ORDER BY is_system DESC, name COLLATE NOCASE").fetchall()
     configured = bool(setting["api_id"] and setting["api_hash"] and setting["archive_timezone"])
     connected = configured and setting["connection_status"] == "connected" and bool(setting["account_connected"])
     return {
@@ -1323,7 +1501,140 @@ def get_settings() -> dict[str, Any]:
         "trustedLanWarning": "当前服务未启用应用层认证。任何可访问此 HTTP 地址的人都可操作已连接账号和查看归档；仅应部署在可信局域网，绝不可暴露公网。",
         "download": download_runtime_state(),
         "sourceCache": {"maxBytes": setting["source_cache_max_bytes"]},
+        "destinations": [destination_payload(record) for record in destination_records],
     }
+
+
+def validate_destination_payload(payload: DestinationSettings, *, existing: sqlite3.Row | None = None) -> dict[str, Any]:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(422, "目的地名称不能为空")
+    if payload.kind == "LOCAL":
+        if not payload.local_root or not payload.local_root.strip():
+            raise HTTPException(422, "本地目的地需要填写目录")
+        root = Path(payload.local_root.strip()).expanduser()
+        if not root.is_absolute():
+            root = DATA_DIR / root
+        root = root.resolve()
+        if root == Path("/"):
+            raise HTTPException(422, "不能使用根目录作为归档目的地")
+        return {"name": name, "kind": "LOCAL", "local_root": str(root), "webdav_url": None, "webdav_username": None, "webdav_password": None, "remote_root": "", "enabled": payload.enabled}
+    if not payload.webdav_url or not payload.webdav_url.strip():
+        raise HTTPException(422, "WebDAV 目的地需要填写 URL")
+    remote_root = "/".join(part for part in payload.remote_root.strip().split("/") if part)
+    if any(part in {".", ".."} for part in remote_root.split("/") if part):
+        raise HTTPException(422, "WebDAV 根路径无效")
+    candidate = Destination(
+        id=int(existing["id"]) if existing else 0,
+        name=name,
+        kind="WEBDAV",
+        webdav_url=payload.webdav_url.strip().rstrip("/"),
+        webdav_username=payload.webdav_username.strip() if payload.webdav_username else None,
+        webdav_password=payload.webdav_password if payload.webdav_password is not None else (existing["webdav_password"] if existing else None),
+        remote_root=remote_root,
+    )
+    try:
+        candidate._base_url()
+    except StorageError as error:
+        raise HTTPException(422, str(error)) from error
+    return {"name": name, "kind": "WEBDAV", "local_root": None, "webdav_url": candidate.webdav_url, "webdav_username": candidate.webdav_username, "webdav_password": candidate.webdav_password, "remote_root": remote_root, "enabled": payload.enabled}
+
+
+def ensure_local_destination_root(values: dict[str, Any]) -> None:
+    if values["kind"] != "LOCAL":
+        return
+    try:
+        Path(values["local_root"]).mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise HTTPException(422, f"本地目的地目录不可用：{error}") from error
+
+
+@app.get("/api/destinations")
+def list_destinations() -> list[dict[str, Any]]:
+    with connection() as db:
+        records = db.execute("SELECT * FROM destinations ORDER BY is_system DESC, name COLLATE NOCASE").fetchall()
+    return [destination_payload(record) for record in records]
+
+
+@app.post("/api/destinations")
+async def create_destination(payload: DestinationSettings) -> dict[str, Any]:
+    values = validate_destination_payload(payload)
+    ensure_local_destination_root(values)
+    timestamp = now()
+    with connection() as db:
+        cursor = db.execute(
+            """INSERT INTO destinations (name, kind, local_root, webdav_url, webdav_username, webdav_password, remote_root, enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (*values.values(), timestamp, timestamp),
+        )
+        record = db.execute("SELECT * FROM destinations WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    log_event(logging.INFO, "destination.created", "Archive destination created", destination_id=record["id"], destination_kind=record["kind"], destination_name=record["name"])
+    return destination_payload(record)
+
+
+@app.put("/api/destinations/{destination_id}")
+async def update_destination(destination_id: int, payload: DestinationUpdateSettings) -> dict[str, Any]:
+    with connection() as db:
+        existing = db.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "归档目的地不存在")
+        if existing["is_system"] and payload.kind != "LOCAL":
+            raise HTTPException(409, "系统本地目的地不能改为 WebDAV")
+        values = validate_destination_payload(payload, existing=existing)
+        if existing["is_system"]:
+            if values["local_root"] != existing["local_root"]:
+                raise HTTPException(409, "系统本地目的地的目录不能修改")
+            values["enabled"] = True
+        ensure_local_destination_root(values)
+        db.execute(
+            """UPDATE destinations SET name = ?, kind = ?, local_root = ?, webdav_url = ?, webdav_username = ?, webdav_password = ?, remote_root = ?, enabled = ?, updated_at = ?
+               WHERE id = ?""",
+            (*values.values(), now(), destination_id),
+        )
+        record = db.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+    log_event(logging.INFO, "destination.updated", "Archive destination updated", destination_id=destination_id, destination_kind=record["kind"], destination_name=record["name"])
+    return destination_payload(record)
+
+
+@app.delete("/api/destinations/{destination_id}")
+def disable_destination(destination_id: int) -> dict[str, Any]:
+    with connection() as db:
+        record = db.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+        if not record:
+            raise HTTPException(404, "归档目的地不存在")
+        if record["is_system"]:
+            raise HTTPException(409, "系统本地目的地不能停用")
+        db.execute("UPDATE destinations SET enabled = 0, updated_at = ? WHERE id = ?", (now(), destination_id))
+        record = db.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+    return destination_payload(record)
+
+
+@app.post("/api/destinations/{destination_id}/enable")
+def enable_destination(destination_id: int) -> dict[str, Any]:
+    with connection() as db:
+        record = db.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+        if not record:
+            raise HTTPException(404, "归档目的地不存在")
+        db.execute("UPDATE destinations SET enabled = 1, updated_at = ? WHERE id = ?", (now(), destination_id))
+        record = db.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+    return destination_payload(record)
+
+
+@app.post("/api/destinations/test")
+async def test_destination(payload: DestinationSettings) -> dict[str, Any]:
+    values = validate_destination_payload(payload)
+    candidate = Destination(id=0, **values)
+    await candidate.test_connection()
+    return {"ok": True, "message": "目的地连接正常"}
+
+
+@app.post("/api/destinations/{destination_id}/test")
+async def test_saved_destination(destination_id: int) -> dict[str, Any]:
+    record = destination_row(destination_id, include_disabled=True)
+    if not record:
+        raise HTTPException(404, "归档目的地不存在")
+    await Destination.from_row(record).test_connection()
+    return {"ok": True, "message": "目的地连接正常"}
 
 
 @app.put("/api/settings/api")
@@ -1533,7 +1844,14 @@ async def refresh_chats() -> dict[str, Any]:
 def list_tasks() -> list[dict[str, Any]]:
     with connection() as db:
         records = db.execute("SELECT * FROM tasks ORDER BY CASE status WHEN 'DOWNLOADING' THEN 0 WHEN 'PAUSED' THEN 1 ELSE 2 END, updated_at DESC").fetchall()
-    return [{**dict(record), "filters": json.loads(record["filters_json"])} for record in records]
+    return [
+        {
+            **dict(record),
+            "filters": json.loads(record["filters_json"]),
+            "destination": destination_payload(destination_row(record["destination_id"], include_disabled=True)) if destination_row(record["destination_id"], include_disabled=True) else None,
+        }
+        for record in records
+    ]
 
 
 @app.get("/api/tasks/{task_id}")
@@ -1543,9 +1861,11 @@ def get_task(task_id: int) -> dict[str, Any]:
         active_media = db.execute("SELECT * FROM task_media WHERE task_id = ? AND status = 'DOWNLOADING' ORDER BY updated_at", (task_id,)).fetchall()
     if not record:
         raise HTTPException(404, "任务不存在")
+    destination = destination_row(record["destination_id"], include_disabled=True)
     return {
         **dict(record),
         "filters": json.loads(record["filters_json"]),
+        "destination": destination_payload(destination) if destination else None,
         "activeMedia": [media_payload(item) for item in active_media],
         "downloadRuntime": download_runtime_state(),
     }
@@ -1616,8 +1936,8 @@ def archived_filename(filename: str, message_id: int) -> str:
     return f"{stem}__msg-{message_id}{suffix}"
 
 
-def archive_destination(task: Any, media: Any) -> Path:
-    """Build the stable on-disk location for a downloaded Telegram message."""
+def archive_relative_path(task: Any, media: Any) -> Path:
+    """Build the stable destination-independent path for a downloaded message."""
     timezone_name = task["archive_timezone"]
     if not timezone_name:
         raise RuntimeError("任务缺少归档时区，无法开始下载")
@@ -1627,12 +1947,22 @@ def archive_destination(task: Any, media: Any) -> Path:
     archive_date = message_date.astimezone(ZoneInfo(timezone_name))
     chat_directory = f"{safe_filename(str(task['chat_title']))}__chat-{task['chat_id']}"
     return (
-        Path(DOWNLOAD_ROOT)
-        / chat_directory
+        Path(chat_directory)
         / f"{archive_date:%Y}"
         / f"{archive_date:%m}"
         / archived_filename(str(media["filename"]), int(media["message_id"]))
     )
+
+
+def archive_destination(task: Any, media: Any) -> Path:
+    """Build the legacy local path used by existing callers and tests."""
+    return Path(DOWNLOAD_ROOT) / archive_relative_path(task, media)
+
+
+def archive_stage_path(task: Any, media: Any, destination: Destination, relative_path: Path) -> Path:
+    if destination.is_local:
+        return destination.local_path(relative_path).with_suffix(Path(relative_path).suffix + ".part")
+    return STAGING_ROOT / f"task-{task['id']}-media-{media['id']}{Path(relative_path).suffix}.part"
 
 
 def scan_cache_key(payload: ScanRequest) -> str:
@@ -1705,20 +2035,25 @@ def parse_source_cursor(value: str | None) -> int | None:
     return result
 
 
-def source_item_states(chat_id: str, message_ids: list[int]) -> tuple[dict[int, int], set[int], dict[int, sqlite3.Row]]:
+def source_item_states(chat_id: str, message_ids: list[int], destination_id: int | None = None) -> tuple[dict[int, int], set[int], dict[int, sqlite3.Row]]:
     if not message_ids:
         return {}, set(), {}
+    destination_id = resolved_destination_id(destination_id)
     placeholders = ", ".join("?" for _ in message_ids)
     with connection() as db:
         archived = db.execute(
-            f"SELECT message_id, id FROM archive_items WHERE chat_id = ? AND message_id IN ({placeholders})",
-            (chat_id, *message_ids),
+            f"""SELECT a.message_id, a.id FROM archive_items a
+                LEFT JOIN archive_locations l ON l.id = a.location_id
+                WHERE a.chat_id = ? AND a.message_id IN ({placeholders})
+                AND COALESCE(l.destination_id, ?) = ?""",
+            (chat_id, *message_ids, destination_id, destination_id),
         ).fetchall()
         queued = db.execute(
             f"""SELECT DISTINCT m.message_id FROM task_media m JOIN tasks t ON t.id = m.task_id
                 WHERE t.chat_id = ? AND m.message_id IN ({placeholders})
+                AND COALESCE(t.destination_id, ?) = ?
                 AND t.status IN ('QUEUED', 'SCANNING', 'DOWNLOADING', 'RETRYING', 'WAITING_RATE_LIMIT', 'PAUSED')""",
-            (chat_id, *message_ids),
+            (chat_id, *message_ids, destination_id, destination_id),
         ).fetchall()
         previews = db.execute(
             f"SELECT * FROM preview_cache WHERE chat_id = ? AND message_id IN ({placeholders})",
@@ -1832,14 +2167,14 @@ def cache_source_page(chat_id: str, query_key: str, cursor: str | None, visible:
     DOWNLOAD_WAKE.set()
 
 
-def source_page_response(chat_id: str, visible: list[tuple[int, str, str, str | None, int, str]], next_cursor: str | None, *, cache_status: str) -> dict[str, Any]:
-    archive_ids, queued_ids, previews = source_item_states(chat_id, [item[0] for item in visible])
+def source_page_response(chat_id: str, visible: list[tuple[int, str, str, str | None, int, str]], next_cursor: str | None, *, cache_status: str, destination_id: int | None = None) -> dict[str, Any]:
+    archive_ids, queued_ids, previews = source_item_states(chat_id, [item[0] for item in visible], destination_id)
     thumbnails = source_thumbnail_records(chat_id, [item[0] for item in visible])
     return {"items": [source_media_payload(item, archive_ids, queued_ids, previews, thumbnails) for item in visible], "next_cursor": next_cursor, "cacheStatus": cache_status}
 
 
 @app.get("/api/sources/{chat_id}/media")
-async def browse_source_media(chat_id: str, cursor: str | None = None, media_type: str | None = None, date_start: str | None = None, date_end: str | None = None, page_size: int = 30, refresh: bool = False) -> dict[str, Any]:
+async def browse_source_media(chat_id: str, cursor: str | None = None, media_type: str | None = None, date_start: str | None = None, date_end: str | None = None, page_size: int = 30, refresh: bool = False, destination_id: int | None = None) -> dict[str, Any]:
     if not 1 <= page_size <= 50:
         raise HTTPException(400, "每页媒体数量必须在 1 到 50 之间")
     allowed_types = {"PHOTO", "VIDEO", "AUDIO", "DOCUMENT"}
@@ -1861,7 +2196,7 @@ async def browse_source_media(chat_id: str, cursor: str | None = None, media_typ
     if not refresh:
         cached = cached_source_page(chat_id, query_key, cursor)
         if cached is not None:
-            return source_page_response(chat_id, *cached, cache_status="HIT")
+            return source_page_response(chat_id, *cached, cache_status="HIT", destination_id=destination_id)
     matched: list[tuple[int, str, str, str | None, int, str]] = []
     if DEMO_MODE:
         matched = demo_source_media(chat_id, offset, requested_types)
@@ -1884,7 +2219,7 @@ async def browse_source_media(chat_id: str, cursor: str | None = None, media_typ
     visible, overflow = matched[:page_size], matched[page_size:]
     next_cursor = source_cursor(visible[-1][0]) if overflow and visible else None
     cache_source_page(chat_id, query_key, cursor, visible, next_cursor)
-    return source_page_response(chat_id, visible, next_cursor, cache_status="REFRESHED")
+    return source_page_response(chat_id, visible, next_cursor, cache_status="REFRESHED", destination_id=destination_id)
 
 
 @app.get("/api/source-thumbnails/{cache_id}/content")
@@ -2159,6 +2494,8 @@ def classify_download_error(error: Exception) -> tuple[str, bool, str]:
         return "UNAVAILABLE", False, "文件不可用、已删除或当前账号无访问权限"
     if isinstance(error, (RpcCallFailError, TimedOutError)):
         return "TELEGRAM_SERVER", True, "Telegram 服务暂时无法处理下载请求，将自动重试"
+    if isinstance(error, StorageError):
+        return "DESTINATION", True, "归档目的地暂时不可用，将自动重试"
     if isinstance(error, (OSError, asyncio.TimeoutError)) or isinstance(error, RPCError):
         return "NETWORK", True, "网络或 Telegram 服务暂时不可用，将自动重试"
     return "UNKNOWN", True, "下载发生临时错误，将自动重试"
@@ -2528,52 +2865,67 @@ async def download_media_job(task_id: int, media_id: int) -> None:
         if not task or not media or current_task_status(task_id) not in {"DOWNLOADING", "RETRYING"}:
             return
         log_event(logging.INFO, "download.started", "Telegram media download started", task_id=task_id, media_id=media_id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], media_type=media["media_type"], size_bytes=media["size_bytes"])
-        destination = archive_destination(task, media)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        part = destination.with_suffix(destination.suffix + ".part")
+        destination = destination_for_task(task)
+        relative_path = archive_relative_path(task, media)
+        part = archive_stage_path(task, media, destination, relative_path)
+        part.parent.mkdir(parents=True, exist_ok=True)
+        final_path = destination.local_path(relative_path) if destination.is_local else None
+        if final_path:
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+        preview_adopted = False
         if media["preview_cache_id"]:
             with connection() as db:
                 preview = db.execute("SELECT * FROM preview_cache WHERE id = ?", (media["preview_cache_id"],)).fetchone()
             preview_file = path_in_root(preview["cache_path"], PREVIEW_ROOT) if preview else None
             preview_part = preview_part_path(preview) if preview else None
             if preview and preview["status"] == "READY" and preview_file and preview_file.is_file():
-                os.replace(preview_file, destination)
+                os.replace(preview_file, part)
                 update_preview_cache(preview["id"], status="CONSUMED", expires_at=now())
                 with connection() as db:
                     db.execute("UPDATE task_media SET preview_cache_id = NULL WHERE id = ?", (media_id,))
-                record_archive(task, media, destination)
-                update_media(task_id, media_id, status="COMPLETED", downloaded_bytes=media["size_bytes"], speed_bytes_per_second=0, error_message=None, failure_category=None)
-                log_event(logging.INFO, "download.preview_adopted", "Completed preview adopted without another Telegram download", task_id=task_id, media_id=media_id, preview_id=preview["id"])
-                return
-            if preview_part and preview_part.is_file() and not part.exists():
+                preview_adopted = True
+            elif preview_part and preview_part.is_file() and not part.exists():
                 os.replace(preview_part, part)
                 update_preview_cache(preview["id"], status="CONSUMED", expires_at=now())
                 with connection() as db:
                     db.execute("UPDATE task_media SET preview_cache_id = NULL WHERE id = ?", (media_id,))
-        client = await get_download_client()
-        async with TELEGRAM_LOCK:
-            entity = await client.get_entity(int(task["chat_id"]))
-            message = await client.get_messages(entity, ids=media["message_id"])
-        if not message:
-            raise RuntimeError("消息已不可用")
-        started_at = asyncio.get_running_loop().time()
-        last_persisted_at = 0.0
+        staged_file_reused = False
+        if not preview_adopted and part.is_file():
+            try:
+                staged_file_reused = media["size_bytes"] == 0 or part.stat().st_size >= media["size_bytes"]
+            except OSError:
+                staged_file_reused = False
+            if staged_file_reused:
+                update_parallel_download_progress(task_id, media_id, media["size_bytes"], 0)
+                log_event(logging.INFO, "download.staging_reused", "Reusing completed local staging file before destination delivery", task_id=task_id, media_id=media_id, destination_id=destination.id, size_bytes=media["size_bytes"])
+        if not preview_adopted and not staged_file_reused:
+            client = await get_download_client()
+            async with TELEGRAM_LOCK:
+                entity = await client.get_entity(int(task["chat_id"]))
+                message = await client.get_messages(entity, ids=media["message_id"])
+            if not message:
+                raise RuntimeError("消息已不可用")
+            started_at = asyncio.get_running_loop().time()
+            last_persisted_at = 0.0
 
-        def progress(current: int, total: int) -> None:
-            nonlocal last_persisted_at
-            current_time = asyncio.get_running_loop().time()
-            if current != total and current_time - last_persisted_at < 1:
-                return
-            last_persisted_at = current_time
-            update_parallel_download_progress(task_id, media_id, current, round(current / max(current_time - started_at, 0.001)))
+            def progress(current: int, total: int) -> None:
+                nonlocal last_persisted_at
+                current_time = asyncio.get_running_loop().time()
+                if current != total and current_time - last_persisted_at < 1:
+                    return
+                last_persisted_at = current_time
+                update_parallel_download_progress(task_id, media_id, current, round(current / max(current_time - started_at, 0.001)))
 
-        result = await client.download_media(message, file=str(part), progress_callback=progress)
-        if not result:
-            raise RuntimeError("Telegram 未返回下载文件")
-        os.replace(part, destination)
-        record_archive(task, media, destination)
+            result = await client.download_media(message, file=str(part), progress_callback=progress)
+            if not result:
+                raise RuntimeError("Telegram 未返回下载文件")
+        await destination.upload_file(part, relative_path)
+        archive_path = final_path if final_path else part
+        record_archive(task, media, archive_path, relative_path)
+        if not destination.is_local:
+            part.unlink(missing_ok=True)
         update_media(task_id, media_id, status="COMPLETED", downloaded_bytes=media["size_bytes"], speed_bytes_per_second=0, error_message=None, failure_category=None)
-        log_event(logging.INFO, "download.completed", "Telegram media download completed", task_id=task_id, media_id=media_id, filename=media["filename"], archive_path=str(destination), size_bytes=media["size_bytes"])
+        log_event(logging.INFO, "download.completed", "Telegram media download completed", task_id=task_id, media_id=media_id, destination_id=destination.id, filename=media["filename"], archive_path=str(relative_path), size_bytes=media["size_bytes"])
     except asyncio.CancelledError:
         status = current_task_status(task_id)
         key = (task_id, media_id)
@@ -2597,7 +2949,7 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             update_media(task_id, media_id, status="RETRY_WAIT", speed_bytes_per_second=0, next_retry_at=DOWNLOAD_FLOOD_UNTIL.isoformat() if DOWNLOAD_FLOOD_UNTIL else now(), failure_category="RATE_LIMIT", error_message=f"Telegram 限流，约 {seconds} 秒后自动继续")
             return
         category, recoverable, message = classify_download_error(error)
-        log_event(logging.ERROR if not recoverable else logging.WARNING, "download.failed", "Telegram media download failed", exc_info=True, task_id=task_id, media_id=media_id, error_type=type(error).__name__, failure_category=category, recoverable=recoverable)
+        log_event(logging.ERROR if not recoverable else logging.WARNING, "download.failed", "Media download or destination delivery failed", exc_info=True, task_id=task_id, media_id=media_id, error_type=type(error).__name__, failure_category=category, recoverable=recoverable)
         if isinstance(error, TimedOutError):
             request_download_client_reset(task_id, media_id)
         if category == "AUTH":
@@ -2696,7 +3048,18 @@ def task_request(task: sqlite3.Row) -> ScanRequest:
     return ScanRequest(chat_id=task["chat_id"], chat_title=task["chat_title"], chat_handle=task["chat_handle"], filters=TaskFilters(**json.loads(task["filters_json"])))
 
 
-def record_archive(task: sqlite3.Row, media: sqlite3.Row, path: Path) -> None:
+def record_archive(task: sqlite3.Row, media: sqlite3.Row, path: Path, relative_path: Path | None = None) -> None:
+    destination = destination_for_task(task)
+    if relative_path is None:
+        if destination.is_local and destination.local_root:
+            try:
+                relative_path = Path(path).resolve().relative_to(destination.local_root.resolve())
+            except ValueError:
+                relative_path = archive_relative_path(task, media)
+        else:
+            relative_path = archive_relative_path(task, media)
+    location_path = str(relative_path).replace(os.sep, "/")
+    legacy_blob_path = str(path) if destination.is_local else location_path
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     with connection() as db:
         existing = db.execute("SELECT id FROM media_blobs WHERE content_hash = ?", (digest,)).fetchone()
@@ -2704,11 +3067,22 @@ def record_archive(task: sqlite3.Row, media: sqlite3.Row, path: Path) -> None:
             blob_id = existing["id"]
         else:
             blob_id = db.execute("""INSERT INTO media_blobs (content_hash, canonical_path, thumbnail_status, size_bytes, media_type, created_at)
-                VALUES (?, ?, 'PENDING', ?, ?, ?)""", (digest, str(path), media["size_bytes"], media["media_type"], now())).lastrowid
-        db.execute("""INSERT INTO archive_items (blob_id, chat_id, chat_title, message_id, filename, media_type, mime_type, size_bytes, message_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (blob_id, task["chat_id"], task["chat_title"], media["message_id"], media["filename"], media["media_type"], media["mime_type"], media["size_bytes"], media["message_date"], now()))
+                VALUES (?, ?, 'PENDING', ?, ?, ?)""", (digest, legacy_blob_path, media["size_bytes"], media["media_type"], now())).lastrowid
+        location = db.execute("SELECT id, canonical_path FROM archive_locations WHERE blob_id = ? AND destination_id = ?", (blob_id, destination.id)).fetchone()
+        if not location:
+            location = db.execute("SELECT id, canonical_path FROM archive_locations WHERE destination_id = ? AND canonical_path = ?", (destination.id, location_path)).fetchone()
+        if not location:
+            location_id = db.execute(
+                """INSERT INTO archive_locations (blob_id, destination_id, canonical_path, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (blob_id, destination.id, location_path, now()),
+            ).lastrowid
+        else:
+            location_id = location["id"]
+        db.execute("""INSERT INTO archive_items (blob_id, location_id, chat_id, chat_title, message_id, filename, media_type, mime_type, size_bytes, message_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (blob_id, location_id, task["chat_id"], task["chat_title"], media["message_id"], media["filename"], media["media_type"], media["mime_type"], media["size_bytes"], media["message_date"], now()))
     wake_thumbnail_worker()
-    log_event(logging.INFO, "archive.recorded", "Downloaded media recorded in archive", task_id=task["id"], media_id=media["id"], blob_id=blob_id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], archive_path=str(path), duplicate_blob=bool(existing))
+    log_event(logging.INFO, "archive.recorded", "Downloaded media recorded in archive", task_id=task["id"], media_id=media["id"], blob_id=blob_id, destination_id=destination.id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], archive_path=location_path, duplicate_blob=bool(existing))
 
 
 async def download_demo_media_job(task_id: int, media_id: int) -> None:
@@ -2815,13 +3189,14 @@ def start_pending_task_workers() -> None:
 @app.post("/api/tasks")
 async def create_task(payload: ScanRequest) -> dict[str, Any]:
     created = now()
+    destination_id = resolved_destination_id(payload.destination_id)
     with connection() as db:
         setting = db.execute("SELECT archive_timezone FROM app_settings WHERE id = 1").fetchone()
         if not setting or not setting["archive_timezone"]:
             raise HTTPException(409, "请先完成归档时区设置")
-        cursor = db.execute("""INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, filters_json, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?)""", (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], payload.filters.model_dump_json(), created, created))
-    log_event(logging.INFO, "task.created", "Archive task created", task_id=cursor.lastrowid, chat_id=payload.chat_id, chat_title=payload.chat_title, chat_handle=payload.chat_handle, archive_timezone=setting["archive_timezone"], filters=payload.filters.model_dump())
+        cursor = db.execute("""INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, destination_id, filters_json, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?)""", (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], destination_id, payload.filters.model_dump_json(), created, created))
+    log_event(logging.INFO, "task.created", "Archive task created", task_id=cursor.lastrowid, chat_id=payload.chat_id, chat_title=payload.chat_title, chat_handle=payload.chat_handle, archive_timezone=setting["archive_timezone"], destination_id=destination_id, filters=payload.filters.model_dump())
     start_task_worker(cursor.lastrowid)
     return get_task(cursor.lastrowid)
 
@@ -2858,7 +3233,8 @@ async def create_selection_task(payload: SelectionTaskRequest) -> dict[str, Any]
     selected = await selected_source_messages(payload)
     if not selected:
         raise HTTPException(409, "所选文件已不可用，或不再包含可下载媒体")
-    archive_ids, queued_ids, previews = source_item_states(payload.chat_id, [item[0] for item in selected])
+    destination_id = resolved_destination_id(payload.destination_id)
+    archive_ids, queued_ids, previews = source_item_states(payload.chat_id, [item[0] for item in selected], destination_id)
     accepted = [item for item in selected if item[0] not in archive_ids and item[0] not in queued_ids]
     if not accepted:
         raise HTTPException(409, "所选文件已归档或已加入下载队列")
@@ -2878,9 +3254,9 @@ async def create_selection_task(payload: SelectionTaskRequest) -> dict[str, Any]
         if not setting or not setting["archive_timezone"]:
             raise HTTPException(409, "请先完成归档时区设置")
         cursor = db.execute(
-            """INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, filters_json, status, total_count, total_bytes, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?)""",
-            (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], json.dumps({"mode": "selection", "message_ids": [item[0] for item in accepted]}, ensure_ascii=False), len(accepted), sum(item[4] for item in accepted), created, created),
+            """INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, destination_id, filters_json, status, total_count, total_bytes, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?)""",
+            (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], destination_id, json.dumps({"mode": "selection", "message_ids": [item[0] for item in accepted]}, ensure_ascii=False), len(accepted), sum(item[4] for item in accepted), created, created),
         )
         task_id = cursor.lastrowid
         db.executemany(
@@ -2888,7 +3264,7 @@ async def create_selection_task(payload: SelectionTaskRequest) -> dict[str, Any]
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             [(task_id, *item, previews[item[0]]["id"] if item[0] in previews else None) for item in accepted],
         )
-    log_event(logging.INFO, "task.selection_created", "Selected media task created", task_id=task_id, chat_id=payload.chat_id, chat_title=payload.chat_title, media_count=len(accepted), skipped_archived=len(selected) - len(accepted))
+    log_event(logging.INFO, "task.selection_created", "Selected media task created", task_id=task_id, chat_id=payload.chat_id, chat_title=payload.chat_title, destination_id=destination_id, media_count=len(accepted), skipped_archived=len(selected) - len(accepted))
     start_task_worker(task_id)
     return get_task(task_id)
 
@@ -3012,17 +3388,34 @@ async def task_events(request: Request, task_id: int, after_revision: int = 0) -
 
 
 @app.get("/api/archives/chats")
-def archive_chats() -> list[dict[str, Any]]:
+def archive_chats(destination_id: int | None = None) -> list[dict[str, Any]]:
+    values: list[Any] = []
+    where = ""
+    if destination_id:
+        destination_id = resolved_destination_id(destination_id, require_enabled=False)
+        where = "WHERE COALESCE(l.destination_id, ?) = ?"
+        values.extend([resolved_destination_id(None), destination_id])
     with connection() as db:
-        records = db.execute("SELECT chat_id AS id, chat_title AS title, COUNT(*) AS item_count FROM archive_items GROUP BY chat_id, chat_title ORDER BY title").fetchall()
+        records = db.execute(
+            f"""SELECT a.chat_id AS id, a.chat_title AS title, COUNT(*) AS item_count
+                FROM archive_items a LEFT JOIN archive_locations l ON l.id = a.location_id
+                {where} GROUP BY a.chat_id, a.chat_title ORDER BY title""", values,
+        ).fetchall()
     return rows(records)
 
 
 def archive_record(item_id: int) -> sqlite3.Row:
     with connection() as db:
         record = db.execute(
-            """SELECT a.*, b.canonical_path, b.thumbnail_path, b.thumbnail_status, b.thumbnail_error FROM archive_items a
-            JOIN media_blobs b ON a.blob_id = b.id WHERE a.id = ?""",
+            """SELECT a.*, b.canonical_path AS legacy_canonical_path, b.thumbnail_path, b.thumbnail_status, b.thumbnail_error,
+                      COALESCE(l.canonical_path, b.canonical_path) AS canonical_path,
+                      l.id AS location_id, l.destination_id, l.canonical_path AS location_path,
+                      d.name AS destination_name, d.kind AS destination_kind
+               FROM archive_items a
+               JOIN media_blobs b ON a.blob_id = b.id
+               LEFT JOIN archive_locations l ON l.id = a.location_id
+               LEFT JOIN destinations d ON d.id = l.destination_id
+               WHERE a.id = ?""",
             (item_id,),
         ).fetchone()
     if not record:
@@ -3033,13 +3426,46 @@ def archive_record(item_id: int) -> sqlite3.Row:
 def archive_payload(record: sqlite3.Row) -> dict[str, Any]:
     payload = dict(record)
     item_id = record["id"]
+    destination = destination_row(record["destination_id"], include_disabled=True) if record["destination_id"] else destination_row(None, include_disabled=True)
+    payload["destination"] = destination_payload(destination) if destination else None
     payload["thumbnail_url"] = f"/api/archives/media/{item_id}/thumbnail" if record["thumbnail_status"] == "READY" else None
     payload["content_url"] = f"/api/archives/media/{item_id}/content" if record["media_type"] in {"PHOTO", "VIDEO"} else None
     payload["download_url"] = f"/api/archives/media/{item_id}/download"
     return payload
 
 
-def archive_file_response(item_id: int, kind: Literal["thumbnail", "content", "download"]) -> FileResponse:
+def archive_record_destination(record: sqlite3.Row) -> Destination:
+    destination_id = record["destination_id"]
+    destination = destination_row(destination_id, include_disabled=True) if destination_id else destination_row(None, include_disabled=True)
+    if not destination:
+        raise HTTPException(503, "归档目的地配置不存在")
+    return Destination.from_row(destination)
+
+
+def parse_range_header(value: str | None, total: int) -> tuple[int, int] | None:
+    if not value:
+        return None
+    if total <= 0 or not value.startswith("bytes=") or "," in value:
+        raise HTTPException(416, "文件范围无效", headers={"Content-Range": f"bytes */{total}"})
+    start_text, end_text = value[6:].split("-", 1)
+    try:
+        if not start_text:
+            suffix = int(end_text)
+            if suffix <= 0:
+                raise ValueError
+            start, end = max(0, total - suffix), total - 1
+        else:
+            start = int(start_text)
+            end = int(end_text) if end_text else total - 1
+            if start < 0 or start >= total or end < start:
+                raise ValueError
+            end = min(end, total - 1)
+    except ValueError as error:
+        raise HTTPException(416, "文件范围无效", headers={"Content-Range": f"bytes */{total}"}) from error
+    return start, end
+
+
+async def archive_file_response(request: Request, item_id: int, kind: Literal["thumbnail", "content", "download"]) -> Any:
     record = archive_record(item_id)
     if kind == "thumbnail":
         if record["thumbnail_status"] != "READY" or not record["thumbnail_path"]:
@@ -3047,23 +3473,57 @@ def archive_file_response(item_id: int, kind: Literal["thumbnail", "content", "d
         file_path = path_in_root(record["thumbnail_path"], THUMBNAIL_ROOT)
         media_type = "image/jpeg"
         filename = f"{record['filename']}.jpg"
-    else:
-        file_path = path_in_root(record["canonical_path"], DOWNLOAD_ROOT)
-        media_type = record["mime_type"] or mimetypes.guess_type(record["filename"])[0] or "application/octet-stream"
-        filename = record["filename"]
-    if not file_path or not file_path.is_file():
-        raise HTTPException(404, "归档文件不存在")
-    return FileResponse(
-        file_path,
-        media_type=media_type,
-        filename=filename,
-        content_disposition_type="attachment" if kind == "download" else "inline",
-        headers={"Cache-Control": "private, max-age=86400"},
-    )
+        if not file_path or not file_path.is_file():
+            raise HTTPException(404, "归档文件不存在")
+        return FileResponse(file_path, media_type=media_type, filename=filename, content_disposition_type="inline", headers={"Cache-Control": "private, max-age=86400"})
+
+    destination = archive_record_destination(record)
+    location_path = record["location_path"] or record["canonical_path"]
+    media_type = record["mime_type"] or mimetypes.guess_type(record["filename"])[0] or "application/octet-stream"
+    filename = record["filename"]
+    if destination.is_local:
+        if not destination.local_root:
+            raise HTTPException(503, "本地归档目的地配置无效")
+        try:
+            file_path = destination.resolve_local_location(location_path)
+        except StorageError as error:
+            raise HTTPException(404, "归档文件不存在") from error
+        if not file_path.is_file():
+            raise HTTPException(404, "归档文件不存在")
+        return FileResponse(file_path, media_type=media_type, filename=filename, content_disposition_type="attachment" if kind == "download" else "inline", headers={"Cache-Control": "private, max-age=86400"})
+
+    if not record["location_path"]:
+        raise HTTPException(404, "远端归档位置不存在")
+    total = int(record["size_bytes"])
+    range_header = request.headers.get("range")
+    selected_range = parse_range_header(range_header, total)
+    try:
+        client, response = await destination.open_remote_stream(record["location_path"], range_header)
+    except StorageError as error:
+        raise HTTPException(502, str(error)) from error
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in response.aiter_bytes():
+                yield chunk
+        finally:
+            await destination.close_remote_stream(client, response)
+
+    disposition = "attachment" if kind == "download" else "inline"
+    headers = {"Cache-Control": "private, max-age=86400", "Accept-Ranges": "bytes", "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(filename)}"}
+    status_code = 200
+    if selected_range:
+        start, end = selected_range
+        status_code = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        headers["Content-Length"] = str(end - start + 1)
+    elif response.headers.get("content-length"):
+        headers["Content-Length"] = response.headers["content-length"]
+    return StreamingResponse(body(), status_code=status_code, media_type=media_type, headers=headers)
 
 
 @app.get("/api/archives/media")
-def archive_media(chat_id: str | None = None, media_type: str | None = None, month: str | None = None) -> list[dict[str, Any]]:
+def archive_media(chat_id: str | None = None, media_type: str | None = None, month: str | None = None, destination_id: int | None = None) -> list[dict[str, Any]]:
     clauses, values = [], []
     if chat_id:
         clauses.append("a.chat_id = ?")
@@ -3074,28 +3534,37 @@ def archive_media(chat_id: str | None = None, media_type: str | None = None, mon
     if month:
         clauses.append("substr(a.message_date, 1, 7) = ?")
         values.append(month)
+    if destination_id:
+        destination_id = resolved_destination_id(destination_id, require_enabled=False)
+        clauses.append("COALESCE(l.destination_id, ?) = ?")
+        values.extend([resolved_destination_id(None), destination_id])
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with connection() as db:
         records = db.execute(
-            f"""SELECT a.*, b.canonical_path, b.thumbnail_path, b.thumbnail_status, b.thumbnail_error
-            FROM archive_items a JOIN media_blobs b ON a.blob_id = b.id {where}
+            f"""SELECT a.*, b.canonical_path AS legacy_canonical_path, b.thumbnail_path, b.thumbnail_status, b.thumbnail_error,
+                      COALESCE(l.canonical_path, b.canonical_path) AS canonical_path,
+                      l.id AS location_id, l.destination_id, l.canonical_path AS location_path,
+                      d.name AS destination_name, d.kind AS destination_kind
+            FROM archive_items a JOIN media_blobs b ON a.blob_id = b.id
+            LEFT JOIN archive_locations l ON l.id = a.location_id
+            LEFT JOIN destinations d ON d.id = l.destination_id {where}
             ORDER BY a.message_date DESC""", values).fetchall()
     return [archive_payload(record) for record in records]
 
 
 @app.get("/api/archives/media/{item_id}/thumbnail")
-def archive_thumbnail(item_id: int) -> FileResponse:
-    return archive_file_response(item_id, "thumbnail")
+async def archive_thumbnail(request: Request, item_id: int) -> Any:
+    return await archive_file_response(request, item_id, "thumbnail")
 
 
 @app.get("/api/archives/media/{item_id}/content")
-def archive_content(item_id: int) -> FileResponse:
-    return archive_file_response(item_id, "content")
+async def archive_content(request: Request, item_id: int) -> Any:
+    return await archive_file_response(request, item_id, "content")
 
 
 @app.get("/api/archives/media/{item_id}/download")
-def archive_download(item_id: int) -> FileResponse:
-    return archive_file_response(item_id, "download")
+async def archive_download(request: Request, item_id: int) -> Any:
+    return await archive_file_response(request, item_id, "download")
 
 
 @app.get("/api/archives/media/{item_id}")

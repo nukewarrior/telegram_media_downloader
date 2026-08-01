@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
 import { CalendarDays, Download, FileAudio, FileText, Filter, Image, Search, Video, X } from 'lucide-vue-next'
-import { api, apiResourceUrl, type ArchiveItem } from '../api'
+import { api, apiResourceUrl, type ArchiveItem, type Destination } from '../api'
 
 type ArchiveDay = { key: string; label: string; fullLabel: string; year: number; items: ArchiveItem[] }
 type ArchiveMonth = { key: string; label: string; year: number; items: ArchiveItem[]; days: ArchiveDay[] }
 
 const chats = ref<{ id: string; title: string; item_count: number }[]>([])
+const destinations = ref<Destination[]>([])
 const items = ref<ArchiveItem[]>([])
 const selectedChat = ref('')
 const selectedType = ref('')
+const selectedDestination = ref('')
 const selected = ref<ArchiveItem | null>(null)
 const mediaFailed = ref(false)
 const loading = ref(true)
@@ -39,7 +41,7 @@ function dateParts(value: string) {
 }
 
 const formattedDate = (value: string) => archiveDate(value).toLocaleDateString('zh-CN')
-const cardLabel = (item: ArchiveItem) => `${mediaLabel[item.media_type]}：${item.filename}。归属聊天：${item.chat_title}。${formattedDate(item.message_date)}，${bytes(item.size_bytes)}。打开预览`
+const cardLabel = (item: ArchiveItem) => `${mediaLabel[item.media_type]}：${item.filename}。归属聊天：${item.chat_title}。目的地：${item.destination?.name ?? '本地归档'}。${formattedDate(item.message_date)}，${bytes(item.size_bytes)}。打开预览`
 
 const archiveMonths = computed<ArchiveMonth[]>(() => {
   const months = new Map<string, ArchiveMonth>()
@@ -68,13 +70,13 @@ const archiveMonths = computed<ArchiveMonth[]>(() => {
 const archiveDays = computed(() => archiveMonths.value.flatMap((month) => month.days))
 const focusedDayKey = computed(() => hoveredDayKey.value ?? activeDayKey.value)
 const focusedDay = computed(() => archiveDays.value.find((day) => day.key === focusedDayKey.value) ?? archiveDays.value[0] ?? null)
-const activeFilterCount = computed(() => Number(Boolean(selectedChat.value)) + Number(Boolean(selectedType.value)))
+const activeFilterCount = computed(() => Number(Boolean(selectedChat.value)) + Number(Boolean(selectedType.value)) + Number(Boolean(selectedDestination.value)))
 const archiveTypes = ['', 'PHOTO', 'VIDEO', 'AUDIO', 'DOCUMENT']
 
 async function load() {
   loading.value = true
   try {
-    items.value = await api.archiveMedia({ ...(selectedChat.value ? { chat_id: selectedChat.value } : {}), ...(selectedType.value ? { media_type: selectedType.value } : {}) })
+    items.value = await api.archiveMedia({ ...(selectedChat.value ? { chat_id: selectedChat.value } : {}), ...(selectedType.value ? { media_type: selectedType.value } : {}), ...(selectedDestination.value ? { destination_id: selectedDestination.value } : {}) })
   } finally {
     loading.value = false
   }
@@ -85,13 +87,20 @@ async function applyFilters() {
   await load()
 }
 
+async function applyDestinationFilter() {
+  selectedChat.value = ''
+  chats.value = await api.archiveChats(selectedDestination.value ? Number(selectedDestination.value) : undefined)
+  await applyFilters()
+}
+
 async function clearFilters() {
-  if (!selectedChat.value && !selectedType.value) {
+  if (!selectedChat.value && !selectedType.value && !selectedDestination.value) {
     filterOpen.value = false
     return
   }
   selectedChat.value = ''
   selectedType.value = ''
+  selectedDestination.value = ''
   await applyFilters()
 }
 
@@ -246,6 +255,7 @@ onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('scroll', onScroll, { passive: true })
   window.addEventListener('resize', updateActiveDay)
+  destinations.value = await api.destinations()
   chats.value = await api.archiveChats()
   await load()
 })
@@ -267,7 +277,7 @@ onBeforeUnmount(() => {
     <div v-if="filterOpen" class="archive-filter-backdrop" aria-hidden="true" @click="filterOpen = false"></div>
     <section v-if="filterOpen" id="archive-filter-panel" class="archive-filter-panel" role="dialog" aria-modal="false" aria-label="筛选归档">
       <div class="archive-filter-panel-head"><strong>筛选归档</strong><button class="archive-filter-close" aria-label="关闭筛选" @click="filterOpen = false"><X :size="18" /></button></div>
-      <label class="archive-filter-field"><span>来源聊天</span><select v-model="selectedChat" @change="applyFilters"><option value="">全部来源</option><option v-for="chat in chats" :key="chat.id" :value="chat.id">{{ chat.title }} · {{ chat.item_count }} 个文件</option></select></label>
+      <label class="archive-filter-field"><span>归档目的地</span><select v-model="selectedDestination" @change="applyDestinationFilter"><option value="">全部目的地</option><option v-for="destination in destinations" :key="destination.id" :value="String(destination.id)">{{ destination.name }}</option></select></label><label class="archive-filter-field"><span>来源聊天</span><select v-model="selectedChat" @change="applyFilters"><option value="">全部来源</option><option v-for="chat in chats" :key="chat.id" :value="chat.id">{{ chat.title }} · {{ chat.item_count }} 个文件</option></select></label>
       <fieldset class="archive-filter-types"><legend>文件类型</legend><div><button v-for="type in archiveTypes" :key="type" :class="{ selected: selectedType === type }" @click="selectedType = type; applyFilters()">{{ type ? mediaLabel[type] : '全部' }}</button></div></fieldset>
       <button class="archive-filter-clear" :disabled="!activeFilterCount" @click="clearFilters">清除筛选</button>
     </section>
@@ -280,7 +290,7 @@ onBeforeUnmount(() => {
           <div class="archive-month-heading"><h2>{{ month.label }}</h2><span>{{ month.items.length }} 个文件</span></div>
           <div v-for="day in month.days" :key="day.key" :ref="(element) => setDayAnchor(day.key, element)" class="archive-day" :data-day-key="day.key">
             <div class="archive-day-heading"><h3>{{ day.label }}</h3><span>{{ day.items.length }} 个文件</span></div>
-            <div class="archive-grid"><button v-for="item in day.items" :key="item.id" class="archive-card" :aria-label="cardLabel(item)" @click="select(item)"><div :class="['media-preview', item.media_type.toLowerCase()]"><img v-if="item.thumbnail_url" :src="resource(item.thumbnail_url) ?? undefined" alt="" /><template v-else><Image v-if="item.media_type === 'PHOTO'" :size="34" aria-hidden="true" /><Video v-else-if="item.media_type === 'VIDEO'" :size="34" aria-hidden="true" /><FileAudio v-else-if="item.media_type === 'AUDIO'" :size="34" aria-hidden="true" /><FileText v-else :size="34" aria-hidden="true" /><small v-if="previewStatus[item.thumbnail_status]" class="sr-only">{{ previewStatus[item.thumbnail_status] }}</small></template><span v-if="item.media_type === 'VIDEO'" class="play-badge" aria-hidden="true">▶</span><span class="archive-card-overlay" aria-hidden="true"><b>{{ item.filename }}</b><span class="archive-card-chat">{{ item.chat_title }}</span><small>{{ formattedDate(item.message_date) }} · {{ bytes(item.size_bytes) }}</small></span></div></button></div>
+            <div class="archive-grid"><button v-for="item in day.items" :key="item.id" class="archive-card" :aria-label="cardLabel(item)" @click="select(item)"><div :class="['media-preview', item.media_type.toLowerCase()]"><img v-if="item.thumbnail_url" :src="resource(item.thumbnail_url) ?? undefined" alt="" /><template v-else><Image v-if="item.media_type === 'PHOTO'" :size="34" aria-hidden="true" /><Video v-else-if="item.media_type === 'VIDEO'" :size="34" aria-hidden="true" /><FileAudio v-else-if="item.media_type === 'AUDIO'" :size="34" aria-hidden="true" /><FileText v-else :size="34" aria-hidden="true" /><small v-if="previewStatus[item.thumbnail_status]" class="sr-only">{{ previewStatus[item.thumbnail_status] }}</small></template><span v-if="item.media_type === 'VIDEO'" class="play-badge" aria-hidden="true">▶</span><span class="archive-card-overlay" aria-hidden="true"><b>{{ item.filename }}</b><span class="archive-card-chat">{{ item.chat_title }} · {{ item.destination?.name ?? '本地归档' }}</span><small>{{ formattedDate(item.message_date) }} · {{ bytes(item.size_bytes) }}</small></span></div></button></div>
           </div>
         </section>
       </section>
