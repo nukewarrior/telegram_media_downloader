@@ -16,6 +16,7 @@ os.environ["DATA_DIR"] = str(TEST_DATA)
 os.environ["DOWNLOAD_ROOT"] = str(TEST_DATA / "downloads")
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from app import main
 from app.storage import Destination, StorageError
@@ -241,6 +242,189 @@ class DestinationTests(unittest.TestCase):
         self.assertEqual(status, "COMPLETED")
         self.assertEqual(location["destination_id"], destination_id)
         self.assertFalse(staged.exists())
+
+    def test_webdav_upload_failure_keeps_staging_file_for_retry(self) -> None:
+        with main.connection() as db:
+            destination_id = db.execute(
+                """INSERT INTO destinations (name, kind, webdav_url, remote_root, enabled, is_system, created_at, updated_at)
+                   VALUES ('failed-upload-dav', 'WEBDAV', 'https://dav.example.test/dav', 'archive', 1, 0, ?, ?)""",
+                (main.now(), main.now()),
+            ).lastrowid
+            task_id = db.execute(
+                """INSERT INTO tasks (chat_id, chat_title, archive_timezone, destination_id, filters_json, status, total_count, total_bytes, created_at, updated_at)
+                   VALUES ('failed-upload-chat', '上传失败聊天', 'Asia/Shanghai', ?, '{}', 'DOWNLOADING', 1, 4, ?, ?)""",
+                (destination_id, main.now(), main.now()),
+            ).lastrowid
+            media_id = db.execute(
+                """INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date, status)
+                   VALUES (?, 10, 'failed.bin', 'DOCUMENT', 'application/octet-stream', 4, ?, 'DOWNLOADING')""",
+                (task_id, "2026-07-30T04:00:00+00:00"),
+            ).lastrowid
+            task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            media = db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone()
+
+        destination = Destination.from_row(main.destination_row(destination_id, include_disabled=True))
+        relative = main.archive_relative_path(task, media)
+        staged = main.archive_stage_path(task, media, destination, relative)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(b"data")
+        with (
+            patch.object(Destination, "upload_file", new_callable=AsyncMock, side_effect=StorageError("remote unavailable")) as upload,
+            patch.object(main, "get_download_client", new_callable=AsyncMock) as telegram_client,
+        ):
+            asyncio.run(main.download_media_job(task_id, media_id))
+
+        upload.assert_awaited_once()
+        telegram_client.assert_not_awaited()
+        with main.connection() as db:
+            status = db.execute("SELECT status FROM task_media WHERE id = ?", (media_id,)).fetchone()[0]
+        self.assertEqual(status, "RETRY_WAIT")
+        self.assertTrue(staged.exists())
+
+    def test_webdav_delivery_prepares_thumbnail_without_remote_readback(self) -> None:
+        server = MockWebDAV()
+        with main.connection() as db:
+            destination_id = db.execute(
+                """INSERT INTO destinations (name, kind, webdav_url, remote_root, enabled, is_system, created_at, updated_at)
+                   VALUES ('pipeline-dav', 'WEBDAV', 'https://dav.example.test/dav', 'archive/root', 1, 0, ?, ?)""",
+                (main.now(), main.now()),
+            ).lastrowid
+            task_id = db.execute(
+                """INSERT INTO tasks (chat_id, chat_title, archive_timezone, destination_id, filters_json, status, total_count, created_at, updated_at)
+                   VALUES ('pipeline-chat', '流水线聊天', 'Asia/Shanghai', ?, '{}', 'DOWNLOADING', 1, ?, ?)""",
+                (destination_id, main.now(), main.now()),
+            ).lastrowid
+            media_id = db.execute(
+                """INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date, status)
+                   VALUES (?, 8, 'photo.jpg', 'PHOTO', 'image/jpeg', 0, ?, 'DOWNLOADING')""",
+                (task_id, "2026-07-30T04:00:00+00:00"),
+            ).lastrowid
+            task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            media = db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone()
+
+        destination = Destination.from_row(main.destination_row(destination_id, include_disabled=True))
+        relative = main.archive_relative_path(task, media)
+        staged = main.archive_stage_path(task, media, destination, relative)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (1200, 800), (31, 117, 147)).save(staged, format="JPEG")
+        with main.connection() as db:
+            db.execute("UPDATE task_media SET size_bytes = ? WHERE id = ?", (staged.stat().st_size, media_id))
+            media = db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone()
+
+        async def client_factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        with (
+            patch.object(Destination, "_client", client_factory),
+            patch.object(Destination, "download_to_file", new_callable=AsyncMock) as readback,
+        ):
+            asyncio.run(main.download_media_job(task_id, media_id))
+            requests_before_archive_reads = list(server.requests)
+            with TestClient(main.app) as client:
+                items = client.get("/api/archives/media", params={"destination_id": destination_id})
+                self.assertEqual(items.status_code, 200)
+                item_id = items.json()[0]["id"]
+                self.assertEqual(client.get(f"/api/archives/media/{item_id}/thumbnail").status_code, 200)
+                content = client.get(f"/api/archives/media/{item_id}/content", headers={"Range": "bytes=0-7"})
+                self.assertEqual(content.status_code, 206)
+                self.assertEqual(len(content.content), 8)
+                self.assertIn("attachment", client.get(f"/api/archives/media/{item_id}/download").headers["content-disposition"])
+
+        self.assertFalse(any(method == "GET" for method, _ in requests_before_archive_reads))
+        self.assertEqual(sum(method == "PUT" for method, _ in requests_before_archive_reads), 1)
+        self.assertEqual(sum(method == "MOVE" for method, _ in requests_before_archive_reads), 1)
+        readback.assert_not_awaited()
+        with main.connection() as db:
+            status = db.execute("SELECT status FROM task_media WHERE id = ?", (media_id,)).fetchone()[0]
+            blob = db.execute("SELECT thumbnail_status, thumbnail_path FROM media_blobs ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(status, "COMPLETED")
+        self.assertEqual(blob["thumbnail_status"], "READY")
+        self.assertTrue(Path(blob["thumbnail_path"]).is_file())
+        self.assertFalse(staged.exists())
+
+    def test_webdav_thumbnail_failure_does_not_fail_archive(self) -> None:
+        server = MockWebDAV()
+        with main.connection() as db:
+            destination_id = db.execute(
+                """INSERT INTO destinations (name, kind, webdav_url, remote_root, enabled, is_system, created_at, updated_at)
+                   VALUES ('failed-thumbnail-dav', 'WEBDAV', 'https://dav.example.test/dav', 'archive/root', 1, 0, ?, ?)""",
+                (main.now(), main.now()),
+            ).lastrowid
+            task_id = db.execute(
+                """INSERT INTO tasks (chat_id, chat_title, archive_timezone, destination_id, filters_json, status, total_count, created_at, updated_at)
+                   VALUES ('failed-thumbnail-chat', '失败缩略图聊天', 'Asia/Shanghai', ?, '{}', 'DOWNLOADING', 1, ?, ?)""",
+                (destination_id, main.now(), main.now()),
+            ).lastrowid
+            media_id = db.execute(
+                """INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date, status)
+                   VALUES (?, 9, 'broken.jpg', 'PHOTO', 'image/jpeg', 9, ?, 'DOWNLOADING')""",
+                (task_id, "2026-07-30T04:00:00+00:00"),
+            ).lastrowid
+            task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            media = db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone()
+
+        destination = Destination.from_row(main.destination_row(destination_id, include_disabled=True))
+        relative = main.archive_relative_path(task, media)
+        staged = main.archive_stage_path(task, media, destination, relative)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(b"not-an-image")
+        with main.connection() as db:
+            db.execute("UPDATE task_media SET size_bytes = ? WHERE id = ?", (staged.stat().st_size, media_id))
+            media = db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone()
+
+        async def client_factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        with (
+            patch.object(Destination, "_client", client_factory),
+            patch.object(Destination, "download_to_file", new_callable=AsyncMock) as readback,
+        ):
+            asyncio.run(main.download_media_job(task_id, media_id))
+
+        self.assertFalse(any(method == "GET" for method, _ in server.requests))
+        readback.assert_not_awaited()
+        with main.connection() as db:
+            status = db.execute("SELECT status FROM task_media WHERE id = ?", (media_id,)).fetchone()[0]
+            blob = db.execute("SELECT thumbnail_status, thumbnail_error FROM media_blobs ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(status, "COMPLETED")
+        self.assertEqual(blob["thumbnail_status"], "FAILED")
+        self.assertTrue(blob["thumbnail_error"])
+        self.assertFalse(staged.exists())
+
+    def test_legacy_webdav_thumbnail_keeps_remote_readback_compatibility(self) -> None:
+        server = MockWebDAV()
+        source = TEST_DATA / "legacy-source.jpg"
+        Image.new("RGB", (800, 600), (89, 107, 158)).save(source, format="JPEG")
+        server.files["/dav/archive/root/legacy.jpg"] = source.read_bytes()
+        with main.connection() as db:
+            destination_id = db.execute(
+                """INSERT INTO destinations (name, kind, webdav_url, remote_root, enabled, is_system, created_at, updated_at)
+                   VALUES ('legacy-thumbnail-dav', 'WEBDAV', 'https://dav.example.test/dav', 'archive/root', 1, 0, ?, ?)""",
+                (main.now(), main.now()),
+            ).lastrowid
+            blob_id = db.execute(
+                """INSERT INTO media_blobs (content_hash, canonical_path, thumbnail_status, size_bytes, media_type, created_at)
+                   VALUES ('legacy-thumbnail', 'legacy.jpg', 'PENDING', ?, 'PHOTO', ?)""",
+                (source.stat().st_size, main.now()),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO archive_locations (blob_id, destination_id, canonical_path, created_at)
+                   VALUES (?, ?, 'legacy.jpg', ?)""",
+                (blob_id, destination_id, main.now()),
+            )
+            blob = db.execute("SELECT * FROM media_blobs WHERE id = ?", (blob_id,)).fetchone()
+
+        async def client_factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        with patch.object(Destination, "_client", client_factory):
+            asyncio.run(main.generate_thumbnail(blob))
+
+        self.assertIn(("GET", "/dav/archive/root/legacy.jpg"), server.requests)
+        with main.connection() as db:
+            result = db.execute("SELECT thumbnail_status, thumbnail_path FROM media_blobs WHERE id = ?", (blob_id,)).fetchone()
+        self.assertEqual(result["thumbnail_status"], "READY")
+        self.assertTrue(Path(result["thumbnail_path"]).is_file())
 
     def test_webdav_upload_move_range_readback_and_connection_test(self) -> None:
         server = MockWebDAV()

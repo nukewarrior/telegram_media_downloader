@@ -75,6 +75,7 @@ SCAN_CACHE: dict[str, tuple[datetime, list[tuple[int, str, str, str | None, int,
 PREVIEW_CACHE_TTL = timedelta(hours=24)
 SOURCE_CACHE_DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024
 SOURCE_THUMBNAIL_QUALITY_VERSION = 2
+ARCHIVE_THUMBNAIL_MEDIA_TYPES = frozenset({"PHOTO", "VIDEO"})
 PREVIEW_LAST_CLEANUP_AT: datetime | None = None
 CHAT_CACHE_STALE_AFTER = timedelta(hours=24)
 CHAT_CACHE_SYNC_INTERVAL_SECONDS = 60 * 60
@@ -909,6 +910,12 @@ def reconcile_thumbnail_records() -> None:
             thumbnail = path_in_root(blob["thumbnail_path"], THUMBNAIL_ROOT) if blob["thumbnail_path"] else None
             if blob["thumbnail_status"] == "READY" and thumbnail and thumbnail.is_file():
                 continue
+            # New download jobs attempt to create the derived thumbnail before
+            # delivery.  A failed attempt must not turn into an automatic
+            # WebDAV read-back on every restart.  PENDING/PROCESSING rows are
+            # the legacy states that still need the compatibility worker.
+            if blob["thumbnail_status"] in {"FAILED", "UNAVAILABLE"}:
+                continue
             location_data = blob_location(blob["id"])
             source = path_in_root(blob["canonical_path"], DOWNLOAD_ROOT)
             remote_location = False
@@ -1001,6 +1008,62 @@ async def create_video_thumbnail(source: Path, target: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+async def render_archive_thumbnail(source: Path, target: Path, media_type: str) -> None:
+    if media_type == "PHOTO":
+        await asyncio.to_thread(create_image_thumbnail, source, target)
+    else:
+        await create_video_thumbnail(source, target)
+
+
+async def prepare_archive_thumbnail(source: Path, media_type: str, *, task_id: int, media_id: int) -> tuple[Path | None, str | None]:
+    """Create a thumbnail from the local staging file before remote delivery.
+
+    The returned temporary file belongs to the caller until record_archive()
+    adopts or removes it.  A thumbnail failure is deliberately reported as
+    data, rather than raised, so the original archive can still complete.
+    """
+    if media_type not in ARCHIVE_THUMBNAIL_MEDIA_TYPES:
+        return None, None
+    target = THUMBNAIL_ROOT / f".archive-{task_id}-{media_id}-{secrets.token_hex(6)}.jpg"
+    try:
+        log_event(
+            logging.INFO,
+            "thumbnail.prepare_started",
+            "Preparing archive thumbnail from local staging",
+            task_id=task_id,
+            media_id=media_id,
+            media_type=media_type,
+            source_path=str(source),
+            target_path=str(target),
+        )
+        await render_archive_thumbnail(source, target, media_type)
+        log_event(
+            logging.INFO,
+            "thumbnail.prepared",
+            "Archive thumbnail prepared before destination delivery",
+            task_id=task_id,
+            media_id=media_id,
+            media_type=media_type,
+            target_path=str(target),
+        )
+        return target, None
+    except (UnidentifiedImageError, OSError, RuntimeError) as error:
+        target.unlink(missing_ok=True)
+        message = str(error)[:500] or "无法生成缩略图"
+        log_event(
+            logging.WARNING,
+            "thumbnail.prepare_failed",
+            "Archive thumbnail preparation failed; original delivery will continue",
+            exc_info=True,
+            task_id=task_id,
+            media_id=media_id,
+            media_type=media_type,
+            source_path=str(source),
+            error_type=type(error).__name__,
+        )
+        return None, message
+
+
 async def generate_thumbnail(blob: sqlite3.Row) -> None:
     temporary_source: Path | None = None
     location_data = blob_location(blob["id"])
@@ -1028,10 +1091,7 @@ async def generate_thumbnail(blob: sqlite3.Row) -> None:
     target = THUMBNAIL_ROOT / f"{blob['id']}.jpg"
     try:
         log_event(logging.INFO, "thumbnail.started", "Thumbnail generation started", blob_id=blob["id"], media_type=blob["media_type"], source_path=str(source), target_path=str(target))
-        if blob["media_type"] == "PHOTO":
-            await asyncio.to_thread(create_image_thumbnail, source, target)
-        else:
-            await create_video_thumbnail(source, target)
+        await render_archive_thumbnail(source, target, blob["media_type"])
     except (UnidentifiedImageError, OSError, RuntimeError) as error:
         log_event(logging.ERROR, "thumbnail.failed", "Thumbnail generation failed", exc_info=True, blob_id=blob["id"], media_type=blob["media_type"], source_path=str(source), error_type=type(error).__name__)
         set_thumbnail_result(blob["id"], "FAILED", error=str(error)[:500])
@@ -2925,11 +2985,34 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             result = await client.download_media(message, file=str(part), progress_callback=progress)
             if not result:
                 raise RuntimeError("Telegram 未返回下载文件")
-        await destination.upload_file(part, relative_path)
-        archive_path = final_path if final_path else part
-        record_archive(task, media, archive_path, relative_path)
-        if not destination.is_local:
-            part.unlink(missing_ok=True)
+        prepared_thumbnail: Path | None = None
+        thumbnail_error: str | None = None
+        thumbnail_attempted = media["media_type"] in ARCHIVE_THUMBNAIL_MEDIA_TYPES
+        try:
+            if thumbnail_attempted:
+                prepared_thumbnail, thumbnail_error = await prepare_archive_thumbnail(
+                    part,
+                    media["media_type"],
+                    task_id=task_id,
+                    media_id=media_id,
+                )
+            await destination.upload_file(part, relative_path)
+            archive_path = final_path if final_path else part
+            record_archive(
+                task,
+                media,
+                archive_path,
+                relative_path,
+                prepared_thumbnail=prepared_thumbnail,
+                thumbnail_error=thumbnail_error,
+                thumbnail_attempted=thumbnail_attempted,
+            )
+            prepared_thumbnail = None
+            if not destination.is_local:
+                part.unlink(missing_ok=True)
+        finally:
+            if prepared_thumbnail:
+                prepared_thumbnail.unlink(missing_ok=True)
         update_media(task_id, media_id, status="COMPLETED", downloaded_bytes=media["size_bytes"], speed_bytes_per_second=0, error_message=None, failure_category=None)
         log_event(logging.INFO, "download.completed", "Telegram media download completed", task_id=task_id, media_id=media_id, destination_id=destination.id, filename=media["filename"], archive_path=str(relative_path), size_bytes=media["size_bytes"])
     except asyncio.CancelledError:
@@ -3054,7 +3137,16 @@ def task_request(task: sqlite3.Row) -> ScanRequest:
     return ScanRequest(chat_id=task["chat_id"], chat_title=task["chat_title"], chat_handle=task["chat_handle"], filters=TaskFilters(**json.loads(task["filters_json"])))
 
 
-def record_archive(task: sqlite3.Row, media: sqlite3.Row, path: Path, relative_path: Path | None = None) -> None:
+def record_archive(
+    task: sqlite3.Row,
+    media: sqlite3.Row,
+    path: Path,
+    relative_path: Path | None = None,
+    *,
+    prepared_thumbnail: Path | None = None,
+    thumbnail_error: str | None = None,
+    thumbnail_attempted: bool = False,
+) -> int:
     destination = destination_for_task(task)
     if relative_path is None:
         if destination.is_local and destination.local_root:
@@ -3067,13 +3159,55 @@ def record_archive(task: sqlite3.Row, media: sqlite3.Row, path: Path, relative_p
     location_path = str(relative_path).replace(os.sep, "/")
     legacy_blob_path = str(path) if destination.is_local else location_path
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    media_type = str(media["media_type"])
+    thumbnail_capable = media_type in ARCHIVE_THUMBNAIL_MEDIA_TYPES
+    thumbnail_status = "UNAVAILABLE" if not thumbnail_capable else "PENDING"
+    if thumbnail_attempted and thumbnail_capable:
+        thumbnail_status = "PROCESSING"
     with connection() as db:
-        existing = db.execute("SELECT id FROM media_blobs WHERE content_hash = ?", (digest,)).fetchone()
+        existing = db.execute("SELECT * FROM media_blobs WHERE content_hash = ?", (digest,)).fetchone()
         if existing:
             blob_id = existing["id"]
         else:
-            blob_id = db.execute("""INSERT INTO media_blobs (content_hash, canonical_path, thumbnail_status, size_bytes, media_type, created_at)
-                VALUES (?, ?, 'PENDING', ?, ?, ?)""", (digest, legacy_blob_path, media["size_bytes"], media["media_type"], now())).lastrowid
+            blob_id = db.execute(
+                """INSERT INTO media_blobs (content_hash, canonical_path, thumbnail_path, thumbnail_status, thumbnail_error, size_bytes, media_type, created_at)
+                   VALUES (?, ?, NULL, ?, ?, ?, ?, ?)""",
+                (digest, legacy_blob_path, thumbnail_status, thumbnail_error if thumbnail_status == "FAILED" else None, media["size_bytes"], media_type, now()),
+            ).lastrowid
+        blob_id = int(blob_id)
+
+        existing_thumbnail = path_in_root(existing["thumbnail_path"], THUMBNAIL_ROOT) if existing and existing["thumbnail_path"] else None
+        existing_thumbnail_ready = bool(existing and existing["thumbnail_status"] == "READY" and existing_thumbnail and existing_thumbnail.is_file())
+        if thumbnail_attempted and thumbnail_capable and not existing_thumbnail_ready:
+            if prepared_thumbnail and prepared_thumbnail.is_file():
+                thumbnail_path = THUMBNAIL_ROOT / f"{blob_id}.jpg"
+                try:
+                    thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(prepared_thumbnail, thumbnail_path)
+                    db.execute(
+                        "UPDATE media_blobs SET thumbnail_path = ?, thumbnail_status = 'READY', thumbnail_error = NULL WHERE id = ?",
+                        (str(thumbnail_path), blob_id),
+                    )
+                    prepared_thumbnail = None
+                    thumbnail_status = "READY"
+                except OSError as error:
+                    thumbnail_path.unlink(missing_ok=True)
+                    thumbnail_path = None
+                    thumbnail_status = "FAILED"
+                    thumbnail_error = str(error)[:500] or "无法保存缩略图"
+                    db.execute(
+                        "UPDATE media_blobs SET thumbnail_path = NULL, thumbnail_status = 'FAILED', thumbnail_error = ? WHERE id = ?",
+                        (thumbnail_error, blob_id),
+                    )
+            else:
+                thumbnail_status = "FAILED"
+                thumbnail_error = thumbnail_error or "本地归档文件无法生成缩略图"
+                db.execute(
+                    "UPDATE media_blobs SET thumbnail_path = NULL, thumbnail_status = 'FAILED', thumbnail_error = ? WHERE id = ?",
+                    (thumbnail_error, blob_id),
+                )
+        elif existing_thumbnail_ready:
+            thumbnail_status = "READY"
         location = db.execute("SELECT id, canonical_path FROM archive_locations WHERE blob_id = ? AND destination_id = ?", (blob_id, destination.id)).fetchone()
         if not location:
             location = db.execute("SELECT id, canonical_path FROM archive_locations WHERE destination_id = ? AND canonical_path = ?", (destination.id, location_path)).fetchone()
@@ -3086,9 +3220,13 @@ def record_archive(task: sqlite3.Row, media: sqlite3.Row, path: Path, relative_p
         else:
             location_id = location["id"]
         db.execute("""INSERT INTO archive_items (blob_id, location_id, chat_id, chat_title, message_id, filename, media_type, mime_type, size_bytes, message_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (blob_id, location_id, task["chat_id"], task["chat_title"], media["message_id"], media["filename"], media["media_type"], media["mime_type"], media["size_bytes"], media["message_date"], now()))
-    wake_thumbnail_worker()
-    log_event(logging.INFO, "archive.recorded", "Downloaded media recorded in archive", task_id=task["id"], media_id=media["id"], blob_id=blob_id, destination_id=destination.id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], archive_path=location_path, duplicate_blob=bool(existing))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (blob_id, location_id, task["chat_id"], task["chat_title"], media["message_id"], media["filename"], media_type, media["mime_type"], media["size_bytes"], media["message_date"], now()))
+    if not thumbnail_attempted:
+        wake_thumbnail_worker()
+    if prepared_thumbnail:
+        prepared_thumbnail.unlink(missing_ok=True)
+    log_event(logging.INFO, "archive.recorded", "Downloaded media recorded in archive", task_id=task["id"], media_id=media["id"], blob_id=blob_id, destination_id=destination.id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], archive_path=location_path, duplicate_blob=bool(existing), thumbnail_status=thumbnail_status)
+    return blob_id
 
 
 async def download_demo_media_job(task_id: int, media_id: int) -> None:
