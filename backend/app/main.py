@@ -64,6 +64,7 @@ DOWNLOAD_ERROR_TIMES: deque[float] = deque()
 DOWNLOAD_LAST_ERROR_AT: float | None = None
 DOWNLOAD_ROUND_ROBIN_OFFSET = 0
 DOWNLOAD_CLIENT_LOCK = asyncio.Lock()
+ARCHIVE_DELIVERY_LOCKS: dict[tuple[int, str], tuple[asyncio.Lock, int]] = {}
 CHAT_CACHE_REFRESH_LOCK = asyncio.Lock()
 CHAT_CACHE_SYNC_WORKER: asyncio.Task[None] | None = None
 CHAT_CACHE_REFRESH_TASK: asyncio.Task[None] | None = None
@@ -350,17 +351,82 @@ def ensure_system_local_destination(db: sqlite3.Connection) -> int:
     return int(cursor.lastrowid)
 
 
+def ensure_destination_version(db: sqlite3.Connection, destination: sqlite3.Row, *, revision: int | None = None) -> int:
+    """Return the immutable storage configuration used by a destination revision."""
+    destination_revision = int(revision if revision is not None else destination["config_revision"])
+    existing = db.execute(
+        "SELECT id FROM destination_versions WHERE destination_id = ? AND revision = ?",
+        (destination["id"], destination_revision),
+    ).fetchone()
+    if existing:
+        return int(existing["id"])
+    cursor = db.execute(
+        """INSERT INTO destination_versions
+           (destination_id, revision, kind, local_root, webdav_url, webdav_username, webdav_password, remote_root, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            destination["id"],
+            destination_revision,
+            destination["kind"],
+            destination["local_root"],
+            destination["webdav_url"],
+            destination["webdav_username"],
+            destination["webdav_password"],
+            destination["remote_root"],
+            now(),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def current_destination_version_id(destination_id: int) -> int:
+    with connection() as db:
+        destination = db.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+        if not destination:
+            raise RuntimeError("归档目的地不存在")
+        return ensure_destination_version(db, destination)
+
+
+def destination_from_version(destination: sqlite3.Row, version: sqlite3.Row | None) -> Destination:
+    """Build a storage destination from an immutable version when available."""
+    source = version or destination
+    return Destination(
+        id=int(destination["id"]),
+        name=str(destination["name"]),
+        kind=str(source["kind"]),
+        local_root=Path(source["local_root"]) if source["local_root"] else None,
+        webdav_url=source["webdav_url"],
+        webdav_username=source["webdav_username"],
+        webdav_password=source["webdav_password"],
+        remote_root=str(source["remote_root"] or ""),
+        enabled=bool(destination["enabled"]),
+        is_system=bool(destination["is_system"]),
+    )
+
+
+def destination_version_for_location(location: sqlite3.Row, destination: sqlite3.Row) -> sqlite3.Row | None:
+    version_id = location["destination_version_id"] if "destination_version_id" in location.keys() else None
+    if not version_id:
+        return None
+    with connection() as db:
+        return db.execute("SELECT * FROM destination_versions WHERE id = ? AND destination_id = ?", (version_id, destination["id"])).fetchone()
+
+
 def backfill_archive_locations(db: sqlite3.Connection, local_destination_id: int) -> None:
     """Give legacy blobs and archive rows a physical location without moving files."""
+    destination = db.execute("SELECT * FROM destinations WHERE id = ?", (local_destination_id,)).fetchone()
+    if not destination:
+        return
+    destination_version_id = ensure_destination_version(db, destination)
     blobs = db.execute("SELECT id, canonical_path, created_at FROM media_blobs").fetchall()
     for blob in blobs:
         location = db.execute("SELECT id FROM archive_locations WHERE blob_id = ? AND destination_id = ?", (blob["id"], local_destination_id)).fetchone()
         if not location:
             try:
                 db.execute(
-                    """INSERT INTO archive_locations (blob_id, destination_id, canonical_path, created_at)
-                       VALUES (?, ?, ?, ?)""",
-                    (blob["id"], local_destination_id, blob["canonical_path"], blob["created_at"] or now()),
+                    """INSERT INTO archive_locations (blob_id, destination_id, destination_version_id, canonical_path, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (blob["id"], local_destination_id, destination_version_id, blob["canonical_path"], blob["created_at"] or now()),
                 )
             except sqlite3.IntegrityError:
                 # A legacy database may already contain an identical physical path.
@@ -412,7 +478,32 @@ def destination_for_task(task: Any) -> Destination:
     record = destination_row(int(destination_id) if destination_id is not None else None, include_disabled=True)
     if not record:
         raise RuntimeError("任务归档目的地不存在或已停用")
-    return Destination.from_row(record)
+    version_id = task["destination_version_id"] if "destination_version_id" in task.keys() else None
+    if not version_id:
+        version_id = task_destination_version_id(task)
+    with connection() as db:
+        version = db.execute("SELECT * FROM destination_versions WHERE id = ? AND destination_id = ?", (version_id, record["id"])).fetchone()
+    if not version:
+        raise RuntimeError("任务归档目的地配置版本不存在")
+    return destination_from_version(record, version)
+
+
+def task_destination_version_id(task: Any) -> int:
+    """Return the task's immutable destination revision, filling old in-process rows once."""
+    version_id = task["destination_version_id"] if "destination_version_id" in task.keys() else None
+    if version_id:
+        return int(version_id)
+    destination_id = task["destination_id"] if "destination_id" in task.keys() else None
+    if destination_id is None:
+        raise RuntimeError("任务归档目的地不存在")
+    with connection() as db:
+        destination = db.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+        if not destination:
+            raise RuntimeError("任务归档目的地不存在")
+        version_id = ensure_destination_version(db, destination)
+        if "destination_version_id" in task.keys() and task["id"]:
+            db.execute("UPDATE tasks SET destination_version_id = ? WHERE id = ?", (version_id, task["id"]))
+    return int(version_id)
 
 
 def mask_phone(phone: str) -> str:
@@ -594,8 +685,24 @@ def initialize_database() -> None:
               remote_root TEXT NOT NULL DEFAULT '',
               enabled INTEGER NOT NULL DEFAULT 1,
               is_system INTEGER NOT NULL DEFAULT 0,
+              config_revision INTEGER NOT NULL DEFAULT 1,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
+              CHECK ((kind = 'LOCAL' AND local_root IS NOT NULL AND webdav_url IS NULL)
+                     OR (kind = 'WEBDAV' AND local_root IS NULL AND webdav_url IS NOT NULL))
+            );
+            CREATE TABLE IF NOT EXISTS destination_versions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              destination_id INTEGER NOT NULL REFERENCES destinations(id) ON DELETE CASCADE,
+              revision INTEGER NOT NULL,
+              kind TEXT NOT NULL CHECK (kind IN ('LOCAL', 'WEBDAV')),
+              local_root TEXT,
+              webdav_url TEXT,
+              webdav_username TEXT,
+              webdav_password TEXT,
+              remote_root TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              UNIQUE(destination_id, revision),
               CHECK ((kind = 'LOCAL' AND local_root IS NOT NULL AND webdav_url IS NULL)
                      OR (kind = 'WEBDAV' AND local_root IS NULL AND webdav_url IS NOT NULL))
             );
@@ -606,6 +713,7 @@ def initialize_database() -> None:
               chat_handle TEXT,
               archive_timezone TEXT,
               destination_id INTEGER REFERENCES destinations(id),
+              destination_version_id INTEGER REFERENCES destination_versions(id),
               filters_json TEXT NOT NULL,
               status TEXT NOT NULL,
               total_count INTEGER NOT NULL DEFAULT 0,
@@ -636,6 +744,7 @@ def initialize_database() -> None:
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               blob_id INTEGER NOT NULL REFERENCES media_blobs(id) ON DELETE CASCADE,
               destination_id INTEGER NOT NULL REFERENCES destinations(id),
+              destination_version_id INTEGER REFERENCES destination_versions(id),
               canonical_path TEXT NOT NULL,
               created_at TEXT NOT NULL,
               UNIQUE(blob_id, destination_id),
@@ -801,7 +910,14 @@ def initialize_database() -> None:
         if DEMO_MODE and db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0:
             seed_demo_data(db)
         local_destination_id = ensure_system_local_destination(db)
+        for destination in db.execute("SELECT * FROM destinations").fetchall():
+            ensure_destination_version(db, destination)
         db.execute("UPDATE tasks SET destination_id = ? WHERE destination_id IS NULL", (local_destination_id,))
+        for task in db.execute("SELECT id, destination_id, destination_version_id FROM tasks WHERE destination_version_id IS NULL").fetchall():
+            destination = db.execute("SELECT * FROM destinations WHERE id = ?", (task["destination_id"],)).fetchone()
+            if destination:
+                version_id = ensure_destination_version(db, destination)
+                db.execute("UPDATE tasks SET destination_version_id = ? WHERE id = ?", (version_id, task["id"]))
         backfill_archive_locations(db, local_destination_id)
     reconcile_thumbnail_records()
     cleanup_preview_cache()
@@ -895,7 +1011,13 @@ def blob_location(blob_id: int) -> tuple[sqlite3.Row, Destination] | None:
         if not location:
             return None
         destination_record = db.execute("SELECT * FROM destinations WHERE id = ?", (location["destination_id"],)).fetchone()
-    return (location, Destination.from_row(destination_record)) if destination_record else None
+        version = None
+        if location["destination_version_id"]:
+            version = db.execute(
+                "SELECT * FROM destination_versions WHERE id = ? AND destination_id = ?",
+                (location["destination_version_id"], location["destination_id"]),
+            ).fetchone()
+    return (location, destination_from_version(destination_record, version)) if destination_record else None
 
 
 def reconcile_thumbnail_records() -> None:
@@ -1516,6 +1638,11 @@ async def structured_access_log(request: Request, call_next: Any) -> Any:
             error_type=type(error).__name__,
         )
         raise
+    if request.method == "GET" and request.url.path.startswith("/api/archives/"):
+        # Archive IDs may be reused when the SQLite data directory is
+        # intentionally recreated.  Never let the browser keep either the
+        # archive metadata or its media response across that boundary.
+        response.headers["Cache-Control"] = "no-store"
     log_event(
         logging.INFO,
         "http.request_completed",
@@ -1623,11 +1750,12 @@ async def create_destination(payload: DestinationSettings) -> dict[str, Any]:
     timestamp = now()
     with connection() as db:
         cursor = db.execute(
-            """INSERT INTO destinations (name, kind, local_root, webdav_url, webdav_username, webdav_password, remote_root, enabled, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO destinations (name, kind, local_root, webdav_url, webdav_username, webdav_password, remote_root, enabled, config_revision, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
             (*values.values(), timestamp, timestamp),
         )
         record = db.execute("SELECT * FROM destinations WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        ensure_destination_version(db, record)
     log_event(logging.INFO, "destination.created", "Archive destination created", destination_id=record["id"], destination_kind=record["kind"], destination_name=record["name"])
     return destination_payload(record)
 
@@ -1646,12 +1774,19 @@ async def update_destination(destination_id: int, payload: DestinationUpdateSett
                 raise HTTPException(409, "系统本地目的地的目录不能修改")
             values["enabled"] = True
         ensure_local_destination_root(values)
+        config_fields = ("kind", "local_root", "webdav_url", "webdav_username", "webdav_password", "remote_root")
+        config_changed = any(existing[field] != values[field] for field in config_fields)
+        revision = int(existing["config_revision"])
+        if config_changed:
+            revision += 1
         db.execute(
-            """UPDATE destinations SET name = ?, kind = ?, local_root = ?, webdav_url = ?, webdav_username = ?, webdav_password = ?, remote_root = ?, enabled = ?, updated_at = ?
+            """UPDATE destinations SET name = ?, kind = ?, local_root = ?, webdav_url = ?, webdav_username = ?, webdav_password = ?, remote_root = ?, enabled = ?, config_revision = ?, updated_at = ?
                WHERE id = ?""",
-            (*values.values(), now(), destination_id),
+            (*values.values(), revision, now(), destination_id),
         )
         record = db.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+        if config_changed:
+            ensure_destination_version(db, record, revision=revision)
     log_event(logging.INFO, "destination.updated", "Archive destination updated", destination_id=destination_id, destination_kind=record["kind"], destination_name=record["name"])
     return destination_payload(record)
 
@@ -1916,7 +2051,7 @@ def list_tasks() -> list[dict[str, Any]]:
         records = db.execute("SELECT * FROM tasks ORDER BY CASE status WHEN 'DOWNLOADING' THEN 0 WHEN 'PAUSED' THEN 1 ELSE 2 END, updated_at DESC").fetchall()
     return [
         {
-            **dict(record),
+            **{key: value for key, value in dict(record).items() if key != "destination_version_id"},
             "filters": json.loads(record["filters_json"]),
             "destination": destination_payload(destination_row(record["destination_id"], include_disabled=True)) if destination_row(record["destination_id"], include_disabled=True) else None,
         }
@@ -1933,7 +2068,7 @@ def get_task(task_id: int) -> dict[str, Any]:
         raise HTTPException(404, "任务不存在")
     destination = destination_row(record["destination_id"], include_disabled=True)
     return {
-        **dict(record),
+        **{key: value for key, value in dict(record).items() if key != "destination_version_id"},
         "filters": json.loads(record["filters_json"]),
         "destination": destination_payload(destination) if destination else None,
         "activeMedia": [media_payload(item) for item in active_media],
@@ -2030,9 +2165,115 @@ def archive_destination(task: Any, media: Any) -> Path:
 
 
 def archive_stage_path(task: Any, media: Any, destination: Destination, relative_path: Path) -> Path:
-    if destination.is_local:
-        return destination.local_path(relative_path).with_suffix(Path(relative_path).suffix + ".part")
+    # Staging is deliberately independent of the final destination path.  A
+    # final-path ``.part`` file can be shared by two tasks with the same
+    # logical filename, and a retry could then mistake another download for a
+    # completed file.  The task/media identity is stable across retries while
+    # still being unique for concurrent archive jobs.
     return STAGING_ROOT / f"task-{task['id']}-media-{media['id']}{Path(relative_path).suffix}.part"
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def archive_path_text(path: str | Path) -> str:
+    return str(path).replace(os.sep, "/")
+
+
+def archive_location_at_path(destination_id: int, relative_path: Path) -> sqlite3.Row | None:
+    path_text = archive_path_text(relative_path)
+    with connection() as db:
+        return db.execute(
+            """SELECT l.*, b.content_hash
+               FROM archive_locations l JOIN media_blobs b ON b.id = l.blob_id
+               WHERE l.destination_id = ? AND l.canonical_path = ?""",
+            (destination_id, path_text),
+        ).fetchone()
+
+
+def archive_location_for_content(destination_id: int, content_hash: str) -> sqlite3.Row | None:
+    with connection() as db:
+        return db.execute(
+            """SELECT l.*, b.content_hash
+               FROM archive_locations l JOIN media_blobs b ON b.id = l.blob_id
+               WHERE l.destination_id = ? AND b.content_hash = ?
+               ORDER BY l.id LIMIT 1""",
+            (destination_id, content_hash),
+        ).fetchone()
+
+
+def collision_relative_path(relative_path: Path, content_hash: str, attempt: int) -> Path:
+    suffix = relative_path.suffix
+    stem = relative_path.name[:-len(suffix)] if suffix else relative_path.name
+    marker = f"__hash-{content_hash[:12]}"
+    if attempt:
+        marker += f"-{attempt + 1}"
+    return relative_path.with_name(f"{stem}{marker}{suffix}")
+
+
+def resolve_archive_relative_path(destination: Destination, base_path: Path, content_hash: str) -> Path:
+    """Choose a path that cannot associate a new hash with an existing file."""
+    existing_content = archive_location_for_content(destination.id, content_hash)
+    if existing_content:
+        return Path(existing_content["canonical_path"])
+
+    owner = archive_location_at_path(destination.id, base_path)
+    if not owner or owner["content_hash"] == content_hash:
+        if destination.is_local and not owner:
+            target = destination.local_path(base_path)
+            if target.exists():
+                owner = True
+            else:
+                return base_path
+        else:
+            return base_path
+
+    for attempt in range(100):
+        candidate = collision_relative_path(base_path, content_hash, attempt)
+        candidate_owner = archive_location_at_path(destination.id, candidate)
+        if candidate_owner and candidate_owner["content_hash"] != content_hash:
+            continue
+        if not candidate_owner and destination.is_local and destination.local_path(candidate).exists():
+            continue
+        if not candidate_owner or candidate_owner["content_hash"] == content_hash:
+            log_event(
+                logging.WARNING,
+                "archive.path_collision",
+                "Archive path collision resolved with a content-specific path",
+                destination_id=destination.id,
+                original_path=archive_path_text(base_path),
+                resolved_path=archive_path_text(candidate),
+                content_hash_prefix=content_hash[:12],
+            )
+            return candidate
+    raise StorageError("无法为归档文件分配唯一路径")
+
+
+@asynccontextmanager
+async def archive_delivery_guard(destination_id: int, base_path: Path) -> AsyncIterator[None]:
+    """Serialize path selection and delivery for one logical archive path."""
+    key = (destination_id, archive_path_text(base_path))
+    entry = ARCHIVE_DELIVERY_LOCKS.get(key)
+    if entry:
+        lock, users = entry
+        ARCHIVE_DELIVERY_LOCKS[key] = (lock, users + 1)
+    else:
+        lock = asyncio.Lock()
+        ARCHIVE_DELIVERY_LOCKS[key] = (lock, 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        lock, users = ARCHIVE_DELIVERY_LOCKS[key]
+        if users <= 1:
+            ARCHIVE_DELIVERY_LOCKS.pop(key, None)
+        else:
+            ARCHIVE_DELIVERY_LOCKS[key] = (lock, users - 1)
 
 
 def scan_cache_key(payload: ScanRequest) -> str:
@@ -2935,13 +3176,11 @@ async def download_media_job(task_id: int, media_id: int) -> None:
         if not task or not media or current_task_status(task_id) not in {"DOWNLOADING", "RETRYING"}:
             return
         log_event(logging.INFO, "download.started", "Telegram media download started", task_id=task_id, media_id=media_id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], media_type=media["media_type"], size_bytes=media["size_bytes"])
+        destination_version_id = task_destination_version_id(task)
         destination = destination_for_task(task)
-        relative_path = archive_relative_path(task, media)
-        part = archive_stage_path(task, media, destination, relative_path)
+        base_relative_path = archive_relative_path(task, media)
+        part = archive_stage_path(task, media, destination, base_relative_path)
         part.parent.mkdir(parents=True, exist_ok=True)
-        final_path = destination.local_path(relative_path) if destination.is_local else None
-        if final_path:
-            final_path.parent.mkdir(parents=True, exist_ok=True)
         preview_adopted = False
         if media["preview_cache_id"]:
             with connection() as db:
@@ -2989,6 +3228,7 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             result = await client.download_media(message, file=str(part), progress_callback=progress)
             if not result:
                 raise RuntimeError("Telegram 未返回下载文件")
+        content_hash = file_sha256(part)
         prepared_thumbnail: Path | None = None
         thumbnail_error: str | None = None
         thumbnail_attempted = media["media_type"] in ARCHIVE_THUMBNAIL_MEDIA_TYPES
@@ -3000,17 +3240,25 @@ async def download_media_job(task_id: int, media_id: int) -> None:
                     task_id=task_id,
                     media_id=media_id,
                 )
-            await destination.upload_file(part, relative_path)
-            archive_path = final_path if final_path else part
-            record_archive(
-                task,
-                media,
-                archive_path,
-                relative_path,
-                prepared_thumbnail=prepared_thumbnail,
-                thumbnail_error=thumbnail_error,
-                thumbnail_attempted=thumbnail_attempted,
-            )
+            async with archive_delivery_guard(destination.id, base_relative_path):
+                relative_path = resolve_archive_relative_path(destination, base_relative_path, content_hash)
+                final_path = destination.local_path(relative_path) if destination.is_local else None
+                if final_path:
+                    final_path.parent.mkdir(parents=True, exist_ok=True)
+                await destination.upload_file(part, relative_path)
+                archive_path = final_path if final_path else part
+                record_archive(
+                    task,
+                    media,
+                    archive_path,
+                    relative_path,
+                    destination=destination,
+                    destination_version_id=destination_version_id,
+                    content_hash=content_hash,
+                    prepared_thumbnail=prepared_thumbnail,
+                    thumbnail_error=thumbnail_error,
+                    thumbnail_attempted=thumbnail_attempted,
+                )
             prepared_thumbnail = None
             if not destination.is_local:
                 part.unlink(missing_ok=True)
@@ -3147,11 +3395,16 @@ def record_archive(
     path: Path,
     relative_path: Path | None = None,
     *,
+    destination: Destination | None = None,
+    destination_version_id: int | None = None,
+    content_hash: str | None = None,
     prepared_thumbnail: Path | None = None,
     thumbnail_error: str | None = None,
     thumbnail_attempted: bool = False,
 ) -> int:
-    destination = destination_for_task(task)
+    destination = destination or destination_for_task(task)
+    if destination_version_id is None:
+        destination_version_id = task_destination_version_id(task)
     if relative_path is None:
         if destination.is_local and destination.local_root:
             try:
@@ -3160,15 +3413,24 @@ def record_archive(
                 relative_path = archive_relative_path(task, media)
         else:
             relative_path = archive_relative_path(task, media)
-    location_path = str(relative_path).replace(os.sep, "/")
+    location_path = archive_path_text(relative_path)
     legacy_blob_path = str(path) if destination.is_local else location_path
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    actual_digest = file_sha256(path)
+    if content_hash and content_hash != actual_digest:
+        raise StorageError("归档文件在索引前发生变化，已拒绝写入归档索引")
+    digest = actual_digest
     media_type = str(media["media_type"])
     thumbnail_capable = media_type in ARCHIVE_THUMBNAIL_MEDIA_TYPES
     thumbnail_status = "UNAVAILABLE" if not thumbnail_capable else "PENDING"
     if thumbnail_attempted and thumbnail_capable:
         thumbnail_status = "PROCESSING"
     with connection() as db:
+        version = db.execute(
+            "SELECT id FROM destination_versions WHERE id = ? AND destination_id = ?",
+            (destination_version_id, destination.id),
+        ).fetchone()
+        if not version:
+            raise StorageError("归档目的地配置版本不存在")
         existing = db.execute("SELECT * FROM media_blobs WHERE content_hash = ?", (digest,)).fetchone()
         if existing:
             blob_id = existing["id"]
@@ -3179,6 +3441,24 @@ def record_archive(
                 (digest, legacy_blob_path, thumbnail_status, thumbnail_error if thumbnail_status == "FAILED" else None, media["size_bytes"], media_type, now()),
             ).lastrowid
         blob_id = int(blob_id)
+
+        location = db.execute(
+            """SELECT l.id, l.blob_id, l.canonical_path, b.content_hash
+               FROM archive_locations l JOIN media_blobs b ON b.id = l.blob_id
+               WHERE l.blob_id = ? AND l.destination_id = ?""",
+            (blob_id, destination.id),
+        ).fetchone()
+        if location and archive_path_text(location["canonical_path"]) != location_path:
+            raise StorageError("同一内容在该目的地已有归档位置，不能改写路径")
+        if not location:
+            location = db.execute(
+                """SELECT l.id, l.blob_id, l.canonical_path, b.content_hash
+                   FROM archive_locations l JOIN media_blobs b ON b.id = l.blob_id
+                   WHERE l.destination_id = ? AND l.canonical_path = ?""",
+                (destination.id, location_path),
+            ).fetchone()
+        if location and (location["blob_id"] != blob_id or location["content_hash"] != digest):
+            raise StorageError("归档路径已被其他内容占用")
 
         existing_thumbnail = path_in_root(existing["thumbnail_path"], THUMBNAIL_ROOT) if existing and existing["thumbnail_path"] else None
         existing_thumbnail_ready = bool(existing and existing["thumbnail_status"] == "READY" and existing_thumbnail and existing_thumbnail.is_file())
@@ -3212,14 +3492,11 @@ def record_archive(
                 )
         elif existing_thumbnail_ready:
             thumbnail_status = "READY"
-        location = db.execute("SELECT id, canonical_path FROM archive_locations WHERE blob_id = ? AND destination_id = ?", (blob_id, destination.id)).fetchone()
-        if not location:
-            location = db.execute("SELECT id, canonical_path FROM archive_locations WHERE destination_id = ? AND canonical_path = ?", (destination.id, location_path)).fetchone()
         if not location:
             location_id = db.execute(
-                """INSERT INTO archive_locations (blob_id, destination_id, canonical_path, created_at)
-                   VALUES (?, ?, ?, ?)""",
-                (blob_id, destination.id, location_path, now()),
+                """INSERT INTO archive_locations (blob_id, destination_id, destination_version_id, canonical_path, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (blob_id, destination.id, destination_version_id, location_path, now()),
             ).lastrowid
         else:
             location_id = location["id"]
@@ -3338,12 +3615,13 @@ def start_pending_task_workers() -> None:
 async def create_task(payload: ScanRequest) -> dict[str, Any]:
     created = now()
     destination_id = resolved_destination_id(payload.destination_id)
+    destination_version_id = current_destination_version_id(destination_id)
     with connection() as db:
         setting = db.execute("SELECT archive_timezone FROM app_settings WHERE id = 1").fetchone()
         if not setting or not setting["archive_timezone"]:
             raise HTTPException(409, "请先完成归档时区设置")
-        cursor = db.execute("""INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, destination_id, filters_json, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?)""", (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], destination_id, payload.filters.model_dump_json(), created, created))
+        cursor = db.execute("""INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, destination_id, destination_version_id, filters_json, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?)""", (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], destination_id, destination_version_id, payload.filters.model_dump_json(), created, created))
     log_event(logging.INFO, "task.created", "Archive task created", task_id=cursor.lastrowid, chat_id=payload.chat_id, chat_title=payload.chat_title, chat_handle=payload.chat_handle, archive_timezone=setting["archive_timezone"], destination_id=destination_id, filters=payload.filters.model_dump())
     start_task_worker(cursor.lastrowid)
     return get_task(cursor.lastrowid)
@@ -3397,14 +3675,15 @@ async def create_selection_task(payload: SelectionTaskRequest) -> dict[str, Any]
     if preview_workers:
         await asyncio.gather(*preview_workers, return_exceptions=True)
     created = now()
+    destination_version_id = current_destination_version_id(destination_id)
     with connection() as db:
         setting = db.execute("SELECT archive_timezone FROM app_settings WHERE id = 1").fetchone()
         if not setting or not setting["archive_timezone"]:
             raise HTTPException(409, "请先完成归档时区设置")
         cursor = db.execute(
-            """INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, destination_id, filters_json, status, total_count, total_bytes, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?)""",
-            (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], destination_id, json.dumps({"mode": "selection", "message_ids": [item[0] for item in accepted]}, ensure_ascii=False), len(accepted), sum(item[4] for item in accepted), created, created),
+            """INSERT INTO tasks (chat_id, chat_title, chat_handle, archive_timezone, destination_id, destination_version_id, filters_json, status, total_count, total_bytes, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?)""",
+            (payload.chat_id, payload.chat_title, payload.chat_handle, setting["archive_timezone"], destination_id, destination_version_id, json.dumps({"mode": "selection", "message_ids": [item[0] for item in accepted]}, ensure_ascii=False), len(accepted), sum(item[4] for item in accepted), created, created),
         )
         task_id = cursor.lastrowid
         db.executemany(
@@ -3555,9 +3834,9 @@ def archive_chats(destination_id: int | None = None) -> list[dict[str, Any]]:
 def archive_record(item_id: int) -> sqlite3.Row:
     with connection() as db:
         record = db.execute(
-            """SELECT a.*, b.canonical_path AS legacy_canonical_path, b.thumbnail_path, b.thumbnail_status, b.thumbnail_error,
+            """SELECT a.*, b.content_hash, b.canonical_path AS legacy_canonical_path, b.thumbnail_path, b.thumbnail_status, b.thumbnail_error,
                       COALESCE(l.canonical_path, b.canonical_path) AS canonical_path,
-                      l.id AS location_id, l.destination_id, l.canonical_path AS location_path,
+                      l.id AS location_id, l.destination_id, l.destination_version_id, l.canonical_path AS location_path,
                       d.name AS destination_name, d.kind AS destination_kind
                FROM archive_items a
                JOIN media_blobs b ON a.blob_id = b.id
@@ -3573,12 +3852,19 @@ def archive_record(item_id: int) -> sqlite3.Row:
 
 def archive_payload(record: sqlite3.Row) -> dict[str, Any]:
     payload = dict(record)
+    payload.pop("destination_version_id", None)
+    cache_key = record["content_hash"] or record["created_at"] or record["id"]
+    cache_suffix = quote(str(cache_key), safe="")
     item_id = record["id"]
     destination = destination_row(record["destination_id"], include_disabled=True) if record["destination_id"] else destination_row(None, include_disabled=True)
     payload["destination"] = destination_payload(destination) if destination else None
-    payload["thumbnail_url"] = f"/api/archives/media/{item_id}/thumbnail" if record["thumbnail_status"] == "READY" else None
-    payload["content_url"] = f"/api/archives/media/{item_id}/content" if record["media_type"] in {"PHOTO", "VIDEO"} else None
-    payload["download_url"] = f"/api/archives/media/{item_id}/download"
+    # Item IDs can be reused after the database is recreated.  Include the
+    # immutable blob identity so a browser cannot combine a cached thumbnail
+    # from the previous database with a newly-created content URL.
+    payload["thumbnail_url"] = f"/api/archives/media/{item_id}/thumbnail?v={cache_suffix}" if record["thumbnail_status"] == "READY" else None
+    payload["content_url"] = f"/api/archives/media/{item_id}/content?v={cache_suffix}" if record["media_type"] in {"PHOTO", "VIDEO"} else None
+    payload["download_url"] = f"/api/archives/media/{item_id}/download?v={cache_suffix}"
+    payload.pop("content_hash", None)
     return payload
 
 
@@ -3587,7 +3873,13 @@ def archive_record_destination(record: sqlite3.Row) -> Destination:
     destination = destination_row(destination_id, include_disabled=True) if destination_id else destination_row(None, include_disabled=True)
     if not destination:
         raise HTTPException(503, "归档目的地配置不存在")
-    return Destination.from_row(destination)
+    version_id = record["destination_version_id"] if "destination_version_id" in record.keys() else None
+    if not version_id:
+        return Destination.from_row(destination)
+    version = destination_version_for_location(record, destination)
+    if not version:
+        raise HTTPException(503, "归档目的地配置版本不存在")
+    return destination_from_version(destination, version)
 
 
 def parse_range_header(value: str | None, total: int) -> tuple[int, int] | None:
@@ -3623,7 +3915,7 @@ async def archive_file_response(request: Request, item_id: int, kind: Literal["t
         filename = f"{record['filename']}.jpg"
         if not file_path or not file_path.is_file():
             raise HTTPException(404, "归档文件不存在")
-        return FileResponse(file_path, media_type=media_type, filename=filename, content_disposition_type="inline", headers={"Cache-Control": "private, max-age=86400"})
+        return FileResponse(file_path, media_type=media_type, filename=filename, content_disposition_type="inline", headers={"Cache-Control": "private, no-store"})
 
     destination = archive_record_destination(record)
     location_path = record["location_path"] or record["canonical_path"]
@@ -3638,7 +3930,7 @@ async def archive_file_response(request: Request, item_id: int, kind: Literal["t
             raise HTTPException(404, "归档文件不存在") from error
         if not file_path.is_file():
             raise HTTPException(404, "归档文件不存在")
-        return FileResponse(file_path, media_type=media_type, filename=filename, content_disposition_type="attachment" if kind == "download" else "inline", headers={"Cache-Control": "private, max-age=86400"})
+        return FileResponse(file_path, media_type=media_type, filename=filename, content_disposition_type="attachment" if kind == "download" else "inline", headers={"Cache-Control": "private, no-store"})
 
     if not record["location_path"]:
         raise HTTPException(404, "远端归档位置不存在")
@@ -3658,7 +3950,7 @@ async def archive_file_response(request: Request, item_id: int, kind: Literal["t
             await destination.close_remote_stream(client, response)
 
     disposition = "attachment" if kind == "download" else "inline"
-    headers = {"Cache-Control": "private, max-age=86400", "Accept-Ranges": "bytes", "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(filename)}"}
+    headers = {"Cache-Control": "private, no-store", "Accept-Ranges": "bytes", "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(filename)}"}
     status_code = 200
     if selected_range:
         start, end = selected_range
@@ -3689,9 +3981,9 @@ def archive_media(chat_id: str | None = None, media_type: str | None = None, mon
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with connection() as db:
         records = db.execute(
-            f"""SELECT a.*, b.canonical_path AS legacy_canonical_path, b.thumbnail_path, b.thumbnail_status, b.thumbnail_error,
+            f"""SELECT a.*, b.content_hash, b.canonical_path AS legacy_canonical_path, b.thumbnail_path, b.thumbnail_status, b.thumbnail_error,
                       COALESCE(l.canonical_path, b.canonical_path) AS canonical_path,
-                      l.id AS location_id, l.destination_id, l.canonical_path AS location_path,
+                      l.id AS location_id, l.destination_id, l.destination_version_id, l.canonical_path AS location_path,
                       d.name AS destination_name, d.kind AS destination_kind
             FROM archive_items a JOIN media_blobs b ON a.blob_id = b.id
             LEFT JOIN archive_locations l ON l.id = a.location_id

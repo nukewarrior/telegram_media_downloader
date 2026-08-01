@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import shutil
 import tempfile
@@ -157,6 +158,82 @@ class DestinationTests(unittest.TestCase):
             enabled = client.post(f"/api/destinations/{destination['id']}/enable")
             self.assertTrue(enabled.json()["enabled"])
 
+    def test_archive_and_tasks_keep_the_destination_revision_used_at_creation(self) -> None:
+        server = MockWebDAV()
+        source = TEST_DATA / "versioned.jpg"
+        Image.new("RGB", (800, 500), (75, 145, 98)).save(source, format="JPEG")
+        source_bytes = source.read_bytes()
+        server.files["/dav/archive/root/versioned.jpg"] = source_bytes
+        destination_id = self.create_webdav_destination("versioned-dav")
+        old_version_id = main.current_destination_version_id(destination_id)
+
+        with patch.object(main, "start_task_worker"):
+            old_task = asyncio.run(main.create_task(main.ScanRequest(
+                chat_id="version-chat",
+                chat_title="版本聊天",
+                filters=main.TaskFilters(),
+                destination_id=destination_id,
+            )))
+
+        with main.connection() as db:
+            blob_id = db.execute(
+                """INSERT INTO media_blobs (content_hash, canonical_path, thumbnail_status, size_bytes, media_type, created_at)
+                   VALUES (?, 'versioned.jpg', 'PENDING', ?, 'PHOTO', ?)""",
+                (main.file_sha256(source), len(source_bytes), main.now()),
+            ).lastrowid
+            location_id = db.execute(
+                """INSERT INTO archive_locations (blob_id, destination_id, destination_version_id, canonical_path, created_at)
+                   VALUES (?, ?, ?, 'versioned.jpg', ?)""",
+                (blob_id, destination_id, old_version_id, main.now()),
+            ).lastrowid
+            item_id = db.execute(
+                """INSERT INTO archive_items (blob_id, location_id, chat_id, chat_title, message_id, filename, media_type, mime_type, size_bytes, message_date, created_at)
+                   VALUES (?, ?, 'version-chat', '版本聊天', 9001, 'versioned.jpg', 'PHOTO', 'image/jpeg', ?, ?, ?)""",
+                (blob_id, location_id, len(source_bytes), main.now(), main.now()),
+            ).lastrowid
+            blob = db.execute("SELECT * FROM media_blobs WHERE id = ?", (blob_id,)).fetchone()
+
+        updated = asyncio.run(main.update_destination(destination_id, main.DestinationUpdateSettings(
+            name="versioned-dav",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/new-dav",
+            webdav_username="user-v2",
+            remote_root="archive/new-root",
+            enabled=True,
+        )))
+        self.assertEqual(updated["id"], destination_id)
+
+        with patch.object(main, "start_task_worker"):
+            new_task = asyncio.run(main.create_task(main.ScanRequest(
+                chat_id="version-chat-new",
+                chat_title="版本聊天新任务",
+                filters=main.TaskFilters(),
+                destination_id=destination_id,
+            )))
+
+        with main.connection() as db:
+            old_task_row = db.execute("SELECT * FROM tasks WHERE id = ?", (old_task["id"],)).fetchone()
+            new_task_row = db.execute("SELECT * FROM tasks WHERE id = ?", (new_task["id"],)).fetchone()
+            revisions = db.execute("SELECT revision FROM destination_versions WHERE destination_id = ? ORDER BY revision", (destination_id,)).fetchall()
+        self.assertEqual([revision["revision"] for revision in revisions], [1, 2])
+        self.assertEqual(main.destination_for_task(old_task_row).remote_root, "archive/root")
+        self.assertEqual(main.destination_for_task(new_task_row).remote_root, "archive/new-root")
+        self.assertNotEqual(old_task_row["destination_version_id"], new_task_row["destination_version_id"])
+
+        async def client_factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        with patch.object(Destination, "_client", client_factory):
+            asyncio.run(main.generate_thumbnail(blob))
+            with TestClient(main.app) as client:
+                content = client.get(f"/api/archives/media/{item_id}/content")
+                detail = client.get(f"/api/archives/media/{item_id}").json()
+        self.assertEqual(content.status_code, 200)
+        self.assertEqual(content.content, source_bytes)
+        self.assertEqual(detail["destination"]["id"], destination_id)
+        self.assertIn(("GET", "/dav/archive/root/versioned.jpg"), server.requests)
+        self.assertNotIn(("GET", "/new-dav/archive/new-root/versioned.jpg"), server.requests)
+
     def test_webdav_destination_update_keeps_id_password_and_disabled_state(self) -> None:
         destination_id = self.create_webdav_destination("editable-dav", enabled=False)
         with main.connection() as db:
@@ -305,6 +382,123 @@ class DestinationTests(unittest.TestCase):
             self.assertIsNone(first_item["content_url"])
             self.assertEqual(first_item["destination"]["id"], first_id)
             self.assertEqual(second_item["destination"]["id"], second_id)
+
+    def test_same_path_with_different_content_keeps_two_archive_items_and_matching_previews(self) -> None:
+        destination_id = self.create_local_destination("collision-local")
+        destination = Destination.from_row(main.destination_row(destination_id, include_disabled=True))
+        version_id = main.current_destination_version_id(destination_id)
+        with main.connection() as db:
+            task_ids: list[int] = []
+            media_ids: list[int] = []
+            for message_id in (501, 502):
+                task_id = db.execute(
+                    """INSERT INTO tasks (chat_id, chat_title, archive_timezone, destination_id, destination_version_id, filters_json, status, created_at, updated_at)
+                       VALUES ('collision-chat', '冲突聊天', 'Asia/Shanghai', ?, ?, '{}', 'DOWNLOADING', ?, ?)""",
+                    (destination_id, version_id, main.now(), main.now()),
+                ).lastrowid
+                media_id = db.execute(
+                    """INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date)
+                       VALUES (?, ?, 'same.jpg', 'PHOTO', 'image/jpeg', 0, ?)""",
+                    (task_id, message_id, "2026-07-30T04:00:00+00:00"),
+                ).lastrowid
+                task_ids.append(int(task_id))
+                media_ids.append(int(media_id))
+            tasks = [db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone() for task_id in task_ids]
+            media = [db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone() for media_id in media_ids]
+
+        relative = main.archive_relative_path(tasks[0], media[0])
+        first_path = destination.local_path(relative)
+        first_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (900, 600), (220, 45, 40)).save(first_path, format="JPEG")
+        first_thumbnail, first_error = asyncio.run(main.prepare_archive_thumbnail(first_path, "PHOTO", task_id=tasks[0]["id"], media_id=media[0]["id"]))
+        self.assertIsNone(first_error)
+        main.record_archive(
+            tasks[0], media[0], first_path, relative,
+            destination=destination,
+            destination_version_id=version_id,
+            content_hash=main.file_sha256(first_path),
+            prepared_thumbnail=first_thumbnail,
+            thumbnail_attempted=True,
+        )
+
+        second_source = TEST_DATA / "collision-source.jpg"
+        Image.new("RGB", (900, 600), (40, 70, 220)).save(second_source, format="JPEG")
+        second_hash = main.file_sha256(second_source)
+        with self.assertRaises(StorageError):
+            main.record_archive(
+                tasks[1], media[1], second_source, relative,
+                destination=destination,
+                destination_version_id=version_id,
+                content_hash=second_hash,
+            )
+        second_relative = main.resolve_archive_relative_path(destination, relative, second_hash)
+        self.assertNotEqual(second_relative, relative)
+        self.assertIn(f"__hash-{second_hash[:12]}", second_relative.name)
+        second_path = destination.local_path(second_relative)
+        second_path.parent.mkdir(parents=True, exist_ok=True)
+        second_path.write_bytes(second_source.read_bytes())
+        second_thumbnail, second_error = asyncio.run(main.prepare_archive_thumbnail(second_path, "PHOTO", task_id=tasks[1]["id"], media_id=media[1]["id"]))
+        self.assertIsNone(second_error)
+        main.record_archive(
+            tasks[1], media[1], second_path, second_relative,
+            destination=destination,
+            destination_version_id=version_id,
+            content_hash=second_hash,
+            prepared_thumbnail=second_thumbnail,
+            thumbnail_attempted=True,
+        )
+
+        with main.connection() as db:
+            records = db.execute(
+                """SELECT a.id, l.canonical_path, b.content_hash
+                   FROM archive_items a JOIN archive_locations l ON l.id = a.location_id
+                   JOIN media_blobs b ON b.id = a.blob_id
+                   WHERE l.destination_id = ? ORDER BY a.id""",
+                (destination_id,),
+            ).fetchall()
+        self.assertEqual(len(records), 2)
+        with TestClient(main.app) as client:
+            for record, expected_path in zip(records, (first_path, second_path)):
+                content = client.get(f"/api/archives/media/{record['id']}/content")
+                thumbnail = client.get(f"/api/archives/media/{record['id']}/thumbnail")
+                self.assertEqual(content.status_code, 200)
+                self.assertEqual(thumbnail.status_code, 200)
+                self.assertEqual(content.content, expected_path.read_bytes())
+                with Image.open(io.BytesIO(thumbnail.content)) as opened:
+                    pixel = opened.convert("RGB").getpixel((0, 0))
+                if expected_path == first_path:
+                    self.assertGreater(pixel[0], pixel[2])
+                else:
+                    self.assertGreater(pixel[2], pixel[0])
+
+    def test_archive_delivery_guard_serializes_same_destination_base_path(self) -> None:
+        async def exercise() -> list[str]:
+            main.ARCHIVE_DELIVERY_LOCKS.clear()
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            order: list[str] = []
+
+            async def first() -> None:
+                async with main.archive_delivery_guard(901, Path("same/base.jpg")):
+                    order.append("first-enter")
+                    entered.set()
+                    await release.wait()
+                    order.append("first-exit")
+
+            async def second() -> None:
+                async with main.archive_delivery_guard(901, Path("same/base.jpg")):
+                    order.append("second-enter")
+
+            first_task = asyncio.create_task(first())
+            await entered.wait()
+            second_task = asyncio.create_task(second())
+            await asyncio.sleep(0)
+            self.assertEqual(order, ["first-enter"])
+            release.set()
+            await asyncio.gather(first_task, second_task)
+            return order
+
+        self.assertEqual(asyncio.run(exercise()), ["first-enter", "first-exit", "second-enter"])
 
     def test_destination_retry_reuses_a_completed_local_staging_file(self) -> None:
         with main.connection() as db:

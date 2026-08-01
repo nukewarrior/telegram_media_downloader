@@ -23,6 +23,22 @@ class DownloadPathTests(unittest.TestCase):
         self.assertNotIn("/55/", str(destination))
         self.assertEqual(destination.with_suffix(destination.suffix + ".part").parent, destination.parent)
 
+    def test_staging_path_is_scoped_to_task_and_media(self) -> None:
+        destination = main.Destination(
+            id=7,
+            name="本地",
+            kind="LOCAL",
+            local_root=Path(main.DOWNLOAD_ROOT),
+        )
+        relative = Path("chat/2026/07/report__msg-55.jpg")
+
+        first = main.archive_stage_path({"id": 1}, {"id": 2}, destination, relative)
+        second = main.archive_stage_path({"id": 3}, {"id": 4}, destination, relative)
+
+        self.assertEqual(first.parent, main.STAGING_ROOT)
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.name.endswith(".jpg.part"))
+
     def test_same_title_chats_and_same_name_files_do_not_collide(self) -> None:
         first = self.destination(chat_id="-1001", message_id=10)
         second_chat = self.destination(chat_id="-1002", message_id=10)

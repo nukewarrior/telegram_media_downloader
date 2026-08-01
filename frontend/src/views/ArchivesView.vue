@@ -23,6 +23,7 @@ const filterOpen = ref(false)
 const isScrubbing = ref(false)
 const dayAnchors = ref<Record<string, HTMLElement>>({})
 const timeRail = ref<HTMLElement | null>(null)
+let selectionRequestId = 0
 
 const weekDays = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六']
 const mediaLabel: Record<string, string> = { PHOTO: '图片', VIDEO: '视频', AUDIO: '音频', DOCUMENT: '文件' }
@@ -105,11 +106,14 @@ async function clearFilters() {
 }
 
 async function select(item: ArchiveItem) {
+  const requestId = ++selectionRequestId
   mediaFailed.value = false
-  selected.value = await api.archiveDetail(item.id)
+  const detail = await api.archiveDetail(item.id)
+  if (requestId === selectionRequestId) selected.value = detail
 }
 
 function close() {
+  selectionRequestId += 1
   selected.value = null
   mediaFailed.value = false
 }
@@ -261,6 +265,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  selectionRequestId += 1
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('scroll', onScroll)
   window.removeEventListener('resize', updateActiveDay)
