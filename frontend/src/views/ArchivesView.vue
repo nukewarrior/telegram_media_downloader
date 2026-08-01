@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
-import { CalendarDays, Download, FileAudio, FileText, Image, Search, Video, X } from 'lucide-vue-next'
+import { CalendarDays, Download, FileAudio, FileText, Filter, Image, Search, Video, X } from 'lucide-vue-next'
 import { api, apiResourceUrl, type ArchiveItem } from '../api'
 
 type ArchiveDay = { key: string; label: string; fullLabel: string; year: number; items: ArchiveItem[] }
@@ -17,6 +17,7 @@ const activeDayKey = ref('')
 const hoveredDayKey = ref<string | null>(null)
 const timeNavOpen = ref(false)
 const mobileDateMenuOpen = ref(false)
+const filterOpen = ref(false)
 const isScrubbing = ref(false)
 const dayAnchors = ref<Record<string, HTMLElement>>({})
 const timeRail = ref<HTMLElement | null>(null)
@@ -67,6 +68,8 @@ const archiveMonths = computed<ArchiveMonth[]>(() => {
 const archiveDays = computed(() => archiveMonths.value.flatMap((month) => month.days))
 const focusedDayKey = computed(() => hoveredDayKey.value ?? activeDayKey.value)
 const focusedDay = computed(() => archiveDays.value.find((day) => day.key === focusedDayKey.value) ?? archiveDays.value[0] ?? null)
+const activeFilterCount = computed(() => Number(Boolean(selectedChat.value)) + Number(Boolean(selectedType.value)))
+const archiveTypes = ['', 'PHOTO', 'VIDEO', 'AUDIO', 'DOCUMENT']
 
 async function load() {
   loading.value = true
@@ -75,6 +78,21 @@ async function load() {
   } finally {
     loading.value = false
   }
+}
+
+async function applyFilters() {
+  filterOpen.value = false
+  await load()
+}
+
+async function clearFilters() {
+  if (!selectedChat.value && !selectedType.value) {
+    filterOpen.value = false
+    return
+  }
+  selectedChat.value = ''
+  selectedType.value = ''
+  await applyFilters()
 }
 
 async function select(item: ArchiveItem) {
@@ -212,6 +230,7 @@ function showYearMarker(index: number) {
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== 'Escape') return
   if (selected.value) close()
+  else if (filterOpen.value) filterOpen.value = false
   else if (mobileDateMenuOpen.value) mobileDateMenuOpen.value = false
   else if (timeNavOpen.value) closeTimeNavigation()
 }
@@ -240,31 +259,38 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="page-head"><div><p class="eyebrow">已落盘媒体</p><h1>归档文件</h1><p class="subhead">按来源聊天与日期回找已完成的归档内容。</p></div></div>
-  <section class="archive-toolbar">
-    <label class="select-wrap"><span>来源聊天</span><select v-model="selectedChat" @change="load"><option value="">全部来源</option><option v-for="chat in chats" :key="chat.id" :value="chat.id">{{ chat.title }} · {{ chat.item_count }} 个文件</option></select></label>
-    <div class="type-filters"><button v-for="type in ['', 'PHOTO', 'VIDEO', 'DOCUMENT']" :key="type" :class="{ selected: selectedType === type }" @click="selectedType = type; load()">{{ type ? mediaLabel[type] : '全部类型' }}</button></div>
-    <button v-if="archiveDays.length" class="quiet-button archive-date-jump" :aria-expanded="mobileDateMenuOpen" aria-controls="archive-mobile-date-menu" @click="mobileDateMenuOpen = !mobileDateMenuOpen"><CalendarDays :size="17" />跳转日期</button>
-  </section>
-  <section v-if="mobileDateMenuOpen && archiveMonths.length" id="archive-mobile-date-menu" class="archive-mobile-date-menu" aria-label="按日期跳转"><div v-for="month in archiveMonths" :key="month.key" class="archive-mobile-month"><strong>{{ month.label }}</strong><div><button v-for="day in month.days" :key="day.key" :class="{ active: day.key === activeDayKey }" @click="scrollToDay(day.key); mobileDateMenuOpen = false">{{ day.label }}</button></div></div></section>
-  <section v-if="loading" class="loading-block">正在读取归档索引…</section>
-  <section v-else-if="!items.length" class="empty-state compact"><div class="empty-icon"><Search :size="26" /></div><h2>没有匹配的归档文件</h2><p>完成下载后的图片和视频会在这里生成缩略图。</p></section>
-  <section v-else class="archive-scroll-region">
-    <section class="archive-content">
-      <section v-for="month in archiveMonths" :key="month.key" class="archive-month" :data-month-key="month.key">
-        <div class="archive-month-heading"><h2>{{ month.label }}</h2><span>{{ month.items.length }} 个文件</span></div>
-        <div v-for="day in month.days" :key="day.key" :ref="(element) => setDayAnchor(day.key, element)" class="archive-day" :data-day-key="day.key">
-          <div class="archive-day-heading"><h3>{{ day.label }}</h3><span>{{ day.items.length }} 个文件</span></div>
-          <div class="archive-grid"><button v-for="item in day.items" :key="item.id" class="archive-card" :aria-label="cardLabel(item)" @click="select(item)"><div :class="['media-preview', item.media_type.toLowerCase()]"><img v-if="item.thumbnail_url" :src="resource(item.thumbnail_url) ?? undefined" alt="" /><template v-else><Image v-if="item.media_type === 'PHOTO'" :size="34" aria-hidden="true" /><Video v-else-if="item.media_type === 'VIDEO'" :size="34" aria-hidden="true" /><FileAudio v-else-if="item.media_type === 'AUDIO'" :size="34" aria-hidden="true" /><FileText v-else :size="34" aria-hidden="true" /><small v-if="previewStatus[item.thumbnail_status]" class="sr-only">{{ previewStatus[item.thumbnail_status] }}</small></template><span v-if="item.media_type === 'VIDEO'" class="play-badge" aria-hidden="true">▶</span><span class="archive-card-overlay" aria-hidden="true"><b>{{ item.filename }}</b><span class="archive-card-chat">{{ item.chat_title }}</span><small>{{ formattedDate(item.message_date) }} · {{ bytes(item.size_bytes) }}</small></span></div></button></div>
-        </div>
-      </section>
-    </section>
-    <div v-if="archiveDays.length" :class="['archive-time-nav', { open: timeNavOpen }]" tabindex="0" role="navigation" aria-label="按日期跳转归档" :aria-expanded="timeNavOpen" @pointerenter="openTimeNavigation" @pointerleave="closeTimeNavigation" @pointermove="onTimelinePointerMove" @pointerdown="onTimelinePointerDown" @pointerup="onTimelinePointerUp" @pointercancel="onTimelinePointerUp" @focus="openTimeNavigation" @blur="closeTimeNavigation" @keydown="onTimelineKeydown">
-      <div ref="timeRail" class="archive-time-rail" :aria-hidden="!timeNavOpen">
-        <span v-if="focusedDay" class="archive-time-current-label" :style="{ top: dayPosition(focusedDayIndex()) }">{{ focusedDay.fullLabel }}</span>
-        <span v-for="(day, index) in archiveDays" :key="day.key" class="archive-time-stop" :class="{ active: day.key === focusedDayKey, current: day.key === activeDayKey }" :style="{ top: dayPosition(index), '--timeline-scale': timelineScale(index) }"><span v-if="showYearMarker(index)" class="archive-time-year">{{ day.year }}年</span><i></i></span>
-      </div>
+  <main class="archive-page">
+    <div class="archive-filter-controls">
+      <button class="archive-filter-trigger" :class="{ active: activeFilterCount }" :aria-expanded="filterOpen" aria-controls="archive-filter-panel" aria-label="筛选归档" title="筛选归档" @click="mobileDateMenuOpen = false; filterOpen = !filterOpen"><Filter :size="19" /><span v-if="activeFilterCount" class="archive-filter-count">{{ activeFilterCount }}</span></button>
+      <button v-if="archiveDays.length" class="quiet-button archive-date-jump" :aria-expanded="mobileDateMenuOpen" aria-controls="archive-mobile-date-menu" @click="filterOpen = false; mobileDateMenuOpen = !mobileDateMenuOpen"><CalendarDays :size="17" />跳转日期</button>
     </div>
-  </section>
-  <section v-if="selected" class="media-lightbox" role="dialog" aria-modal="true" :aria-label="`${selected.filename} 预览`" @click.self="close"><button class="lightbox-close" aria-label="关闭预览" @click="close"><X :size="24" /></button><div class="lightbox-panel"><div class="lightbox-media"><img v-if="selected.media_type === 'PHOTO' && selected.content_url && !mediaFailed" :src="resource(selected.content_url) ?? undefined" :alt="selected.filename" @error="mediaFailed = true" /><video v-else-if="selected.media_type === 'VIDEO' && selected.content_url && !mediaFailed" :src="resource(selected.content_url) ?? undefined" controls playsinline @error="mediaFailed = true" /><div v-else class="lightbox-fallback"><Image v-if="selected.media_type === 'PHOTO'" :size="46" /><Video v-else-if="selected.media_type === 'VIDEO'" :size="46" /><FileText v-else :size="46" /><p>{{ selected.media_type === 'VIDEO' && mediaFailed ? '此视频无法在当前浏览器播放' : '此文件没有可用的浏览器预览' }}</p></div></div><div class="lightbox-meta"><div><span class="eyebrow">{{ mediaLabel[selected.media_type] }} · 已归档</span><h2>{{ selected.filename }}</h2><p>{{ selected.chat_title }} · {{ formattedDate(selected.message_date) }} · {{ bytes(selected.size_bytes) }}</p></div><a class="quiet-button" :href="resource(selected.download_url) ?? undefined"><Download :size="17" />下载原文件</a></div></div></section>
+    <div v-if="filterOpen" class="archive-filter-backdrop" aria-hidden="true" @click="filterOpen = false"></div>
+    <section v-if="filterOpen" id="archive-filter-panel" class="archive-filter-panel" role="dialog" aria-modal="false" aria-label="筛选归档">
+      <div class="archive-filter-panel-head"><strong>筛选归档</strong><button class="archive-filter-close" aria-label="关闭筛选" @click="filterOpen = false"><X :size="18" /></button></div>
+      <label class="archive-filter-field"><span>来源聊天</span><select v-model="selectedChat" @change="applyFilters"><option value="">全部来源</option><option v-for="chat in chats" :key="chat.id" :value="chat.id">{{ chat.title }} · {{ chat.item_count }} 个文件</option></select></label>
+      <fieldset class="archive-filter-types"><legend>文件类型</legend><div><button v-for="type in archiveTypes" :key="type" :class="{ selected: selectedType === type }" @click="selectedType = type; applyFilters()">{{ type ? mediaLabel[type] : '全部' }}</button></div></fieldset>
+      <button class="archive-filter-clear" :disabled="!activeFilterCount" @click="clearFilters">清除筛选</button>
+    </section>
+    <section v-if="mobileDateMenuOpen && archiveMonths.length" id="archive-mobile-date-menu" class="archive-mobile-date-menu" aria-label="按日期跳转"><div v-for="month in archiveMonths" :key="month.key" class="archive-mobile-month"><strong>{{ month.label }}</strong><div><button v-for="day in month.days" :key="day.key" :class="{ active: day.key === activeDayKey }" @click="scrollToDay(day.key); mobileDateMenuOpen = false">{{ day.label }}</button></div></div></section>
+    <section v-if="loading" class="loading-block">正在读取归档索引…</section>
+    <section v-else-if="!items.length" class="empty-state compact"><div class="empty-icon"><Search :size="26" /></div><h2>没有匹配的归档文件</h2><p>完成下载后的图片和视频会在这里生成缩略图。</p></section>
+    <section v-else class="archive-scroll-region">
+      <section class="archive-content">
+        <section v-for="month in archiveMonths" :key="month.key" class="archive-month" :data-month-key="month.key">
+          <div class="archive-month-heading"><h2>{{ month.label }}</h2><span>{{ month.items.length }} 个文件</span></div>
+          <div v-for="day in month.days" :key="day.key" :ref="(element) => setDayAnchor(day.key, element)" class="archive-day" :data-day-key="day.key">
+            <div class="archive-day-heading"><h3>{{ day.label }}</h3><span>{{ day.items.length }} 个文件</span></div>
+            <div class="archive-grid"><button v-for="item in day.items" :key="item.id" class="archive-card" :aria-label="cardLabel(item)" @click="select(item)"><div :class="['media-preview', item.media_type.toLowerCase()]"><img v-if="item.thumbnail_url" :src="resource(item.thumbnail_url) ?? undefined" alt="" /><template v-else><Image v-if="item.media_type === 'PHOTO'" :size="34" aria-hidden="true" /><Video v-else-if="item.media_type === 'VIDEO'" :size="34" aria-hidden="true" /><FileAudio v-else-if="item.media_type === 'AUDIO'" :size="34" aria-hidden="true" /><FileText v-else :size="34" aria-hidden="true" /><small v-if="previewStatus[item.thumbnail_status]" class="sr-only">{{ previewStatus[item.thumbnail_status] }}</small></template><span v-if="item.media_type === 'VIDEO'" class="play-badge" aria-hidden="true">▶</span><span class="archive-card-overlay" aria-hidden="true"><b>{{ item.filename }}</b><span class="archive-card-chat">{{ item.chat_title }}</span><small>{{ formattedDate(item.message_date) }} · {{ bytes(item.size_bytes) }}</small></span></div></button></div>
+          </div>
+        </section>
+      </section>
+      <div v-if="archiveDays.length" :class="['archive-time-nav', { open: timeNavOpen }]" tabindex="0" role="navigation" aria-label="按日期跳转归档" :aria-expanded="timeNavOpen" @pointerenter="openTimeNavigation" @pointerleave="closeTimeNavigation" @pointermove="onTimelinePointerMove" @pointerdown="onTimelinePointerDown" @pointerup="onTimelinePointerUp" @pointercancel="onTimelinePointerUp" @focus="openTimeNavigation" @blur="closeTimeNavigation" @keydown="onTimelineKeydown">
+        <div ref="timeRail" class="archive-time-rail" :aria-hidden="!timeNavOpen">
+          <span v-if="focusedDay" class="archive-time-current-label" :style="{ top: dayPosition(focusedDayIndex()) }">{{ focusedDay.fullLabel }}</span>
+          <span v-for="(day, index) in archiveDays" :key="day.key" class="archive-time-stop" :class="{ active: day.key === focusedDayKey, current: day.key === activeDayKey }" :style="{ top: dayPosition(index), '--timeline-scale': timelineScale(index) }"><span v-if="showYearMarker(index)" class="archive-time-year">{{ day.year }}年</span><i></i></span>
+        </div>
+      </div>
+    </section>
+    <section v-if="selected" class="media-lightbox" role="dialog" aria-modal="true" :aria-label="`${selected.filename} 预览`" @click.self="close"><button class="lightbox-close" aria-label="关闭预览" @click="close"><X :size="24" /></button><div class="lightbox-panel"><div class="lightbox-media"><img v-if="selected.media_type === 'PHOTO' && selected.content_url && !mediaFailed" :src="resource(selected.content_url) ?? undefined" :alt="selected.filename" @error="mediaFailed = true" /><video v-else-if="selected.media_type === 'VIDEO' && selected.content_url && !mediaFailed" :src="resource(selected.content_url) ?? undefined" controls playsinline @error="mediaFailed = true" /><div v-else class="lightbox-fallback"><Image v-if="selected.media_type === 'PHOTO'" :size="46" /><Video v-else-if="selected.media_type === 'VIDEO'" :size="46" /><FileText v-else :size="46" /><p>{{ selected.media_type === 'VIDEO' && mediaFailed ? '此视频无法在当前浏览器播放' : '此文件没有可用的浏览器预览' }}</p></div></div><div class="lightbox-meta"><div><span class="eyebrow">{{ mediaLabel[selected.media_type] }} · 已归档</span><h2>{{ selected.filename }}</h2><p>{{ selected.chat_title }} · {{ formattedDate(selected.message_date) }} · {{ bytes(selected.size_bytes) }}</p></div><a class="quiet-button" :href="resource(selected.download_url) ?? undefined"><Download :size="17" />下载原文件</a></div></div></section>
+  </main>
 </template>
