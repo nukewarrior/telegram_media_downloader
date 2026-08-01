@@ -43,6 +43,8 @@ SOURCE_THUMBNAIL_ROOT = DATA_DIR / "source-thumbnails"
 STAGING_ROOT = DATA_DIR / "staging"
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 STATIC_DIR = Path(os.getenv("STATIC_DIR", "./static"))
+PROJECT_VERSION = "0.1.0"
+TELEGRAM_DEVICE_MODEL = "Telegram Media Downloader"
 SESSION_DIR = DATA_DIR / "sessions"
 SESSION_PATH = SESSION_DIR / "telegram.session"
 LOGIN_ATTEMPT_TTL = timedelta(minutes=10)
@@ -589,6 +591,8 @@ async def open_telegram_client() -> TelegramClient:
         str(SESSION_PATH),
         api_id,
         api_hash,
+        device_model=TELEGRAM_DEVICE_MODEL,
+        app_version=PROJECT_VERSION,
         receive_updates=False,
         # Downloads can use a different Telegram data centre from the one used
         # for login. Keep the long-lived download client able to reconnect and
@@ -1608,7 +1612,7 @@ async def lifespan(_: FastAPI):
     log_event(logging.INFO, "service.stopped", "Telegram media archiver stopped")
 
 
-app = FastAPI(title="Telegram 媒体归档器", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Telegram 媒体归档器", version=PROJECT_VERSION, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","),

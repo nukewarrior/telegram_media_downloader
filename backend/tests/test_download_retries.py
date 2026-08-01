@@ -133,10 +133,16 @@ class DownloadRetryTests(unittest.TestCase):
             asyncio.run(main.open_telegram_client())
 
         options = created["kwargs"]
+        self.assertEqual(options["device_model"], main.TELEGRAM_DEVICE_MODEL)
+        self.assertEqual(options["app_version"], main.PROJECT_VERSION)
+        self.assertNotIn("system_version", options)
+        self.assertNotIn("lang_code", options)
+        self.assertNotIn("system_lang_code", options)
         self.assertEqual(options["connection_retries"], 5)
         self.assertEqual(options["request_retries"], 5)
         self.assertTrue(options["auto_reconnect"])
         self.assertTrue(options["raise_last_call_error"])
+        self.assertEqual(main.app.version, main.PROJECT_VERSION)
 
 
 if __name__ == "__main__":
