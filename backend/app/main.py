@@ -52,6 +52,9 @@ DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 STATIC_DIR = Path(os.getenv("STATIC_DIR", "./static"))
 PROJECT_VERSION = "0.1.0"
 TELEGRAM_DEVICE_MODEL = "Telegram Media Downloader"
+SQLITE_BUSY_TIMEOUT_MS = 5_000
+DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
+DOWNLOAD_PROGRESS_MIN_BYTES = 4 * 1024 * 1024
 SESSION_DIR = DATA_DIR / "sessions"
 SESSION_PATH = SESSION_DIR / "telegram.session"
 LOGIN_ATTEMPT_TTL = timedelta(minutes=10)
@@ -319,6 +322,7 @@ def now() -> str:
 
 def connection() -> sqlite3.Connection:
     db = sqlite3.connect(DB_PATH)
+    db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     db.row_factory = sqlite3.Row
     return db
 
@@ -2689,6 +2693,22 @@ def update_parallel_download_progress(task_id: int, media_id: int, file_download
                    WHERE id = ?""", (min(totals["bytes"], task["total_bytes"]), totals["speed"], revision, timestamp, task_id))
 
 
+def should_persist_download_progress(
+    current_bytes: int,
+    total_bytes: int,
+    current_time: float,
+    last_persisted_at: float,
+    last_persisted_bytes: int,
+) -> bool:
+    """Keep progress writes bounded while always allowing the terminal callback through."""
+    if current_bytes >= total_bytes:
+        return True
+    return (
+        current_time - last_persisted_at >= DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS
+        or current_bytes - last_persisted_bytes >= DOWNLOAD_PROGRESS_MIN_BYTES
+    )
+
+
 def configured_download_concurrency() -> int:
     with connection() as db:
         return db.execute("SELECT download_concurrency_max FROM app_settings WHERE id = 1").fetchone()[0]
@@ -3255,13 +3275,15 @@ async def download_media_job(task_id: int, media_id: int) -> None:
                 raise RuntimeError("消息已不可用")
             started_at = asyncio.get_running_loop().time()
             last_persisted_at = 0.0
+            last_persisted_bytes = 0
 
             def progress(current: int, total: int) -> None:
-                nonlocal last_persisted_at
+                nonlocal last_persisted_at, last_persisted_bytes
                 current_time = asyncio.get_running_loop().time()
-                if current != total and current_time - last_persisted_at < 1:
+                if not should_persist_download_progress(current, total, current_time, last_persisted_at, last_persisted_bytes):
                     return
                 last_persisted_at = current_time
+                last_persisted_bytes = current
                 update_parallel_download_progress(task_id, media_id, current, round(current / max(current_time - started_at, 0.001)))
 
             result = await client.download_media(message, file=str(part), progress_callback=progress)
