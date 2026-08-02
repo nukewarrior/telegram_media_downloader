@@ -1,0 +1,26 @@
+.git
+.gitignore
+.handoff
+
+# Runtime data and local state
+data/
+backend/data/
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+*.session
+*.session-journal
+*.log
+
+# Local build and test artifacts
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Test-only source is not needed by the production image
+backend/tests/
+frontend/tests/
