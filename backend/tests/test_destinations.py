@@ -931,6 +931,175 @@ class DestinationTests(unittest.TestCase):
         self.assertIn(("PUT", "/dav/archive/root/nested/file.bin.part"), server.requests)
         self.assertIn(("MOVE", "/dav/archive/root/nested/file.bin.part"), server.requests)
 
+    def test_webdav_directory_cache_reuses_confirmations_for_one_version(self) -> None:
+        server = MockWebDAV()
+        created: list[int | None] = []
+
+        async def factory(destination: Destination) -> httpx.AsyncClient:
+            created.append(destination.version_id)
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        manager = WebDAVClientManager(factory)
+        destination = Destination(
+            id=90,
+            name="cached-dav",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            webdav_username="cache-user",
+            webdav_password="cache-password",
+            remote_root="archive/root",
+            version_id=9001,
+        )
+        first = TEST_DATA / "directory-cache-a.bin"
+        second = TEST_DATA / "directory-cache-b.bin"
+        first.write_bytes(b"cache-a")
+        second.write_bytes(b"cache-b")
+
+        async def exercise() -> None:
+            with patch.object(storage, "webdav_client_manager", manager):
+                await destination.upload_file(first, "same-chat/2026/08/a.bin")
+                await destination.upload_file(second, "same-chat/2026/08/b.bin")
+                self.assertEqual(manager.cached_client_count, 1)
+                self.assertEqual(manager.directory_cache_count, 6)
+                await manager.close()
+
+        asyncio.run(exercise())
+        self.assertEqual(created, [9001])
+        for path in (
+            "/dav",
+            "/dav/archive",
+            "/dav/archive/root",
+            "/dav/archive/root/same-chat",
+            "/dav/archive/root/same-chat/2026",
+            "/dav/archive/root/same-chat/2026/08",
+        ):
+            self.assertEqual(server.requests.count(("PROPFIND", path)), 1, path)
+        for path in (
+            "/dav/archive/root/same-chat",
+            "/dav/archive/root/same-chat/2026",
+            "/dav/archive/root/same-chat/2026/08",
+        ):
+            self.assertEqual(server.requests.count(("MKCOL", path)), 1, path)
+
+    def test_webdav_directory_lock_deduplicates_concurrent_same_directory_creation(self) -> None:
+        class YieldingMockWebDAV(MockWebDAV):
+            async def __call__(self, request: httpx.Request) -> httpx.Response:
+                await asyncio.sleep(0)
+                return await super().__call__(request)
+
+        server = YieldingMockWebDAV()
+
+        async def factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        manager = WebDAVClientManager(factory)
+        destination = Destination(
+            id=90,
+            name="locked-dav",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            remote_root="archive/root",
+            version_id=9002,
+        )
+        first = TEST_DATA / "directory-lock-a.bin"
+        second = TEST_DATA / "directory-lock-b.bin"
+        first.write_bytes(b"lock-a")
+        second.write_bytes(b"lock-b")
+
+        async def exercise() -> None:
+            with patch.object(storage, "webdav_client_manager", manager):
+                await asyncio.gather(
+                    destination.upload_file(first, "same-chat/2026/08/a.bin"),
+                    destination.upload_file(second, "same-chat/2026/08/b.bin"),
+                )
+                await manager.close()
+
+        asyncio.run(exercise())
+        for path in (
+            "/dav/archive/root/same-chat",
+            "/dav/archive/root/same-chat/2026",
+            "/dav/archive/root/same-chat/2026/08",
+        ):
+            self.assertEqual(server.requests.count(("PROPFIND", path)), 1, path)
+            self.assertEqual(server.requests.count(("MKCOL", path)), 1, path)
+        self.assertEqual(sum(method == "MOVE" for method, _ in server.requests), 2)
+
+    def test_webdav_directory_cache_isolated_between_destination_versions(self) -> None:
+        old_server = MockWebDAV()
+        new_server = MockWebDAV()
+
+        async def factory(destination: Destination) -> httpx.AsyncClient:
+            server = old_server if destination.version_id == 9011 else new_server
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        manager = WebDAVClientManager(factory)
+        old = Destination(
+            id=90,
+            name="versioned-cache",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            remote_root="archive/root",
+            version_id=9011,
+        )
+        new = Destination(
+            id=90,
+            name="versioned-cache",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            remote_root="archive/root",
+            version_id=9012,
+        )
+        old_source = TEST_DATA / "old-cache-version.bin"
+        new_source = TEST_DATA / "new-cache-version.bin"
+        old_source.write_bytes(b"old-version")
+        new_source.write_bytes(b"new-version")
+
+        async def exercise() -> None:
+            with patch.object(storage, "webdav_client_manager", manager):
+                await old.upload_file(old_source, "same-chat/2026/08/old.bin")
+                await new.upload_file(new_source, "same-chat/2026/08/new.bin")
+                self.assertEqual(manager.cached_client_count, 2)
+                self.assertEqual(len(manager.cached_directories(old)), 6)
+                self.assertEqual(len(manager.cached_directories(new)), 6)
+                await manager.close()
+
+        asyncio.run(exercise())
+        self.assertEqual(old_server.requests.count(("PROPFIND", "/dav/archive/root/same-chat/2026/08")), 1)
+        self.assertEqual(new_server.requests.count(("PROPFIND", "/dav/archive/root/same-chat/2026/08")), 1)
+
+    def test_webdav_directory_cache_reconfirms_after_remote_directory_loss(self) -> None:
+        server = MockWebDAV()
+
+        async def factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        manager = WebDAVClientManager(factory)
+        destination = Destination(
+            id=90,
+            name="invalidated-cache",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            remote_root="archive/root",
+            version_id=9013,
+        )
+        first = TEST_DATA / "invalidated-cache-a.bin"
+        second = TEST_DATA / "invalidated-cache-b.bin"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        month = "/dav/archive/root/same-chat/2026/08"
+
+        async def exercise() -> None:
+            with patch.object(storage, "webdav_client_manager", manager):
+                await destination.upload_file(first, "same-chat/2026/08/a.bin")
+                server.collections.remove(month)
+                await destination.upload_file(second, "same-chat/2026/08/b.bin")
+                await manager.close()
+
+        asyncio.run(exercise())
+        self.assertEqual(server.requests.count(("PROPFIND", month)), 2)
+        self.assertEqual(server.requests.count(("MKCOL", month)), 2)
+        self.assertEqual(server.files["/dav/archive/root/same-chat/2026/08/b.bin"], b"second")
+
     def test_webdav_client_manager_reuses_one_client_per_version_and_closes_streams_before_clients(self) -> None:
         server = MockWebDAV()
         created: list[tuple[int | None, str | None, str | None]] = []

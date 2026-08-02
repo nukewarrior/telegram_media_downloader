@@ -16,6 +16,20 @@ class StorageError(RuntimeError):
     """A destination could not be read or written."""
 
 
+_DIRECTORY_STATE_INVALIDATION_STATUSES = frozenset({404, 405, 409, 410, 412, 423})
+_UPLOAD_DIRECTORY_RETRY_STATUSES = frozenset({404, 409, 410, 412, 423})
+
+
+class _WebDAVResponseError(StorageError):
+    """A WebDAV response that callers may classify without parsing its message."""
+
+    def __init__(self, message: str, *, status_code: int, operation: str, url: str | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.operation = operation
+        self.url = url
+
+
 class _AsyncFileStream(httpx.AsyncByteStream):
     """Read a local staging file without blocking the event loop or loading it all into memory."""
 
@@ -180,7 +194,15 @@ class Destination:
         )
 
     @staticmethod
-    def _check_response(response: httpx.Response, operation: str, *, accepted: set[int] | None = None) -> None:
+    def _response_url(response: httpx.Response) -> str | None:
+        try:
+            request = response.request
+        except RuntimeError:
+            return None
+        return str(request.url) if request is not None else None
+
+    @classmethod
+    def _check_response(cls, response: httpx.Response, operation: str, *, accepted: set[int] | None = None) -> None:
         accepted_statuses = accepted or set(range(200, 300))
         if response.status_code not in accepted_statuses:
             try:
@@ -189,24 +211,65 @@ class Destination:
                 detail = ""
             suffix = f"：{detail}" if detail else ""
             if response.status_code in {401, 403}:
-                raise StorageError(f"WebDAV {operation}权限不足（HTTP {response.status_code}）{suffix}")
-            raise StorageError(f"WebDAV {operation}失败（HTTP {response.status_code}）{suffix}")
+                raise _WebDAVResponseError(
+                    f"WebDAV {operation}权限不足（HTTP {response.status_code}）{suffix}",
+                    status_code=response.status_code,
+                    operation=operation,
+                    url=cls._response_url(response),
+                )
+            raise _WebDAVResponseError(
+                f"WebDAV {operation}失败（HTTP {response.status_code}）{suffix}",
+                status_code=response.status_code,
+                operation=operation,
+                url=cls._response_url(response),
+            )
 
     @staticmethod
     async def _propfind_collection(client: httpx.AsyncClient, url: str) -> httpx.Response:
         return await client.request("PROPFIND", url, headers={"Depth": "0"})
 
-    async def _require_collection(self, client: httpx.AsyncClient, url: str, operation: str) -> None:
+    async def _require_collection(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        operation: str,
+        *,
+        directory_cache: "WebDAVClientManager | None" = None,
+    ) -> None:
+        if directory_cache is not None:
+            await directory_cache.require_collection(self, client, url, operation)
+            return
+        await self._require_collection_uncached(client, url, operation)
+
+    async def _require_collection_uncached(self, client: httpx.AsyncClient, url: str, operation: str) -> None:
         response = await self._propfind_collection(client, url)
         if 200 <= response.status_code < 300:
             return
         if response.status_code in {401, 403}:
             self._check_response(response, operation)
         if response.status_code == 404:
-            raise StorageError(f"WebDAV {operation}不存在（HTTP 404）")
+            raise _WebDAVResponseError(
+                f"WebDAV {operation}不存在（HTTP 404）",
+                status_code=response.status_code,
+                operation=operation,
+                url=self._response_url(response),
+            )
         self._check_response(response, operation)
 
-    async def _ensure_collection(self, client: httpx.AsyncClient, url: str, operation: str) -> None:
+    async def _ensure_collection(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        operation: str,
+        *,
+        directory_cache: "WebDAVClientManager | None" = None,
+    ) -> None:
+        if directory_cache is not None:
+            await directory_cache.ensure_collection(self, client, url, operation)
+            return
+        await self._ensure_collection_uncached(client, url, operation)
+
+    async def _ensure_collection_uncached(self, client: httpx.AsyncClient, url: str, operation: str) -> None:
         response = await self._propfind_collection(client, url)
         if 200 <= response.status_code < 300:
             return
@@ -224,23 +287,38 @@ class Destination:
                 return
             if confirmation.status_code in {401, 403}:
                 self._check_response(confirmation, operation)
-            raise StorageError(f"WebDAV {operation}创建后无法确认目录（HTTP {confirmation.status_code}）")
+            raise _WebDAVResponseError(
+                f"WebDAV {operation}创建后无法确认目录（HTTP {confirmation.status_code}）",
+                status_code=confirmation.status_code,
+                operation=operation,
+                url=self._response_url(confirmation),
+            )
         if response.status_code in {401, 403}:
             self._check_response(response, f"创建{operation}")
         self._check_response(response, f"创建{operation}")
 
-    async def _ensure_remote_directories(self, client: httpx.AsyncClient, relative: str | Path) -> None:
+    async def _ensure_remote_directories(
+        self,
+        client: httpx.AsyncClient,
+        relative: str | Path,
+        *,
+        directory_cache: "WebDAVClientManager | None" = None,
+    ) -> None:
         relative_text = _relative_text(relative)
         service_url = self._service_url()
-        await self._require_collection(client, service_url, "WebDAV 服务入口")
+        await self._require_collection(client, service_url, "WebDAV 服务入口", directory_cache=directory_cache)
         current_url = service_url
         for part in self._remote_root_parts():
             current_url = f"{current_url}/{quote(part, safe='-._~')}"
-            await self._ensure_collection(client, current_url, "远端根目录")
+            await self._ensure_collection(client, current_url, "远端根目录", directory_cache=directory_cache)
         parents = relative_text.split("/")[:-1]
         for index in range(1, len(parents) + 1):
             directory = "/".join(parents[:index])
-            await self._ensure_collection(client, self.remote_url(directory), "归档目录")
+            await self._ensure_collection(client, self.remote_url(directory), "归档目录", directory_cache=directory_cache)
+
+    def _remote_parent_url(self, relative: str) -> str:
+        parent = relative.rsplit("/", 1)[0] if "/" in relative else ""
+        return self.remote_url(parent) if parent else self._base_url()
 
     async def _best_effort_delete(self, client: httpx.AsyncClient, relative: str) -> None:
         try:
@@ -297,21 +375,35 @@ class Destination:
 
         relative_text = _relative_text(relative)
         temporary_relative = f"{relative_text}.part"
+        manager = webdav_client_manager
         try:
-            client = await webdav_client_manager.get_client(self)
-            await self._ensure_remote_directories(client, relative_text)
-            response = await client.put(self.remote_url(temporary_relative), content=_AsyncFileStream(source))
-            self._check_response(response, "上传文件")
-            response = await client.request(
-                "MOVE",
-                self.remote_url(temporary_relative),
-                headers={"Destination": self.remote_url(relative_text), "Overwrite": "T"},
-            )
-            self._check_response(response, "提交文件", accepted={200, 201, 204})
+            client = await manager.get_client(self)
+            for attempt in range(2):
+                try:
+                    await self._ensure_remote_directories(client, relative_text, directory_cache=manager)
+                    response = await client.put(self.remote_url(temporary_relative), content=_AsyncFileStream(source))
+                    self._check_response(response, "上传文件")
+                    response = await client.request(
+                        "MOVE",
+                        self.remote_url(temporary_relative),
+                        headers={"Destination": self.remote_url(relative_text), "Overwrite": "T"},
+                    )
+                    self._check_response(response, "提交文件", accepted={200, 201, 204})
+                    break
+                except _WebDAVResponseError as error:
+                    if attempt or not self._should_retry_directory_state(error):
+                        raise
+                    manager.invalidate_directory(self, self._remote_parent_url(relative_text), include_ancestors=True)
         except OSError as error:
             raise StorageError(f"读取本地临时文件失败：{error}") from error
         except httpx.HTTPError as error:
             raise StorageError(f"WebDAV 上传失败：{error}") from error
+
+    @staticmethod
+    def _should_retry_directory_state(error: _WebDAVResponseError) -> bool:
+        return error.status_code in _UPLOAD_DIRECTORY_RETRY_STATUSES or (
+            error.status_code == 405 and "目录" in error.operation
+        )
 
     async def download_to_file(self, relative: str | Path, target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -378,6 +470,8 @@ class WebDAVClientManager:
     def __init__(self, client_factory: WebDAVClientFactory | None = None) -> None:
         self._client_factory = client_factory
         self._clients: dict[tuple[object, ...], httpx.AsyncClient] = {}
+        self._directory_cache: dict[tuple[object, ...], set[str]] = {}
+        self._directory_locks: dict[tuple[tuple[object, ...], str], asyncio.Lock] = {}
         self._active_streams: dict[int, tuple[httpx.AsyncClient, httpx.Response]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock: asyncio.Lock | None = None
@@ -394,6 +488,123 @@ class WebDAVClientManager:
     @property
     def cache_keys(self) -> tuple[tuple[object, ...], ...]:
         return tuple(self._clients)
+
+    @property
+    def directory_cache_count(self) -> int:
+        return sum(len(entries) for entries in self._directory_cache.values())
+
+    @property
+    def directory_lock_count(self) -> int:
+        return len(self._directory_locks)
+
+    def cached_directories(self, destination: Destination) -> tuple[str, ...]:
+        """Return cached directory URLs for one destination namespace."""
+        namespace = destination.webdav_client_cache_key()
+        return tuple(sorted(self._directory_cache.get(namespace, set())))
+
+    def is_directory_cached(self, destination: Destination, url: str) -> bool:
+        namespace = destination.webdav_client_cache_key()
+        return self._canonical_directory_url(url) in self._directory_cache.get(namespace, set())
+
+    @staticmethod
+    def _canonical_directory_url(url: str) -> str:
+        return url.rstrip("/")
+
+    @staticmethod
+    def _is_directory_state_invalidating(status_code: int) -> bool:
+        return status_code in _DIRECTORY_STATE_INVALIDATION_STATUSES
+
+    def _directory_namespace(self, destination: Destination) -> tuple[object, ...]:
+        return destination.webdav_client_cache_key()
+
+    def _directory_lock(self, namespace: tuple[object, ...], url: str) -> asyncio.Lock:
+        key = (namespace, url)
+        lock = self._directory_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._directory_locks[key] = lock
+        return lock
+
+    def invalidate_directory(
+        self,
+        destination: Destination,
+        url: str,
+        *,
+        include_descendants: bool = True,
+        include_ancestors: bool = False,
+    ) -> None:
+        """Forget a directory and related paths without discarding its lock."""
+        namespace = self._directory_namespace(destination)
+        canonical_url = self._canonical_directory_url(url)
+        entries = self._directory_cache.get(namespace)
+        if not entries:
+            return
+
+        prefixes: list[str] = []
+        if include_descendants:
+            prefixes.append(f"{canonical_url}/")
+        if include_ancestors:
+            parts = urlsplit(canonical_url)
+            path = parts.path.rstrip("/")
+            while path and path != "/":
+                path = path.rsplit("/", 1)[0] or "/"
+                prefixes.append(f"{parts.scheme}://{parts.netloc}{path}".rstrip("/"))
+
+        entries.discard(canonical_url)
+        for entry in tuple(entries):
+            if any(entry.startswith(prefix) for prefix in prefixes):
+                entries.discard(entry)
+        if not entries:
+            self._directory_cache.pop(namespace, None)
+
+    async def require_collection(
+        self,
+        destination: Destination,
+        client: httpx.AsyncClient,
+        url: str,
+        operation: str,
+    ) -> None:
+        await self._ensure_cached_collection(destination, client, url, operation, require=True)
+
+    async def ensure_collection(
+        self,
+        destination: Destination,
+        client: httpx.AsyncClient,
+        url: str,
+        operation: str,
+    ) -> None:
+        await self._ensure_cached_collection(destination, client, url, operation, require=False)
+
+    async def _ensure_cached_collection(
+        self,
+        destination: Destination,
+        client: httpx.AsyncClient,
+        url: str,
+        operation: str,
+        *,
+        require: bool,
+    ) -> None:
+        await self._ensure_loop()
+        canonical_url = self._canonical_directory_url(url)
+        namespace = self._directory_namespace(destination)
+        entries = self._directory_cache.setdefault(namespace, set())
+        if canonical_url in entries:
+            return
+
+        lock = self._directory_lock(namespace, canonical_url)
+        async with lock:
+            if canonical_url in self._directory_cache.get(namespace, set()):
+                return
+            try:
+                if require:
+                    await destination._require_collection_uncached(client, canonical_url, operation)
+                else:
+                    await destination._ensure_collection_uncached(client, canonical_url, operation)
+            except _WebDAVResponseError as error:
+                if self._is_directory_state_invalidating(error.status_code):
+                    self.invalidate_directory(destination, canonical_url, include_ancestors=True)
+                raise
+            self._directory_cache.setdefault(namespace, set()).add(canonical_url)
 
     async def _close_resources(
         self,
@@ -433,6 +644,8 @@ class WebDAVClientManager:
         stale_clients = list(self._clients.values())
         self._active_streams.clear()
         self._clients.clear()
+        self._directory_cache.clear()
+        self._directory_locks.clear()
         self._loop = loop
         self._lock = asyncio.Lock()
         self._closed = False
@@ -499,6 +712,8 @@ class WebDAVClientManager:
             clients = list(self._clients.values())
             self._active_streams.clear()
             self._clients.clear()
+            self._directory_cache.clear()
+            self._directory_locks.clear()
         await self._close_resources(streams, clients)
 
 
