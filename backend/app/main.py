@@ -2373,9 +2373,9 @@ def list_task_media(task_id: int, page: int = 1, page_size: int = 50) -> dict[st
             raise HTTPException(404, "任务不存在")
         total = db.execute("SELECT COUNT(*) FROM task_media WHERE task_id = ?", (task_id,)).fetchone()[0]
         records = db.execute(
-            """SELECT * FROM task_media WHERE task_id = ?
-               ORDER BY CASE status WHEN 'DOWNLOADING' THEN 0 WHEN 'FAILED' THEN 1 WHEN 'COMPLETED' THEN 2 ELSE 3 END,
-               CASE WHEN status = 'COMPLETED' THEN updated_at END DESC, message_id ASC
+            TASK_MEDIA_WITH_ARCHIVE_SQL +
+            """ ORDER BY CASE m.status WHEN 'DOWNLOADING' THEN 0 WHEN 'FAILED' THEN 1 WHEN 'COMPLETED' THEN 2 ELSE 3 END,
+               CASE WHEN m.status = 'COMPLETED' THEN m.updated_at END DESC, m.message_id ASC
                LIMIT ? OFFSET ?""",
             (task_id, page_size, (page - 1) * page_size),
         ).fetchall()
@@ -2385,7 +2385,7 @@ def list_task_media(task_id: int, page: int = 1, page_size: int = 50) -> dict[st
 def changed_task_media(task_id: int, after_revision: int) -> list[dict[str, Any]]:
     with connection() as db:
         records = db.execute(
-            "SELECT * FROM task_media WHERE task_id = ? AND revision > ? ORDER BY revision ASC",
+            TASK_MEDIA_WITH_ARCHIVE_SQL + " AND m.revision > ? ORDER BY m.revision ASC",
             (task_id, after_revision),
         ).fetchall()
     return [media_payload(record) for record in records]
@@ -2887,11 +2887,45 @@ def update_task(task_id: int, **values: Any) -> None:
         log_event(logging.INFO, "task.state_changed", "Task state changed", task_id=task_id, chat_id=previous["chat_id"], chat_title=previous["chat_title"], previous_status=previous["status"], status=values["status"])
 
 
+TASK_MEDIA_WITH_ARCHIVE_SQL = """
+    SELECT m.*,
+           archive.id AS archive_item_id,
+           blob.content_hash AS archive_content_hash,
+           blob.thumbnail_status AS archive_thumbnail_status,
+           archive.created_at AS archive_created_at
+    FROM task_media m
+    JOIN tasks t ON t.id = m.task_id
+    LEFT JOIN archive_items archive ON archive.id = (
+        SELECT candidate.id
+        FROM archive_items candidate
+        LEFT JOIN archive_locations location ON location.id = candidate.location_id
+        WHERE candidate.chat_id = t.chat_id
+          AND candidate.message_id = m.message_id
+          AND candidate.media_type = m.media_type
+          AND COALESCE(location.destination_id, (SELECT id FROM destinations WHERE is_system = 1 AND kind = 'LOCAL' ORDER BY id LIMIT 1))
+              = COALESCE(t.destination_id, (SELECT id FROM destinations WHERE is_system = 1 AND kind = 'LOCAL' ORDER BY id LIMIT 1))
+        ORDER BY candidate.id DESC
+        LIMIT 1
+    )
+    LEFT JOIN media_blobs blob ON blob.id = archive.blob_id
+    WHERE m.task_id = ?
+"""
+
+
 def media_payload(record: sqlite3.Row) -> dict[str, Any]:
     item = dict(record)
+    archive_item_id = item.pop("archive_item_id", None)
+    archive_content_hash = item.pop("archive_content_hash", None)
+    archive_thumbnail_status = item.pop("archive_thumbnail_status", None)
+    archive_created_at = item.pop("archive_created_at", None)
+    thumbnail_url = None
+    if item["status"] == "COMPLETED" and archive_item_id and archive_thumbnail_status == "READY":
+        cache_key = archive_content_hash or archive_created_at or archive_item_id
+        thumbnail_url = f"/api/archives/media/{archive_item_id}/thumbnail?v={quote(str(cache_key), safe='')}"
     downloaded = item["size_bytes"] if item["status"] == "COMPLETED" else min(item["downloaded_bytes"], item["size_bytes"])
     return {
         **item,
+        "thumbnail_url": thumbnail_url,
         "downloaded_bytes": downloaded,
         "percent": min(100, int(downloaded / item["size_bytes"] * 100)) if item["size_bytes"] else 0,
     }
