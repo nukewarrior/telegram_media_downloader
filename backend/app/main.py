@@ -13,6 +13,7 @@ import secrets
 import shutil
 import sqlite3
 import sys
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -31,7 +32,13 @@ from PIL import ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError, RpcCallFailError, SessionPasswordNeededError, TimedOutError
-from app.storage import Destination, StorageError, webdav_client_manager
+from app.storage import (
+    Destination,
+    StorageError,
+    clear_last_directory_cache_metrics,
+    get_last_directory_cache_metrics,
+    webdav_client_manager,
+)
 
 try:
     import cryptg
@@ -100,7 +107,32 @@ LOG_FILE_PREFIX = "telegram-media-archiver-"
 LOG_RETENTION_DAYS = 30
 LOG_FAILURE_REPORT_INTERVAL = timedelta(minutes=5)
 LOGGER = logging.getLogger("telegram_media_archiver")
-SENSITIVE_LOG_KEY_PARTS = ("api_hash", "password", "code", "session", "token", "attempt_id")
+SENSITIVE_LOG_KEY_PARTS = (
+    "api_hash",
+    "password",
+    "code",
+    "session",
+    "token",
+    "attempt_id",
+    "request_param",
+    "request_body",
+    "query",
+    "remote_auth",
+    "authorization",
+    "credential",
+)
+
+
+def monotonic_duration_ms(started_at: float) -> int:
+    """Return elapsed milliseconds using a monotonic clock."""
+    return max(0, round((time.monotonic() - started_at) * 1000))
+
+
+def average_bytes_per_second(size_bytes: int | None, duration_ms: int | None) -> int | None:
+    """Calculate a rate only for a completed, non-zero measured interval."""
+    if size_bytes is None or duration_ms is None or duration_ms <= 0:
+        return None
+    return max(0, round(size_bytes * 1000 / duration_ms))
 
 
 def local_now() -> datetime:
@@ -1163,6 +1195,7 @@ async def prepare_archive_thumbnail(source: Path, media_type: str, *, task_id: i
     if media_type not in ARCHIVE_THUMBNAIL_MEDIA_TYPES:
         return None, None
     target = THUMBNAIL_ROOT / f".archive-{task_id}-{media_id}-{secrets.token_hex(6)}.jpg"
+    thumbnail_started_at = time.monotonic()
     try:
         log_event(
             logging.INFO,
@@ -1175,6 +1208,21 @@ async def prepare_archive_thumbnail(source: Path, media_type: str, *, task_id: i
             target_path=str(target),
         )
         await render_archive_thumbnail(source, target, media_type)
+        thumbnail_duration_ms = monotonic_duration_ms(thumbnail_started_at)
+        source_size_bytes: int | None = None
+        try:
+            source_size_bytes = source.stat().st_size
+        except OSError:
+            pass
+        log_event(
+            logging.INFO,
+            "archive.thumbnail_completed",
+            "Archive thumbnail generation completed",
+            media_type=media_type,
+            size_bytes=source_size_bytes,
+            duration_ms=thumbnail_duration_ms,
+            status="success",
+        )
         log_event(
             logging.INFO,
             "thumbnail.prepared",
@@ -1185,9 +1233,36 @@ async def prepare_archive_thumbnail(source: Path, media_type: str, *, task_id: i
             target_path=str(target),
         )
         return target, None
+    except asyncio.CancelledError:
+        target.unlink(missing_ok=True)
+        log_event(
+            logging.INFO,
+            "archive.thumbnail_failed",
+            "Archive thumbnail generation was cancelled",
+            media_type=media_type,
+            size_bytes=None,
+            duration_ms=monotonic_duration_ms(thumbnail_started_at),
+            status="cancelled",
+        )
+        raise
     except (UnidentifiedImageError, OSError, RuntimeError) as error:
         target.unlink(missing_ok=True)
         message = str(error)[:500] or "无法生成缩略图"
+        source_size_bytes = None
+        try:
+            source_size_bytes = source.stat().st_size
+        except OSError:
+            pass
+        log_event(
+            logging.WARNING,
+            "archive.thumbnail_failed",
+            "Archive thumbnail generation failed",
+            media_type=media_type,
+            size_bytes=source_size_bytes,
+            duration_ms=monotonic_duration_ms(thumbnail_started_at),
+            status="failed",
+            error_type=type(error).__name__,
+        )
         log_event(
             logging.WARNING,
             "thumbnail.prepare_failed",
@@ -1220,20 +1295,70 @@ async def generate_thumbnail(blob: sqlite3.Row) -> None:
             except StorageError as error:
                 temporary_source.unlink(missing_ok=True)
                 set_thumbnail_result(blob["id"], "FAILED", error=str(error)[:500])
+                log_event(
+                    logging.WARNING,
+                    "archive.thumbnail_failed",
+                    "Archive thumbnail source was unavailable",
+                    media_type=blob["media_type"],
+                    size_bytes=blob["size_bytes"],
+                    duration_ms=None,
+                    status="source_unavailable",
+                    error_type=type(error).__name__,
+                )
                 return
     else:
         source = path_in_root(blob["canonical_path"], DOWNLOAD_ROOT)
     if not source or not source.is_file():
         set_thumbnail_result(blob["id"], "UNAVAILABLE", error="原始归档文件不存在")
+        log_event(
+            logging.INFO,
+            "archive.thumbnail_failed",
+            "Archive thumbnail generation was unavailable",
+            media_type=blob["media_type"],
+            size_bytes=blob["size_bytes"],
+            duration_ms=None,
+            status="unavailable",
+        )
         return
     target = THUMBNAIL_ROOT / f"{blob['id']}.jpg"
+    thumbnail_started_at = time.monotonic()
     try:
         log_event(logging.INFO, "thumbnail.started", "Thumbnail generation started", blob_id=blob["id"], media_type=blob["media_type"], source_path=str(source), target_path=str(target))
         await render_archive_thumbnail(source, target, blob["media_type"])
+        log_event(
+            logging.INFO,
+            "archive.thumbnail_completed",
+            "Archive thumbnail generation completed",
+            media_type=blob["media_type"],
+            size_bytes=blob["size_bytes"],
+            duration_ms=monotonic_duration_ms(thumbnail_started_at),
+            status="success",
+        )
     except (UnidentifiedImageError, OSError, RuntimeError) as error:
+        log_event(
+            logging.WARNING,
+            "archive.thumbnail_failed",
+            "Archive thumbnail generation failed",
+            media_type=blob["media_type"],
+            size_bytes=blob["size_bytes"],
+            duration_ms=monotonic_duration_ms(thumbnail_started_at),
+            status="failed",
+            error_type=type(error).__name__,
+        )
         log_event(logging.ERROR, "thumbnail.failed", "Thumbnail generation failed", exc_info=True, blob_id=blob["id"], media_type=blob["media_type"], source_path=str(source), error_type=type(error).__name__)
         set_thumbnail_result(blob["id"], "FAILED", error=str(error)[:500])
         return
+    except asyncio.CancelledError:
+        log_event(
+            logging.INFO,
+            "archive.thumbnail_failed",
+            "Archive thumbnail generation was cancelled",
+            media_type=blob["media_type"],
+            size_bytes=blob["size_bytes"],
+            duration_ms=monotonic_duration_ms(thumbnail_started_at),
+            status="cancelled",
+        )
+        raise
     finally:
         if temporary_source:
             temporary_source.unlink(missing_ok=True)
@@ -3228,15 +3353,85 @@ async def preview_download_job(cache_id: int) -> None:
 
 
 async def download_media_job(task_id: int, media_id: int) -> None:
+    total_started_at = time.monotonic()
+    stage_names = ("telegram_download", "hash", "thumbnail", "delivery")
+    stage_started_at: dict[str, float | None] = {name: None for name in stage_names}
+    stage_duration_ms: dict[str, int | None] = {name: None for name in stage_names}
+    stage_status: dict[str, str] = {name: "not_started" for name in stage_names}
+    media_size_bytes: int | None = None
+    delivery_kind: str | None = None
+    task: Any | None = None
+    media: Any | None = None
+    destination: Destination | None = None
+
+    def start_stage(name: str) -> None:
+        stage_started_at[name] = time.monotonic()
+        stage_status[name] = "running"
+
+    def finish_stage(name: str, status: str) -> None:
+        started_at = stage_started_at[name]
+        if started_at is not None and stage_duration_ms[name] is None:
+            stage_duration_ms[name] = monotonic_duration_ms(started_at)
+        if started_at is not None:
+            stage_status[name] = status
+
+    def finish_active_stages(status: str) -> None:
+        for name in stage_names:
+            if stage_status[name] == "running":
+                finish_stage(name, status)
+
+    def performance_fields() -> dict[str, Any]:
+        return {
+            "size_bytes": media_size_bytes,
+            "telegram_download_duration_ms": stage_duration_ms["telegram_download"],
+            "telegram_download_status": stage_status["telegram_download"],
+            "telegram_average_bps": average_bytes_per_second(media_size_bytes, stage_duration_ms["telegram_download"])
+            if stage_status["telegram_download"] == "completed"
+            else None,
+            "hash_duration_ms": stage_duration_ms["hash"],
+            "hash_status": stage_status["hash"],
+            "thumbnail_duration_ms": stage_duration_ms["thumbnail"],
+            "thumbnail_status": stage_status["thumbnail"],
+            "delivery_duration_ms": stage_duration_ms["delivery"],
+            "delivery_status": stage_status["delivery"],
+            "delivery_kind": delivery_kind,
+            "delivery_average_bps": average_bytes_per_second(media_size_bytes, stage_duration_ms["delivery"])
+            if stage_status["delivery"] == "completed"
+            else None,
+            "total_duration_ms": monotonic_duration_ms(total_started_at),
+        }
+
+    def log_webdav_delivery(status: str, *, error_type: str | None = None) -> None:
+        if delivery_kind != "webdav" or destination is None:
+            return
+        cache_metrics = get_last_directory_cache_metrics()
+        duration_ms = stage_duration_ms["delivery"]
+        log_event(
+            logging.INFO if status == "success" else logging.WARNING,
+            "webdav.upload_completed" if status == "success" else "webdav.upload_failed",
+            "WebDAV archive delivery completed" if status == "success" else "WebDAV archive delivery failed",
+            destination_id=destination.id,
+            size_bytes=media_size_bytes,
+            duration_ms=duration_ms,
+            average_bps=average_bytes_per_second(media_size_bytes, duration_ms) if status == "success" else None,
+            status=status,
+            directory_cache_hits=cache_metrics.hits if cache_metrics else None,
+            directory_cache_misses=cache_metrics.misses if cache_metrics else None,
+            directory_cache_metrics_status="collected" if cache_metrics else "unavailable",
+            error_type=error_type,
+        )
+
     try:
         with connection() as db:
             task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             media = db.execute("SELECT * FROM task_media WHERE id = ? AND task_id = ?", (media_id, task_id)).fetchone()
         if not task or not media or current_task_status(task_id) not in {"DOWNLOADING", "RETRYING"}:
             return
+        media_size_bytes = int(media["size_bytes"])
         log_event(logging.INFO, "download.started", "Telegram media download started", task_id=task_id, media_id=media_id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], media_type=media["media_type"], size_bytes=media["size_bytes"])
         destination_version_id = task_destination_version_id(task)
         destination = destination_for_task(task)
+        delivery_kind = "local" if destination.is_local else "webdav"
         base_relative_path = archive_relative_path(task, media)
         part = archive_stage_path(task, media, destination, base_relative_path)
         part.parent.mkdir(parents=True, exist_ok=True)
@@ -3252,6 +3447,7 @@ async def download_media_job(task_id: int, media_id: int) -> None:
                 with connection() as db:
                     db.execute("UPDATE task_media SET preview_cache_id = NULL WHERE id = ?", (media_id,))
                 preview_adopted = True
+                stage_status["telegram_download"] = "skipped_preview_adopted"
             elif preview_part and preview_part.is_file() and not part.exists():
                 os.replace(preview_part, part)
                 update_preview_cache(preview["id"], status="CONSUMED", expires_at=now())
@@ -3266,6 +3462,7 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             if staged_file_reused:
                 update_parallel_download_progress(task_id, media_id, media["size_bytes"], 0)
                 log_event(logging.INFO, "download.staging_reused", "Reusing completed local staging file before destination delivery", task_id=task_id, media_id=media_id, destination_id=destination.id, size_bytes=media["size_bytes"])
+                stage_status["telegram_download"] = "skipped_staging_reused"
         if not preview_adopted and not staged_file_reused:
             client = await get_download_client()
             async with TELEGRAM_LOCK:
@@ -3273,7 +3470,8 @@ async def download_media_job(task_id: int, media_id: int) -> None:
                 message = await client.get_messages(entity, ids=media["message_id"])
             if not message:
                 raise RuntimeError("消息已不可用")
-            started_at = asyncio.get_running_loop().time()
+            start_stage("telegram_download")
+            started_at = stage_started_at["telegram_download"] or time.monotonic()
             last_persisted_at = 0.0
             last_persisted_bytes = 0
 
@@ -3286,13 +3484,49 @@ async def download_media_job(task_id: int, media_id: int) -> None:
                 last_persisted_bytes = current
                 update_parallel_download_progress(task_id, media_id, current, round(current / max(current_time - started_at, 0.001)))
 
-            result = await client.download_media(message, file=str(part), progress_callback=progress)
-            if not result:
-                raise RuntimeError("Telegram 未返回下载文件")
+            try:
+                result = await client.download_media(message, file=str(part), progress_callback=progress)
+                if not result:
+                    raise RuntimeError("Telegram 未返回下载文件")
+            except asyncio.CancelledError:
+                finish_stage("telegram_download", "cancelled")
+                raise
+            except Exception:
+                finish_stage("telegram_download", "failed")
+                raise
+            else:
+                finish_stage("telegram_download", "completed")
         if not part.is_file():
             raise RuntimeError("下载完成后未生成有效暂存文件")
         staging_fingerprint = file_stat_fingerprint(part)
-        content_hash = await asyncio.to_thread(file_sha256, part)
+        start_stage("hash")
+        try:
+            content_hash = await asyncio.to_thread(file_sha256, part)
+        except asyncio.CancelledError:
+            finish_stage("hash", "cancelled")
+            raise
+        except Exception as error:
+            finish_stage("hash", "failed")
+            log_event(
+                logging.WARNING,
+                "archive.hash_failed",
+                "Archive SHA-256 calculation failed",
+                size_bytes=staging_fingerprint[2],
+                duration_ms=stage_duration_ms["hash"],
+                status="failed",
+                error_type=type(error).__name__,
+            )
+            raise
+        else:
+            finish_stage("hash", "completed")
+            log_event(
+                logging.INFO,
+                "archive.hash_completed",
+                "Archive SHA-256 calculation completed",
+                size_bytes=staging_fingerprint[2],
+                duration_ms=stage_duration_ms["hash"],
+                status="success",
+            )
         assert_file_fingerprint(
             part,
             staging_fingerprint,
@@ -3304,12 +3538,24 @@ async def download_media_job(task_id: int, media_id: int) -> None:
         thumbnail_attempted = media["media_type"] in ARCHIVE_THUMBNAIL_MEDIA_TYPES
         try:
             if thumbnail_attempted:
-                prepared_thumbnail, thumbnail_error = await prepare_archive_thumbnail(
-                    part,
-                    media["media_type"],
-                    task_id=task_id,
-                    media_id=media_id,
-                )
+                start_stage("thumbnail")
+                try:
+                    prepared_thumbnail, thumbnail_error = await prepare_archive_thumbnail(
+                        part,
+                        media["media_type"],
+                        task_id=task_id,
+                        media_id=media_id,
+                    )
+                except asyncio.CancelledError:
+                    finish_stage("thumbnail", "cancelled")
+                    raise
+                except Exception:
+                    finish_stage("thumbnail", "failed")
+                    raise
+                else:
+                    finish_stage("thumbnail", "failed" if thumbnail_error else "completed")
+            else:
+                stage_status["thumbnail"] = "skipped_not_applicable"
             assert_file_fingerprint(
                 part,
                 content_fingerprint,
@@ -3318,9 +3564,23 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             async with archive_delivery_guard(destination.id, base_relative_path):
                 relative_path = resolve_archive_relative_path(destination, base_relative_path, content_hash)
                 final_path = destination.local_path(relative_path) if destination.is_local else None
-                if final_path:
-                    final_path.parent.mkdir(parents=True, exist_ok=True)
-                await destination.upload_file(part, relative_path)
+                start_stage("delivery")
+                clear_last_directory_cache_metrics()
+                try:
+                    if final_path:
+                        final_path.parent.mkdir(parents=True, exist_ok=True)
+                    await destination.upload_file(part, relative_path)
+                except asyncio.CancelledError:
+                    finish_stage("delivery", "cancelled")
+                    log_webdav_delivery("cancelled")
+                    raise
+                except Exception as error:
+                    finish_stage("delivery", "failed")
+                    log_webdav_delivery("failed", error_type=type(error).__name__)
+                    raise
+                else:
+                    finish_stage("delivery", "completed")
+                    log_webdav_delivery("success")
                 archive_path = final_path if final_path else part
                 record_archive(
                     task,
@@ -3342,8 +3602,9 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             if prepared_thumbnail:
                 prepared_thumbnail.unlink(missing_ok=True)
         update_media(task_id, media_id, status="COMPLETED", downloaded_bytes=media["size_bytes"], speed_bytes_per_second=0, error_message=None, failure_category=None)
-        log_event(logging.INFO, "download.completed", "Telegram media download completed", task_id=task_id, media_id=media_id, destination_id=destination.id, filename=media["filename"], archive_path=str(relative_path), size_bytes=media["size_bytes"])
+        log_event(logging.INFO, "download.completed", "Telegram media download completed", task_id=task_id, media_id=media_id, destination_id=destination.id, filename=media["filename"], archive_path=str(relative_path), **performance_fields())
     except asyncio.CancelledError:
+        finish_active_stages("cancelled")
         status = current_task_status(task_id)
         key = (task_id, media_id)
         if key in DOWNLOAD_REQUEUED_CANCELS:
@@ -3353,20 +3614,23 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             update_media(task_id, media_id, status="PENDING", speed_bytes_per_second=0, error_message=None)
         elif status == "CANCELLED":
             update_media(task_id, media_id, status="PENDING", speed_bytes_per_second=0)
-        log_event(logging.INFO, "download.cancelled", "Telegram media download cancelled", task_id=task_id, media_id=media_id, task_status=status)
+        log_event(logging.INFO, "download.cancelled", "Telegram media download cancelled", task_id=task_id, media_id=media_id, task_status=status, **performance_fields())
         raise
     except FloodWaitError as error:
+        finish_active_stages("rate_limited")
         seconds = max(1, int(getattr(error, "seconds", 1)))
         register_flood_wait(seconds)
         update_media(task_id, media_id, status="RETRY_WAIT", speed_bytes_per_second=0, next_retry_at=DOWNLOAD_FLOOD_UNTIL.isoformat() if DOWNLOAD_FLOOD_UNTIL else now(), failure_category="RATE_LIMIT", error_message=f"Telegram 限流，约 {seconds} 秒后自动继续")
     except Exception as error:
         if type(error).__name__ in {"FloodPremiumWaitError", "FloodWaitError"}:
+            finish_active_stages("rate_limited")
             seconds = max(1, int(getattr(error, "seconds", 1)))
             register_flood_wait(seconds)
             update_media(task_id, media_id, status="RETRY_WAIT", speed_bytes_per_second=0, next_retry_at=DOWNLOAD_FLOOD_UNTIL.isoformat() if DOWNLOAD_FLOOD_UNTIL else now(), failure_category="RATE_LIMIT", error_message=f"Telegram 限流，约 {seconds} 秒后自动继续")
             return
+        finish_active_stages("failed")
         category, recoverable, message = classify_download_error(error)
-        log_event(logging.ERROR if not recoverable else logging.WARNING, "download.failed", "Media download or destination delivery failed", exc_info=True, task_id=task_id, media_id=media_id, error_type=type(error).__name__, failure_category=category, recoverable=recoverable)
+        log_event(logging.ERROR if not recoverable else logging.WARNING, "download.failed", "Media download or destination delivery failed", exc_info=True, task_id=task_id, media_id=media_id, error_type=type(error).__name__, failure_category=category, recoverable=recoverable, **performance_fields())
         if isinstance(error, TimedOutError):
             request_download_client_reset(task_id, media_id)
         if category == "AUTH":
@@ -3607,6 +3871,7 @@ def record_archive(
 
 async def download_demo_media_job(task_id: int, media_id: int) -> None:
     """Use the same pool in demo mode so concurrency controls remain observable."""
+    total_started_at = time.monotonic()
     try:
         while current_task_status(task_id) in {"DOWNLOADING", "RETRYING"}:
             with connection() as db:
@@ -3618,7 +3883,28 @@ async def download_demo_media_job(task_id: int, media_id: int) -> None:
             update_parallel_download_progress(task_id, media_id, downloaded, 1_000_000)
             if downloaded >= media["size_bytes"]:
                 update_media(task_id, media_id, status="COMPLETED", downloaded_bytes=media["size_bytes"], speed_bytes_per_second=0, error_message=None, failure_category=None)
-                log_event(logging.INFO, "download.completed", "Demo media download completed", task_id=task_id, media_id=media_id, filename=media["filename"], size_bytes=media["size_bytes"], demo_mode=True)
+                log_event(
+                    logging.INFO,
+                    "download.completed",
+                    "Demo media download completed",
+                    task_id=task_id,
+                    media_id=media_id,
+                    filename=media["filename"],
+                    size_bytes=media["size_bytes"],
+                    telegram_download_duration_ms=None,
+                    telegram_download_status="skipped_demo_mode",
+                    telegram_average_bps=None,
+                    hash_duration_ms=None,
+                    hash_status="skipped_demo_mode",
+                    thumbnail_duration_ms=None,
+                    thumbnail_status="skipped_demo_mode",
+                    delivery_duration_ms=None,
+                    delivery_status="skipped_demo_mode",
+                    delivery_kind=None,
+                    delivery_average_bps=None,
+                    total_duration_ms=monotonic_duration_ms(total_started_at),
+                    demo_mode=True,
+                )
                 return
             await asyncio.sleep(1)
     except asyncio.CancelledError:

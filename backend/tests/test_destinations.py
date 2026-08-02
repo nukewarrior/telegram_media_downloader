@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
+import logging
 import os
 import shutil
 import tempfile
@@ -739,11 +741,18 @@ class DestinationTests(unittest.TestCase):
         staged = main.archive_stage_path(task, media, destination, relative)
         staged.parent.mkdir(parents=True, exist_ok=True)
         staged.write_bytes(b"data")
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(main.JsonLogFormatter())
+        main.LOGGER.addHandler(handler)
         with (
             patch.object(Destination, "upload_file", new_callable=AsyncMock, side_effect=StorageError("remote unavailable")) as upload,
             patch.object(main, "get_download_client", new_callable=AsyncMock) as telegram_client,
         ):
-            asyncio.run(main.download_media_job(task_id, media_id))
+            try:
+                asyncio.run(main.download_media_job(task_id, media_id))
+            finally:
+                main.LOGGER.removeHandler(handler)
 
         upload.assert_awaited_once()
         telegram_client.assert_not_awaited()
@@ -751,6 +760,14 @@ class DestinationTests(unittest.TestCase):
             status = db.execute("SELECT status FROM task_media WHERE id = ?", (media_id,)).fetchone()[0]
         self.assertEqual(status, "RETRY_WAIT")
         self.assertTrue(staged.exists())
+        events = [json.loads(line) for line in stream.getvalue().splitlines() if line]
+        failed_upload = next(event for event in events if event["event"] == "webdav.upload_failed")
+        self.assertEqual(failed_upload["status"], "failed")
+        self.assertIsInstance(failed_upload["duration_ms"], int)
+        self.assertEqual(failed_upload["directory_cache_metrics_status"], "unavailable")
+        download_failed = next(event for event in events if event["event"] == "download.failed")
+        self.assertEqual(download_failed["delivery_status"], "failed")
+        self.assertIsInstance(download_failed["delivery_duration_ms"], int)
 
     def test_webdav_delivery_prepares_thumbnail_without_remote_readback(self) -> None:
         server = MockWebDAV()
@@ -785,11 +802,18 @@ class DestinationTests(unittest.TestCase):
         async def client_factory(_: Destination) -> httpx.AsyncClient:
             return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
 
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(main.JsonLogFormatter())
+        main.LOGGER.addHandler(handler)
         with (
             patch.object(Destination, "_client", client_factory),
             patch.object(Destination, "download_to_file", new_callable=AsyncMock) as readback,
         ):
-            asyncio.run(main.download_media_job(task_id, media_id))
+            try:
+                asyncio.run(main.download_media_job(task_id, media_id))
+            finally:
+                main.LOGGER.removeHandler(handler)
             requests_before_archive_reads = list(server.requests)
             with TestClient(main.app) as client:
                 items = client.get("/api/archives/media", params={"destination_id": destination_id})
@@ -812,6 +836,16 @@ class DestinationTests(unittest.TestCase):
         self.assertEqual(blob["thumbnail_status"], "READY")
         self.assertTrue(Path(blob["thumbnail_path"]).is_file())
         self.assertFalse(staged.exists())
+        events = [json.loads(line) for line in stream.getvalue().splitlines() if line]
+        completed_upload = next(event for event in events if event["event"] == "webdav.upload_completed")
+        self.assertEqual(completed_upload["status"], "success")
+        self.assertIsInstance(completed_upload["duration_ms"], int)
+        self.assertEqual(completed_upload["directory_cache_metrics_status"], "collected")
+        self.assertGreaterEqual(completed_upload["directory_cache_misses"], 1)
+        completed_download = next(event for event in events if event["event"] == "download.completed")
+        self.assertEqual(completed_download["delivery_kind"], "webdav")
+        self.assertEqual(completed_download["thumbnail_status"], "completed")
+        self.assertIsInstance(completed_download["total_duration_ms"], int)
 
     def test_webdav_thumbnail_failure_does_not_fail_archive(self) -> None:
         server = MockWebDAV()
@@ -958,9 +992,15 @@ class DestinationTests(unittest.TestCase):
         async def exercise() -> None:
             with patch.object(storage, "webdav_client_manager", manager):
                 await destination.upload_file(first, "same-chat/2026/08/a.bin")
+                first_metrics = storage.get_last_directory_cache_metrics()
                 await destination.upload_file(second, "same-chat/2026/08/b.bin")
+                second_metrics = storage.get_last_directory_cache_metrics()
                 self.assertEqual(manager.cached_client_count, 1)
                 self.assertEqual(manager.directory_cache_count, 6)
+                self.assertIsNotNone(first_metrics)
+                self.assertEqual((first_metrics.hits, first_metrics.misses), (0, 6))
+                self.assertIsNotNone(second_metrics)
+                self.assertEqual((second_metrics.hits, second_metrics.misses), (6, 0))
                 await manager.close()
 
         asyncio.run(exercise())

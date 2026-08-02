@@ -66,6 +66,41 @@ class StructuredLoggingTests(unittest.TestCase):
         self.assertNotIn("must-not-appear", self.stream.getvalue())
         self.assertIn("test.event", self.current_log_path().read_text())
 
+    def test_performance_events_are_jsonl_and_exclude_sensitive_context(self) -> None:
+        main.log_event(
+            logging.INFO,
+            "download.completed",
+            "Performance telemetry",
+            size_bytes=1024,
+            telegram_download_duration_ms=10,
+            telegram_download_status="completed",
+            telegram_average_bps=102400,
+            hash_duration_ms=2,
+            hash_status="completed",
+            thumbnail_duration_ms=None,
+            thumbnail_status="skipped_not_applicable",
+            delivery_duration_ms=4,
+            delivery_status="completed",
+            delivery_kind="local",
+            delivery_average_bps=256000,
+            total_duration_ms=20,
+            api_hash="secret-api-hash",
+            password="secret-password",
+            code="secret-code",
+            session="secret-session",
+            request_params="secret-params",
+            remote_auth="secret-auth",
+        )
+
+        event = self.events()[0]
+        self.assertEqual(event["event"], "download.completed")
+        self.assertEqual(event["size_bytes"], 1024)
+        self.assertIsNone(event["thumbnail_duration_ms"])
+        for forbidden_key in ("api_hash", "password", "code", "session", "request_params", "remote_auth"):
+            self.assertNotIn(forbidden_key, event)
+        for forbidden_value in ("secret-api-hash", "secret-password", "secret-code", "secret-session", "secret-params", "secret-auth"):
+            self.assertNotIn(forbidden_value, self.stream.getvalue())
+
     def test_error_events_include_traceback(self) -> None:
         try:
             raise RuntimeError("expected logging test failure")

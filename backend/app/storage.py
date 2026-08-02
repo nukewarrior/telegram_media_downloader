@@ -4,7 +4,9 @@ import asyncio
 import os
 import secrets
 import shutil
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -14,6 +16,30 @@ import httpx
 
 class StorageError(RuntimeError):
     """A destination could not be read or written."""
+
+
+@dataclass
+class DirectoryCacheMetrics:
+    """Per-upload WebDAV directory cache lookup counts."""
+
+    hits: int = 0
+    misses: int = 0
+
+
+_LAST_UPLOAD_DIRECTORY_CACHE_METRICS: ContextVar[DirectoryCacheMetrics | None] = ContextVar(
+    "last_upload_directory_cache_metrics",
+    default=None,
+)
+
+
+def clear_last_directory_cache_metrics() -> None:
+    """Forget the previous upload's metrics in the current async context."""
+    _LAST_UPLOAD_DIRECTORY_CACHE_METRICS.set(None)
+
+
+def get_last_directory_cache_metrics() -> DirectoryCacheMetrics | None:
+    """Return the current task's most recent WebDAV upload metrics."""
+    return _LAST_UPLOAD_DIRECTORY_CACHE_METRICS.get()
 
 
 _DIRECTORY_STATE_INVALIDATION_STATUSES = frozenset({404, 405, 409, 410, 412, 423})
@@ -365,6 +391,7 @@ class Destination:
 
     async def upload_file(self, source: Path, relative: str | Path) -> None:
         if self.is_local:
+            clear_last_directory_cache_metrics()
             target = self.local_path(relative)
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -376,28 +403,33 @@ class Destination:
         relative_text = _relative_text(relative)
         temporary_relative = f"{relative_text}.part"
         manager = webdav_client_manager
+        cache_metrics: DirectoryCacheMetrics | None = None
         try:
-            client = await manager.get_client(self)
-            for attempt in range(2):
-                try:
-                    await self._ensure_remote_directories(client, relative_text, directory_cache=manager)
-                    response = await client.put(self.remote_url(temporary_relative), content=_AsyncFileStream(source))
-                    self._check_response(response, "上传文件")
-                    response = await client.request(
-                        "MOVE",
-                        self.remote_url(temporary_relative),
-                        headers={"Destination": self.remote_url(relative_text), "Overwrite": "T"},
-                    )
-                    self._check_response(response, "提交文件", accepted={200, 201, 204})
-                    break
-                except _WebDAVResponseError as error:
-                    if attempt or not self._should_retry_directory_state(error):
-                        raise
-                    manager.invalidate_directory(self, self._remote_parent_url(relative_text), include_ancestors=True)
+            async with manager.collect_directory_cache_metrics() as collected_metrics:
+                cache_metrics = collected_metrics
+                client = await manager.get_client(self)
+                for attempt in range(2):
+                    try:
+                        await self._ensure_remote_directories(client, relative_text, directory_cache=manager)
+                        response = await client.put(self.remote_url(temporary_relative), content=_AsyncFileStream(source))
+                        self._check_response(response, "上传文件")
+                        response = await client.request(
+                            "MOVE",
+                            self.remote_url(temporary_relative),
+                            headers={"Destination": self.remote_url(relative_text), "Overwrite": "T"},
+                        )
+                        self._check_response(response, "提交文件", accepted={200, 201, 204})
+                        break
+                    except _WebDAVResponseError as error:
+                        if attempt or not self._should_retry_directory_state(error):
+                            raise
+                        manager.invalidate_directory(self, self._remote_parent_url(relative_text), include_ancestors=True)
         except OSError as error:
             raise StorageError(f"读取本地临时文件失败：{error}") from error
         except httpx.HTTPError as error:
             raise StorageError(f"WebDAV 上传失败：{error}") from error
+        finally:
+            _LAST_UPLOAD_DIRECTORY_CACHE_METRICS.set(cache_metrics)
 
     @staticmethod
     def _should_retry_directory_state(error: _WebDAVResponseError) -> bool:
@@ -472,6 +504,10 @@ class WebDAVClientManager:
         self._clients: dict[tuple[object, ...], httpx.AsyncClient] = {}
         self._directory_cache: dict[tuple[object, ...], set[str]] = {}
         self._directory_locks: dict[tuple[tuple[object, ...], str], asyncio.Lock] = {}
+        self._active_directory_cache_metrics: ContextVar[DirectoryCacheMetrics | None] = ContextVar(
+            f"active_directory_cache_metrics_{id(self)}",
+            default=None,
+        )
         self._active_streams: dict[int, tuple[httpx.AsyncClient, httpx.Response]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock: asyncio.Lock | None = None
@@ -524,6 +560,26 @@ class WebDAVClientManager:
             lock = asyncio.Lock()
             self._directory_locks[key] = lock
         return lock
+
+    @asynccontextmanager
+    async def collect_directory_cache_metrics(self) -> AsyncIterator[DirectoryCacheMetrics]:
+        """Collect cache lookups for one upload without logging each lookup."""
+        metrics = DirectoryCacheMetrics()
+        token = self._active_directory_cache_metrics.set(metrics)
+        try:
+            yield metrics
+        finally:
+            self._active_directory_cache_metrics.reset(token)
+
+    def _record_directory_cache_hit(self) -> None:
+        metrics = self._active_directory_cache_metrics.get()
+        if metrics is not None:
+            metrics.hits += 1
+
+    def _record_directory_cache_miss(self) -> None:
+        metrics = self._active_directory_cache_metrics.get()
+        if metrics is not None:
+            metrics.misses += 1
 
     def invalidate_directory(
         self,
@@ -589,11 +645,15 @@ class WebDAVClientManager:
         namespace = self._directory_namespace(destination)
         entries = self._directory_cache.setdefault(namespace, set())
         if canonical_url in entries:
+            self._record_directory_cache_hit()
             return
+
+        self._record_directory_cache_miss()
 
         lock = self._directory_lock(namespace, canonical_url)
         async with lock:
             if canonical_url in self._directory_cache.get(namespace, set()):
+                self._record_directory_cache_hit()
                 return
             try:
                 if require:
