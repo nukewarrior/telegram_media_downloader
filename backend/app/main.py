@@ -156,6 +156,144 @@ class JsonLogFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+CONSOLE_LEVEL_WIDTH = 8
+CONSOLE_EVENT_WIDTH = 32
+CONSOLE_VALUE_MAX_LENGTH = 256
+CONSOLE_SAFE_STRING_PATTERN = re.compile(r"^[A-Za-z0-9._/@:+%~-]+$")
+
+
+def _truncate_console_value(value: str) -> str:
+    if len(value) <= CONSOLE_VALUE_MAX_LENGTH:
+        return value
+    return value[: CONSOLE_VALUE_MAX_LENGTH - 1] + "…"
+
+
+def _format_console_number(value: int | float) -> str:
+    if isinstance(value, int):
+        return str(value)
+    return str(value)
+
+
+def _format_console_bytes(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    magnitude = abs(float(value))
+    sign = "-" if value < 0 else ""
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    unit_index = 0
+    while magnitude >= 1024 and unit_index < len(units) - 1:
+        magnitude /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        rendered = str(int(magnitude) if magnitude.is_integer() else magnitude)
+        return f"{sign}{rendered}B"
+    rendered = f"{magnitude:.1f}".rstrip("0").rstrip(".")
+    return f"{sign}{rendered}{units[unit_index]}"
+
+
+def _format_console_duration_ms(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    milliseconds = float(value)
+    if abs(milliseconds) < 1000:
+        rendered = _format_console_number(int(value) if milliseconds.is_integer() else value)
+        return f"{rendered}ms"
+    seconds = milliseconds / 1000
+    rendered = f"{seconds:.1f}".rstrip("0").rstrip(".")
+    return f"{rendered}s"
+
+
+def _format_console_seconds(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = float(value)
+    rendered = _format_console_number(int(value) if seconds.is_integer() else value)
+    return f"{rendered}s"
+
+
+def _format_console_rate(value: Any) -> str | None:
+    formatted = _format_console_bytes(value)
+    return f"{formatted}/s" if formatted is not None else None
+
+
+def _console_display_key(key: str) -> str:
+    key_name = key.lower()
+    if key_name == "bytes_per_second":
+        return "rate"
+    if key_name.endswith("_bytes_per_second"):
+        prefix = key[: -len("_bytes_per_second")]
+        return f"{prefix}_rate" if prefix else "rate"
+    if key_name.endswith("_average_bps"):
+        prefix = key[: -len("_average_bps")]
+        return f"{prefix}_rate" if prefix else "rate"
+    for suffix in ("_bytes", "_ms", "_seconds"):
+        if key_name.endswith(suffix):
+            return key[: -len(suffix)]
+    return key
+
+
+def _format_console_string(value: str) -> str:
+    value = _truncate_console_value(value)
+    if CONSOLE_SAFE_STRING_PATTERN.fullmatch(value):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _format_console_value(key: str, value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    key_name = key.lower()
+    if key_name == "bytes_per_second" or key_name.endswith("_bytes_per_second") or key_name.endswith("_bps"):
+        formatted = _format_console_rate(value)
+        if formatted is not None:
+            return formatted
+    elif key_name.endswith("_bytes"):
+        formatted = _format_console_bytes(value)
+        if formatted is not None:
+            return formatted
+    elif key_name.endswith("_ms"):
+        formatted = _format_console_duration_ms(value)
+        if formatted is not None:
+            return formatted
+    elif key_name.endswith("_seconds"):
+        formatted = _format_console_seconds(value)
+        if formatted is not None:
+            return formatted
+    if isinstance(value, (int, float)):
+        return _format_console_number(value)
+    if isinstance(value, str):
+        return _format_console_string(value)
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        rendered = str(value)
+    return _truncate_console_value(rendered)
+
+
+class ConsoleLogFormatter(logging.Formatter):
+    """Emit compact human-readable records for stdout only."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        timestamp = datetime.fromtimestamp(record.created).astimezone().strftime("%H:%M:%S")
+        level = "WARN" if record.levelname == "WARNING" else record.levelname
+        event = getattr(record, "event", "server.log" if record.name.startswith("uvicorn") else "application_log")
+        event_text = str(event).replace("\r", "\\r").replace("\n", "\\n")
+        message = record.getMessage().replace("\r\n", "\\n").replace("\r", "\\r").replace("\n", "\\n")
+        line = f"{timestamp} {level:<{CONSOLE_LEVEL_WIDTH}}{event_text:<{CONSOLE_EVENT_WIDTH}} {message}"
+        event_data = getattr(record, "event_data", {})
+        if isinstance(event_data, dict) and event_data:
+            fields = " ".join(
+                f"{_console_display_key(str(key))}={_format_console_value(str(key), value)}"
+                for key, value in event_data.items()
+            )
+            line += f" | {fields}"
+        if record.exc_info:
+            line += f"\n{self.formatException(record.exc_info)}"
+        return line
+
+
 class DailyCompressedJsonlHandler(logging.Handler):
     """Persist JSONL by local calendar day without allowing file I/O to stop the service."""
 
@@ -300,13 +438,14 @@ class DailyCompressedJsonlHandler(logging.Handler):
 
 
 def configure_logging() -> None:
-    """Send application and Uvicorn logs to stdout and a durable local JSONL stream."""
+    """Send human-readable application logs to stdout and JSONL to durable storage."""
     level = getattr(logging, LOG_LEVEL, logging.INFO)
-    formatter = JsonLogFormatter()
+    console_formatter = ConsoleLogFormatter()
+    json_formatter = JsonLogFormatter()
     stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setFormatter(formatter)
+    stdout_handler.setFormatter(console_formatter)
     persistent_handler = DailyCompressedJsonlHandler(LOG_ROOT, stdout_handler)
-    persistent_handler.setFormatter(formatter)
+    persistent_handler.setFormatter(json_formatter)
     for logger in (LOGGER, logging.getLogger("uvicorn")):
         logger.setLevel(level)
         logger.propagate = False

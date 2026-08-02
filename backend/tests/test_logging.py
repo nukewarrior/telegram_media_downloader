@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -183,6 +184,125 @@ class StructuredLoggingTests(unittest.TestCase):
 
         event = next(event for event in self.events() if event["event"] == "telegram.crypto_acceleration")
         self.assertFalse(event["cryptg_available"])
+
+    def test_stdout_and_persistent_handlers_use_separate_formatters(self) -> None:
+        stdout_handlers = [
+            handler
+            for handler in main.LOGGER.handlers
+            if isinstance(handler, logging.StreamHandler) and isinstance(handler.formatter, main.ConsoleLogFormatter)
+        ]
+        persistent_handlers = [handler for handler in main.LOGGER.handlers if isinstance(handler, main.DailyCompressedJsonlHandler)]
+
+        self.assertEqual(len(stdout_handlers), 1)
+        self.assertIsInstance(persistent_handlers[0].formatter, main.JsonLogFormatter)
+
+
+class ConsoleLogFormatterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.formatter = main.ConsoleLogFormatter()
+
+    def record(self, level: int, event: str, message: str, **event_data: object) -> logging.LogRecord:
+        record = logging.LogRecord("telegram_media_archiver", level, __file__, 1, message, (), None)
+        record.event = event
+        record.event_data = event_data
+        return record
+
+    def test_levels_event_and_message_are_easy_to_scan(self) -> None:
+        info = self.formatter.format(self.record(logging.INFO, "download.completed", "Download completed"))
+        warning = self.formatter.format(self.record(logging.WARNING, "download.rate_limited", "Telegram rate limited"))
+        error = self.formatter.format(self.record(logging.ERROR, "download.failed", "Download failed"))
+
+        self.assertIn("INFO    download.completed", info)
+        self.assertIn("WARN    download.rate_limited", warning)
+        self.assertIn("ERROR   download.failed", error)
+        self.assertIn("Download completed", info)
+
+    def test_event_data_formats_common_values_and_quotes_ambiguous_strings(self) -> None:
+        output = self.formatter.format(
+            self.record(
+                logging.INFO,
+                "task.created",
+                "Archive task created",
+                task_id=12,
+                status="DOWNLOADING",
+                chat_title="技术交流群",
+                filename="My Video 01.mp4",
+                optional=None,
+                enabled=True,
+                count=128,
+            )
+        )
+
+        self.assertIn(" | task_id=12 status=DOWNLOADING chat_title=\"技术交流群\" filename=\"My Video 01.mp4\" optional=null enabled=true count=128", output)
+
+    def test_machine_units_are_humanized_only_in_console_output(self) -> None:
+        record = self.record(
+            logging.INFO,
+            "download.completed",
+            "Download completed",
+            size_bytes=9_122_611,
+            duration_ms=2_134,
+            bytes_per_second=4_300_000,
+            telegram_average_bps=4_300_000,
+        )
+
+        console = self.formatter.format(record)
+        persisted = json.loads(main.JsonLogFormatter().format(record))
+
+        self.assertIn("size=8.7MiB", console)
+        self.assertIn("duration=2.1s", console)
+        self.assertIn("rate=4.1MiB/s", console)
+        self.assertEqual(persisted["size_bytes"], 9_122_611)
+        self.assertEqual(persisted["duration_ms"], 2_134)
+        self.assertEqual(persisted["bytes_per_second"], 4_300_000)
+
+    def test_long_string_is_truncated_without_affecting_json_formatter(self) -> None:
+        long_value = "https://example.test/" + "x" * 5_000
+        record = self.record(logging.ERROR, "http.request_failed", "HTTP request failed", error=long_value)
+
+        console = self.formatter.format(record)
+        persisted = json.loads(main.JsonLogFormatter().format(record))
+
+        self.assertLess(len(console), 400)
+        self.assertIn("…", console)
+        self.assertNotIn(long_value, console)
+        self.assertEqual(persisted["error"], long_value)
+
+    def test_exception_keeps_a_readable_line_and_full_traceback(self) -> None:
+        try:
+            raise TimeoutError("expected console traceback")
+        except TimeoutError:
+            record = self.record(logging.ERROR, "download.failed", "Download failed", error_type="TimeoutError")
+            record.exc_info = sys.exc_info()
+
+        output = self.formatter.format(record)
+
+        self.assertIn("ERROR   download.failed", output.splitlines()[0])
+        self.assertIn("Download failed", output.splitlines()[0])
+        self.assertIn("TimeoutError: expected console traceback", output)
+
+    def test_sensitive_context_filtering_is_preserved_for_console_output(self) -> None:
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(self.formatter)
+        main.LOGGER.addHandler(handler)
+        try:
+            main.log_event(
+                logging.INFO,
+                "test.console_sensitive",
+                "Console event",
+                api_hash="secret-api-hash",
+                password="secret-password",
+                request_body="secret-body",
+                visible="ok",
+            )
+        finally:
+            main.LOGGER.removeHandler(handler)
+
+        output = stream.getvalue()
+        self.assertIn("visible=ok", output)
+        for secret in ("secret-api-hash", "secret-password", "secret-body"):
+            self.assertNotIn(secret, output)
 
 
 class DailyCompressedJsonlHandlerTests(unittest.TestCase):

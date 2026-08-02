@@ -27,7 +27,7 @@ cp .env.example .env
 # 使用 NAS 或其他绝对路径
 ./run.sh -d /mnt/nas/telegram-archive restart
 
-# 输出更详细的 JSON 业务日志（默认 INFO）
+# 输出更详细的业务日志（默认 INFO）
 ./run.sh --log-level DEBUG restart
 
 # 暂停服务 / 移除容器和网络；两者都会保留数据目录
@@ -39,9 +39,21 @@ cp .env.example .env
 
 ### 运行日志
 
-服务启动、错误、HTTP 访问和业务事件均输出为每行一个 JSON 对象，并同时写入容器输出与 `data/logs/`。日志使用宿主机本地时区（带 UTC 偏移）；容器只读挂载 `/etc/localtime` 来继承该时区。HTTP 访问日志只记录方法、路径、状态、客户端地址和耗时，绝不记录查询参数或请求体。使用 `-l` / `--log-level` 指定 `DEBUG`、`INFO`、`WARNING`、`ERROR` 或 `CRITICAL`，未指定时为 `INFO`。直接使用 Docker Compose 时，可在 `.env` 设置 `LOG_LEVEL` 作为容器默认值；`run.sh` 始终以其参数（或默认的 `INFO`）传入等级。
+`./run.sh start`、`./run.sh restart` 和 `docker logs -f telegram-media-archiver` 显示人类可读的紧凑单行日志，例如：
 
-每天首次写日志时创建 `data/logs/telegram-media-archiver-YYYY-MM-DD.jsonl`；跨日后旧文件会压缩为 `.jsonl.gz`，活动日期在内最多保留 30 天。可用 `zgrep 'download.rate_limited' data/logs/*.jsonl.gz` 检查历史事件。文件日志会在 `run.sh down` 后继续保留；Docker 的实时副本仅保留 3 个、每个最多 10 MiB，供 `docker logs` 快速查看。文件系统不可写、磁盘满或压缩失败时，服务会继续运行并在 stdout 输出限频告警。
+```text
+15:42:37 INFO    download.completed             Download completed | task_id=12 message_id=8821 size=175.8MiB duration=6.2s
+```
+
+服务启动、错误、HTTP 访问和业务事件仍会同时写入 `data/logs/` 的完整结构化 JSONL；终端格式化不会改变文件日志。日志使用宿主机本地时区（带 UTC 偏移）；容器只读挂载 `/etc/localtime` 来继承该时区。HTTP 访问日志只记录方法、路径、状态、客户端地址和耗时，绝不记录查询参数或请求体。使用 `-l` / `--log-level` 指定 `DEBUG`、`INFO`、`WARNING`、`ERROR` 或 `CRITICAL`，未指定时为 `INFO`。直接使用 Docker Compose 时，可在 `.env` 设置 `LOG_LEVEL` 作为容器默认值；`run.sh` 始终以其参数（或默认的 `INFO`）传入等级。
+
+每天首次写日志时创建 `data/logs/telegram-media-archiver-YYYY-MM-DD.jsonl`；每行仍是一个完整 JSON 对象，例如：
+
+```json
+{"timestamp":"2026-08-02T15:42:37+08:00","level":"INFO","logger":"telegram_media_archiver","event":"download.completed","message":"Download completed","size_bytes":184320000}
+```
+
+跨日后旧文件会压缩为 `.jsonl.gz`，活动日期在内最多保留 30 天。可用 `zgrep 'download.rate_limited' data/logs/*.jsonl.gz` 检查历史事件。文件日志会在 `run.sh down` 后继续保留；Docker 的实时副本仅保留 3 个、每个最多 10 MiB，供 `docker logs` 快速查看。文件系统不可写、磁盘满或压缩失败时，服务会继续运行并在 stdout 输出限频告警。
 
 业务日志可能包含聊天标题、文件名和归档路径。日志不会写入 API Hash、验证码、两步验证密码、Telegram 会话令牌、HTTP 查询参数或请求体。
 
