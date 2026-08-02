@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import { Archive, Check, ChevronRight, Download, FileAudio, FileText, Image, LoaderCircle, Play, RefreshCw, Search, Video, X } from 'lucide-vue-next'
 import { api, apiResourceUrl, type Chat, type ChatListSnapshot, type Destination, type SourceMedia, type SourcePreview } from '../api'
 import { clearChatCache, readChatCache, writeChatCache } from '../chatCache'
-import { isCurrentSourceRequest, shouldPreloadSourceMedia } from '../sourcePreload'
+import { isCurrentSourceRequest, retainSourceChatSelection, shouldPreloadSourceMedia } from '../sourcePreload'
 
 const chats = ref<Chat[]>([])
 const chatSnapshot = ref<ChatListSnapshot | null>(null)
@@ -29,7 +29,7 @@ const selected = ref(new Map<number, SourceMedia>())
 const previewItem = ref<SourceMedia | null>(null)
 const preview = ref<SourcePreview | null>(null)
 const successTaskId = ref<number | null>(null)
-const sourcePanel = ref<'media' | 'sources' | 'selection'>('media')
+const sourcePanel = ref<'media' | 'sources' | 'selection'>('sources')
 const mediaScroll = ref<HTMLElement | null>(null)
 const loadSentinel = ref<HTMLElement | null>(null)
 let previewTimer: number | null = null
@@ -142,6 +142,24 @@ async function load(reset = true) {
     }
   }
 }
+function clearSourceSelection() {
+  selectedChatId.value = ''
+  selected.value = new Map()
+  items.value = []
+  nextCursor.value = null
+  mediaError.value = ''
+  error.value = ''
+  successTaskId.value = null
+  previewItem.value = null
+  preview.value = null
+  loading.value = false
+  loadingMore.value = false
+  sourcePanel.value = 'sources'
+  requestEpoch += 1
+  disconnectLoadObserver()
+  stopPolling()
+  stopThumbnailPolling()
+}
 async function chooseChat(chat: Chat) {
   selectedChatId.value = chat.id
   selected.value = new Map()
@@ -154,9 +172,8 @@ async function loadSources() {
   sourcesError.value = ''
   try {
     applyChatSnapshot(await api.chats())
-    if (!sourceChats.value.some((chat) => chat.id === selectedChatId.value)) {
-      selectedChatId.value = sourceChats.value[0]?.id ?? ''
-    }
+    const nextSelectedChatId = retainSourceChatSelection(selectedChatId.value, sourceChats.value.map((chat) => chat.id))
+    if (nextSelectedChatId !== selectedChatId.value) clearSourceSelection()
     if (selectedChatId.value) await load()
   } catch (reason) {
     if (!clearUnavailableChats(reason)) sourcesError.value = reason instanceof Error ? reason.message : '无法读取群组与频道'
@@ -169,13 +186,21 @@ async function loadDestinations() {
   if (!selectedDestinationId.value || !destinations.value.some((item) => item.id === selectedDestinationId.value)) selectedDestinationId.value = destinations.value[0]?.id ?? null
 }
 function applyChatSnapshot(snapshot: ChatListSnapshot) { chats.value = snapshot.chats; chatSnapshot.value = snapshot; writeChatCache(snapshot) }
-function clearUnavailableChats(reason: unknown) { if ((reason as Error & { status?: number }).status !== 409) return false; clearChatCache(); chats.value = []; chatSnapshot.value = null; selectedChatId.value = ''; return true }
+function clearUnavailableChats(reason: unknown) {
+  if ((reason as Error & { status?: number }).status !== 409) return false
+  clearChatCache()
+  chats.value = []
+  chatSnapshot.value = null
+  clearSourceSelection()
+  return true
+}
 async function refreshChats() {
   refreshingChats.value = true
   sourcesError.value = ''
   try {
     applyChatSnapshot(await api.refreshChats())
-    if (!sourceChats.value.some((chat) => chat.id === selectedChatId.value)) selectedChatId.value = sourceChats.value[0]?.id ?? ''
+    const nextSelectedChatId = retainSourceChatSelection(selectedChatId.value, sourceChats.value.map((chat) => chat.id))
+    if (nextSelectedChatId !== selectedChatId.value) clearSourceSelection()
     if (selectedChatId.value) await load()
   } catch (reason) {
     const message = reason instanceof Error ? reason.message : '无法更新聊天列表'
@@ -277,7 +302,7 @@ onBeforeUnmount(() => {
     <p v-if="successTaskId" class="success-note source-success">已加入下载队列。<RouterLink :to="`/tasks/${successTaskId}`">查看任务详情</RouterLink></p>
     <section class="source-workbench">
       <aside class="source-list"><div class="chat-search-row"><label class="search-input"><Search :size="17" /><input v-model="search" placeholder="搜索聊天" /></label><button class="quiet-button icon-button" type="button" :disabled="refreshingChats" :aria-label="refreshingChats ? '正在刷新聊天列表' : '刷新聊天列表'" @click="refreshChats"><RefreshCw :class="{ spin: refreshingChats }" :size="16" /></button></div><p v-if="chatSnapshot?.isStale" class="chat-cache-notice">列表可能不是最新的{{ chatSnapshot.lastRefreshError ? `：${chatSnapshot.lastRefreshError}` : '' }}。上次同步：{{ refreshedLabel() }}</p><p class="source-count">{{ filteredChats.length }} 个来源</p><button v-for="chat in filteredChats" :key="chat.id" :class="['source-row', { selected: selectedChatId === chat.id }]" @click="chooseChat(chat)"><span class="source-avatar">{{ chat.title.slice(0, 1) }}</span><span><b>{{ chat.title }}</b><small>{{ chat.type === 'CHANNEL' ? '频道' : '群组' }}{{ chat.handle ? ` · ${chat.handle}` : '' }}</small></span><ChevronRight :size="15" /></button><p v-if="loadingSources" class="source-empty">正在读取群组与频道…</p><p v-else-if="!filteredChats.length" class="source-empty">没有可浏览的群组或频道。</p></aside>
-      <main class="source-timeline"><template v-if="currentChat"><header class="source-title"><div><span class="eyebrow">{{ currentChat.type === 'CHANNEL' ? '频道' : '群组' }}</span><h2>{{ currentChat.title }}</h2></div><div class="source-title-actions"><span>{{ items.length }} 项已载入</span><button class="quiet-button mobile-source-switch" @click="sourcePanel = 'sources'">切换来源</button></div></header><div class="source-filters"><label class="destination-inline-field">归档目的地<select v-model.number="selectedDestinationId" @change="changeDestination"><option v-for="destination in destinations" :key="destination.id" :value="destination.id">{{ destination.name }}</option></select></label><div class="type-filters"><button v-for="type in ['', 'PHOTO', 'VIDEO', 'DOCUMENT']" :key="type" :class="{ selected: mediaType === type }" @click="changeMediaType(type)">{{ type ? typeLabel[type] : '全部' }}</button></div><label>开始日期<input v-model="dateStart" type="date" @change="changeDateFilter" /></label><label>结束日期<input v-model="dateEnd" type="date" @change="changeDateFilter" /></label></div><section ref="mediaScroll" class="source-media-scroll"><section v-if="loading" class="loading-block">正在读取媒体时间流…</section><section v-else-if="mediaError && !items.length" class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>媒体时间流加载失败</h2><p>{{ mediaError }}</p><button class="quiet-button" @click="load()">重试加载</button></section><section v-else-if="!items.length" class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>没有匹配的媒体</h2><p>调整日期或类型筛选后重试。</p></section><template v-else><section v-for="(dayItems, day) in groupedItems" :key="day" class="source-day"><div class="section-title"><h2>{{ day }}</h2><span>{{ dayItems.length }} 项</span></div><div class="source-grid"><article v-for="item in dayItems" :key="item.message_id" :class="['source-card', { checked: selectedState(item), unavailable: item.archived || item.queued }]" @click="openPreview(item)"><button v-if="!item.archived && !item.queued" class="select-box" :aria-label="`选择 ${item.filename}`" @click.stop="toggle(item)"><Check v-if="selectedState(item)" :size="15" /></button><div class="source-card-preview"><img v-if="item.thumbnail_url" :src="resource(item.thumbnail_url) ?? undefined" :alt="item.filename" /><component v-else :is="itemIcon(item)" :size="28" /><span v-if="item.media_type === 'VIDEO'" class="play-badge"><Play :size="12" fill="currentColor" /></span></div><div><b>{{ item.filename }}</b><small>{{ typeLabel[item.media_type] }} · {{ bytes(item.size_bytes) }}</small><em v-if="item.archived">已归档</em><em v-else-if="item.queued">已加入队列</em><em v-else-if="item.thumbnail_status === 'FAILED'">缩略图可重试</em></div></article></div></section><div ref="loadSentinel" class="source-load-state"><template v-if="loadingMore"><LoaderCircle class="spin" :size="16" />正在预载更早的媒体…</template><template v-else-if="mediaError"><span>更早的媒体加载失败：{{ mediaError }}</span><button class="quiet-button" @click="load(false)">重试加载</button></template><template v-else-if="!nextCursor">已加载全部媒体</template></div></template></section></template><section v-else class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>没有可用来源</h2><p>连接 Telegram 后会显示已加入的群组与频道。</p></section></main>
+      <main class="source-timeline"><template v-if="currentChat"><header class="source-title"><div><span class="eyebrow">{{ currentChat.type === 'CHANNEL' ? '频道' : '群组' }}</span><h2>{{ currentChat.title }}</h2></div><div class="source-title-actions"><span>{{ items.length }} 项已载入</span><button class="quiet-button mobile-source-switch" @click="sourcePanel = 'sources'">切换来源</button></div></header><div class="source-filters"><label class="destination-inline-field">归档目的地<select v-model.number="selectedDestinationId" @change="changeDestination"><option v-for="destination in destinations" :key="destination.id" :value="destination.id">{{ destination.name }}</option></select></label><div class="type-filters"><button v-for="type in ['', 'PHOTO', 'VIDEO', 'DOCUMENT']" :key="type" :class="{ selected: mediaType === type }" @click="changeMediaType(type)">{{ type ? typeLabel[type] : '全部' }}</button></div><label>开始日期<input v-model="dateStart" type="date" @change="changeDateFilter" /></label><label>结束日期<input v-model="dateEnd" type="date" @change="changeDateFilter" /></label></div><section ref="mediaScroll" class="source-media-scroll"><section v-if="loading" class="loading-block">正在读取媒体时间流…</section><section v-else-if="mediaError && !items.length" class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>媒体时间流加载失败</h2><p>{{ mediaError }}</p><button class="quiet-button" @click="load()">重试加载</button></section><section v-else-if="!items.length" class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>没有匹配的媒体</h2><p>调整日期或类型筛选后重试。</p></section><template v-else><section v-for="(dayItems, day) in groupedItems" :key="day" class="source-day"><div class="section-title"><h2>{{ day }}</h2><span>{{ dayItems.length }} 项</span></div><div class="source-grid"><article v-for="item in dayItems" :key="item.message_id" :class="['source-card', { checked: selectedState(item), unavailable: item.archived || item.queued }]" @click="openPreview(item)"><button v-if="!item.archived && !item.queued" class="select-box" :aria-label="`选择 ${item.filename}`" @click.stop="toggle(item)"><Check v-if="selectedState(item)" :size="15" /></button><div class="source-card-preview"><img v-if="item.thumbnail_url" :src="resource(item.thumbnail_url) ?? undefined" :alt="item.filename" /><component v-else :is="itemIcon(item)" :size="28" /><span v-if="item.media_type === 'VIDEO'" class="play-badge"><Play :size="12" fill="currentColor" /></span></div><div><b>{{ item.filename }}</b><small>{{ typeLabel[item.media_type] }} · {{ bytes(item.size_bytes) }}</small><em v-if="item.archived">已归档</em><em v-else-if="item.queued">已加入队列</em><em v-else-if="item.thumbnail_status === 'FAILED'">缩略图可重试</em></div></article></div></section><div ref="loadSentinel" class="source-load-state"><template v-if="loadingMore"><LoaderCircle class="spin" :size="16" />正在预载更早的媒体…</template><template v-else-if="mediaError"><span>更早的媒体加载失败：{{ mediaError }}</span><button class="quiet-button" @click="load(false)">重试加载</button></template><template v-else-if="!nextCursor">已加载全部媒体</template></div></template></section></template><template v-else-if="sourceChats.length"><section class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>请选择一个群组或频道</h2><p>从左侧选择会话后加载媒体缩略图。</p><button class="quiet-button mobile-source-switch" @click="sourcePanel = 'sources'">选择来源</button></section></template><section v-else class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>没有可用来源</h2><p>连接 Telegram 后会显示已加入的群组与频道。</p></section></main>
       <aside class="selection-basket"><div class="selection-basket-head"><div><span class="eyebrow">待下载</span><h2>{{ selectedItems.length }} 项</h2></div><button class="quiet-button mobile-selection-close" aria-label="返回媒体列表" @click="sourcePanel = 'media'">返回</button></div><p>{{ selectedItems.length ? bytes(selectedBytes) : '从时间流中选择文件' }}</p><div v-if="selectedItems.length" class="basket-list"><button v-for="item in selectedItems" :key="item.message_id" @click="toggle(item)"><span>{{ item.filename }}</span><X :size="15" /></button></div><p v-else class="basket-empty">选择会跨日期和分页保留。</p><button class="primary-button wide" :disabled="!selectedItems.length" @click="queueSelection"><Download :size="17" />加入下载队列</button><small>文件按来源顺序加入统一下载队列。</small></aside>
     </section>
     <button v-if="selectedItems.length" class="selection-launcher primary-button" @click="sourcePanel = 'selection'"><span>已选 {{ selectedItems.length }} 项 · {{ bytes(selectedBytes) }}</span><span>查看并继续</span></button>
