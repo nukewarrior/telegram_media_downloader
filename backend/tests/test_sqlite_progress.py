@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import shutil
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 TEST_DATA = Path(tempfile.mkdtemp(prefix="sqlite-progress-test-"))
@@ -49,33 +51,106 @@ class SQLiteProgressTests(unittest.TestCase):
 
     def test_connections_set_busy_timeout_and_keep_wal(self) -> None:
         with main.connection() as db:
+            self.assertEqual(db.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(db.execute("PRAGMA busy_timeout").fetchone()[0], main.SQLITE_BUSY_TIMEOUT_MS)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
 
-    def test_progress_persists_after_one_second_or_four_megabytes_or_completion(self) -> None:
+    def test_business_connections_enforce_task_media_foreign_key(self) -> None:
+        with self.assertRaises(sqlite3.IntegrityError):
+            with main.connection() as db:
+                db.execute(
+                    """INSERT INTO task_media (task_id, message_id, filename, media_type, size_bytes, message_date)
+                       VALUES (-1, 99, 'orphan.bin', 'DOCUMENT', 1, ?)""",
+                    (main.now(),),
+                )
+
+    def test_progress_persists_only_after_one_second_or_completion(self) -> None:
         interval = main.DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS
-        threshold = main.DOWNLOAD_PROGRESS_MIN_BYTES
-        self.assertFalse(main.should_persist_download_progress(1, 100, interval - 0.01, 0.0, 0))
-        self.assertTrue(main.should_persist_download_progress(1, 100, interval, 0.0, 0))
-        self.assertTrue(main.should_persist_download_progress(threshold, threshold + 1, 0.01, 0.0, 0))
-        self.assertTrue(main.should_persist_download_progress(100, 100, 0.01, 0.0, 100))
+        self.assertFalse(main.should_persist_download_progress(4 * 1024 * 1024, 200 * 1024 * 1024, interval - 0.01, 0.0))
+        self.assertFalse(main.should_persist_download_progress(100 * 1024 * 1024, 200 * 1024 * 1024, interval - 0.01, 0.0))
+        self.assertTrue(main.should_persist_download_progress(1, 200 * 1024 * 1024, interval, 0.0))
+        self.assertTrue(main.should_persist_download_progress(200 * 1024 * 1024, 200 * 1024 * 1024, 0.01, 0.0))
+
+    def test_high_speed_progress_does_not_persist_every_four_megabytes(self) -> None:
+        total_bytes = 200 * 1024 * 1024
+        start_time = 100.0
+        last_persisted_at = 0.0
+        persisted_at: list[float] = []
+
+        for tick in range(1, 51):
+            current_time = start_time + tick * 0.04
+            current_bytes = tick * 4 * 1024 * 1024
+            if main.should_persist_download_progress(current_bytes, total_bytes, current_time, last_persisted_at):
+                persisted_at.append(current_time)
+                last_persisted_at = current_time
+
+        self.assertLessEqual(len(persisted_at), 3)
+        self.assertEqual(persisted_at[0], start_time + 0.04)
+        self.assertEqual(persisted_at[-1], start_time + 2.0)
+        if len(persisted_at) > 2:
+            self.assertGreaterEqual(persisted_at[1] - persisted_at[0], 0.99)
 
     def test_concurrent_file_progress_keeps_aggregate_sum(self) -> None:
         task_id, first_media_id, second_media_id = self.create_task_with_media()
+        barrier = Barrier(2)
+
+        def update(media_id: int, downloaded_bytes: int, speed: int) -> None:
+            barrier.wait(timeout=5)
+            main.update_parallel_download_progress(task_id, media_id, downloaded_bytes, speed)
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [
-                executor.submit(main.update_parallel_download_progress, task_id, first_media_id, 7 * 1024 * 1024, 700),
-                executor.submit(main.update_parallel_download_progress, task_id, second_media_id, 5 * 1024 * 1024, 500),
+                executor.submit(update, first_media_id, 7 * 1024 * 1024, 700),
+                executor.submit(update, second_media_id, 5 * 1024 * 1024, 500),
             ]
             for future in futures:
                 future.result()
 
         with main.connection() as db:
-            task = db.execute("SELECT downloaded_bytes, speed_bytes_per_second FROM tasks WHERE id = ?", (task_id,)).fetchone()
-            media = db.execute("SELECT downloaded_bytes, speed_bytes_per_second FROM task_media WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
+            task = db.execute("SELECT downloaded_bytes, speed_bytes_per_second, media_revision FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            media = db.execute("SELECT id, downloaded_bytes, speed_bytes_per_second, revision FROM task_media WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
         self.assertEqual((task["downloaded_bytes"], task["speed_bytes_per_second"]), (12 * 1024 * 1024, 1200))
         self.assertEqual([row["downloaded_bytes"] for row in media], [7 * 1024 * 1024, 5 * 1024 * 1024])
+        revisions = sorted(row["revision"] for row in media)
+        self.assertEqual(revisions, [1, 2])
+        self.assertEqual(task["media_revision"], max(revisions))
+
+        changed = main.changed_task_media(task_id, 0)
+        self.assertEqual({item["id"] for item in changed}, {first_media_id, second_media_id})
+        self.assertEqual([item["revision"] for item in changed], revisions)
+        self.assertEqual([item["id"] for item in main.changed_task_media(task_id, revisions[0])], [next(item["id"] for item in changed if item["revision"] == revisions[1])])
+
+    def test_single_thread_revision_remains_monotonic(self) -> None:
+        task_id, first_media_id, second_media_id = self.create_task_with_media()
+
+        main.update_parallel_download_progress(task_id, first_media_id, 1, 10)
+        main.update_parallel_download_progress(task_id, second_media_id, 2, 20)
+        revisions = [item["revision"] for item in main.changed_task_media(task_id, 0)]
+
+        self.assertEqual(revisions, [1, 2])
+
+    def test_non_parallel_progress_update_assigns_a_revision_atomically(self) -> None:
+        task_id, media_id, _ = self.create_task_with_media()
+
+        main.update_download_progress(task_id, media_id, 3, 4, 5)
+
+        with main.connection() as db:
+            task = db.execute("SELECT downloaded_bytes, speed_bytes_per_second, media_revision FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            media = db.execute("SELECT downloaded_bytes, speed_bytes_per_second, revision FROM task_media WHERE id = ?", (media_id,)).fetchone()
+        self.assertEqual((task["downloaded_bytes"], task["speed_bytes_per_second"], task["media_revision"]), (3, 5, 1))
+        self.assertEqual((media["downloaded_bytes"], media["speed_bytes_per_second"], media["revision"]), (4, 5, 1))
+
+    def test_claim_next_media_assigns_a_revision_atomically(self) -> None:
+        task_id, media_id, _ = self.create_task_with_media()
+
+        claimed = main.claim_next_media(task_id)
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["id"], media_id)
+        self.assertEqual(claimed["revision"], 1)
+        with main.connection() as db:
+            task = db.execute("SELECT media_revision FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        self.assertEqual(task["media_revision"], 1)
 
     def test_restart_requeues_only_interrupted_media(self) -> None:
         task_id, first_media_id, second_media_id = self.create_task_with_media()

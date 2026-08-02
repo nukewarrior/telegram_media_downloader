@@ -61,7 +61,6 @@ PROJECT_VERSION = "0.1.0"
 TELEGRAM_DEVICE_MODEL = "Telegram Media Downloader"
 SQLITE_BUSY_TIMEOUT_MS = 5_000
 DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
-DOWNLOAD_PROGRESS_MIN_BYTES = 4 * 1024 * 1024
 SESSION_DIR = DATA_DIR / "sessions"
 SESSION_PATH = SESSION_DIR / "telegram.session"
 LOGIN_ATTEMPT_TTL = timedelta(minutes=10)
@@ -354,6 +353,7 @@ def now() -> str:
 
 def connection() -> sqlite3.Connection:
     db = sqlite3.connect(DB_PATH)
+    db.execute("PRAGMA foreign_keys = ON")
     db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     db.row_factory = sqlite3.Row
     return db
@@ -702,7 +702,6 @@ def initialize_database() -> None:
         db.executescript(
             """
             PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS app_settings (
               id INTEGER PRIMARY KEY CHECK (id = 1),
               api_id TEXT,
@@ -2759,19 +2758,32 @@ def media_payload(record: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def next_media_revision(db: sqlite3.Connection, task_id: int, timestamp: str) -> int | None:
+    """Atomically advance a task-local media revision in the current transaction."""
+    updated = db.execute(
+        "UPDATE tasks SET media_revision = media_revision + 1, updated_at = ? WHERE id = ?",
+        (timestamp, task_id),
+    ).rowcount
+    if updated != 1:
+        return None
+    revision = db.execute("SELECT media_revision FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return int(revision["media_revision"]) if revision else None
+
+
 def update_media(task_id: int, media_id: int, **values: Any) -> int:
     """Persist one file's state and assign a task-local, monotonic revision."""
     timestamp = now()
     with connection() as db:
-        task = db.execute("SELECT media_revision FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        if not task:
+        db.execute("BEGIN IMMEDIATE")
+        revision = next_media_revision(db, task_id, timestamp)
+        if revision is None:
             raise HTTPException(404, "任务不存在")
         media = db.execute("SELECT status, filename, message_id, media_type, size_bytes FROM task_media WHERE id = ? AND task_id = ?", (media_id, task_id)).fetchone()
-        revision = task["media_revision"] + 1
+        if not media:
+            raise HTTPException(404, "媒体不存在")
         values.update(updated_at=timestamp, revision=revision)
         assignments = ", ".join(f"{key} = ?" for key in values)
         updated = db.execute(f"UPDATE task_media SET {assignments} WHERE id = ? AND task_id = ?", (*values.values(), media_id, task_id)).rowcount
-        db.execute("UPDATE tasks SET media_revision = ?, updated_at = ? WHERE id = ?", (revision, timestamp, task_id))
     if updated and media and "status" in values and values["status"] != media["status"]:
         log_event(logging.INFO, "media.state_changed", "Task media state changed", task_id=task_id, media_id=media_id, message_id=media["message_id"], filename=media["filename"], media_type=media["media_type"], size_bytes=media["size_bytes"], previous_status=media["status"], status=values["status"], failure_category=values.get("failure_category"), retry_at=values.get("next_retry_at"))
     return revision
@@ -2781,11 +2793,15 @@ def update_download_progress(task_id: int, media_id: int, task_downloaded_bytes:
     """Update aggregate and current-file progress in one SQLite transaction."""
     timestamp = now()
     with connection() as db:
-        task = db.execute("SELECT total_bytes, media_revision FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        db.execute("BEGIN IMMEDIATE")
+        revision = next_media_revision(db, task_id, timestamp)
+        if revision is None:
+            return
+        task = db.execute("SELECT total_bytes FROM tasks WHERE id = ?", (task_id,)).fetchone()
         media = db.execute("SELECT size_bytes FROM task_media WHERE id = ? AND task_id = ?", (media_id, task_id)).fetchone()
         if not task or not media:
+            db.rollback()
             return
-        revision = task["media_revision"] + 1
         file_bytes = min(max(0, file_downloaded_bytes), media["size_bytes"])
         db.execute(
             """UPDATE task_media SET status = 'DOWNLOADING', downloaded_bytes = ?, speed_bytes_per_second = ?,
@@ -2793,9 +2809,9 @@ def update_download_progress(task_id: int, media_id: int, task_downloaded_bytes:
             (file_bytes, speed_bytes_per_second, timestamp, revision, media_id, task_id),
         )
         db.execute(
-            """UPDATE tasks SET downloaded_bytes = ?, speed_bytes_per_second = ?, media_revision = ?, updated_at = ?
+            """UPDATE tasks SET downloaded_bytes = ?, speed_bytes_per_second = ?, updated_at = ?
                WHERE id = ?""",
-            (min(task_downloaded_bytes, task["total_bytes"]), speed_bytes_per_second, revision, timestamp, task_id),
+            (min(task_downloaded_bytes, task["total_bytes"]), speed_bytes_per_second, timestamp, task_id),
         )
 
 
@@ -2803,19 +2819,23 @@ def update_parallel_download_progress(task_id: int, media_id: int, file_download
     """Recalculate aggregate task progress so concurrent files cannot overwrite it."""
     timestamp = now()
     with connection() as db:
-        task = db.execute("SELECT total_bytes, media_revision FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        db.execute("BEGIN IMMEDIATE")
+        revision = next_media_revision(db, task_id, timestamp)
+        if revision is None:
+            return
+        task = db.execute("SELECT total_bytes FROM tasks WHERE id = ?", (task_id,)).fetchone()
         media = db.execute("SELECT size_bytes FROM task_media WHERE id = ? AND task_id = ?", (media_id, task_id)).fetchone()
         if not task or not media:
+            db.rollback()
             return
-        revision = task["media_revision"] + 1
         file_bytes = min(max(0, file_downloaded_bytes), media["size_bytes"])
         db.execute("""UPDATE task_media SET status = 'DOWNLOADING', downloaded_bytes = ?, speed_bytes_per_second = ?,
                    updated_at = ?, revision = ? WHERE id = ? AND task_id = ?""",
                    (file_bytes, speed_bytes_per_second, timestamp, revision, media_id, task_id))
         totals = db.execute("""SELECT COALESCE(SUM(downloaded_bytes), 0) AS bytes,
                    COALESCE(SUM(speed_bytes_per_second), 0) AS speed FROM task_media WHERE task_id = ?""", (task_id,)).fetchone()
-        db.execute("""UPDATE tasks SET downloaded_bytes = ?, speed_bytes_per_second = ?, media_revision = ?, updated_at = ?
-                   WHERE id = ?""", (min(totals["bytes"], task["total_bytes"]), totals["speed"], revision, timestamp, task_id))
+        db.execute("""UPDATE tasks SET downloaded_bytes = ?, speed_bytes_per_second = ?, updated_at = ?
+                   WHERE id = ?""", (min(totals["bytes"], task["total_bytes"]), totals["speed"], timestamp, task_id))
 
 
 def should_persist_download_progress(
@@ -2823,15 +2843,11 @@ def should_persist_download_progress(
     total_bytes: int,
     current_time: float,
     last_persisted_at: float,
-    last_persisted_bytes: int,
 ) -> bool:
     """Keep progress writes bounded while always allowing the terminal callback through."""
     if current_bytes >= total_bytes:
         return True
-    return (
-        current_time - last_persisted_at >= DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS
-        or current_bytes - last_persisted_bytes >= DOWNLOAD_PROGRESS_MIN_BYTES
-    )
+    return current_time - last_persisted_at >= DOWNLOAD_PROGRESS_MIN_INTERVAL_SECONDS
 
 
 def configured_download_concurrency() -> int:
@@ -2930,7 +2946,8 @@ async def reset_download_client_if_requested() -> None:
 def claim_next_media(task_id: int) -> sqlite3.Row | None:
     timestamp = now()
     with connection() as db:
-        task = db.execute("SELECT media_revision, chat_id, chat_title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        db.execute("BEGIN IMMEDIATE")
+        task = db.execute("SELECT chat_id, chat_title FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not task:
             return None
         media = db.execute("""SELECT * FROM task_media WHERE task_id = ? AND
@@ -2938,13 +2955,16 @@ def claim_next_media(task_id: int) -> sqlite3.Row | None:
             ORDER BY CASE status WHEN 'PENDING' THEN 0 ELSE 1 END, message_id LIMIT 1""", (task_id, timestamp)).fetchone()
         if not media:
             return None
-        revision = task["media_revision"] + 1
+        revision = next_media_revision(db, task_id, timestamp)
+        if revision is None:
+            raise RuntimeError("任务在领取媒体时已不存在")
         claimed = db.execute("""UPDATE task_media SET status = 'DOWNLOADING', speed_bytes_per_second = 0,
             next_retry_at = NULL, updated_at = ?, revision = ? WHERE id = ? AND task_id = ? AND status = ?""",
             (timestamp, revision, media["id"], task_id, media["status"])).rowcount
         if not claimed:
+            db.rollback()
             return None
-        db.execute("UPDATE tasks SET status = 'DOWNLOADING', media_revision = ?, download_wait_until = NULL, updated_at = ? WHERE id = ?", (revision, timestamp, task_id))
+        db.execute("UPDATE tasks SET status = 'DOWNLOADING', download_wait_until = NULL, updated_at = ? WHERE id = ?", (timestamp, task_id))
         claimed_media = db.execute("SELECT * FROM task_media WHERE id = ?", (media["id"],)).fetchone()
     if claimed_media:
         log_event(logging.INFO, "media.claimed", "Media claimed by download dispatcher", task_id=task_id, media_id=claimed_media["id"], chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=claimed_media["message_id"], filename=claimed_media["filename"], media_type=claimed_media["media_type"], size_bytes=claimed_media["size_bytes"], previous_status=media["status"], status="DOWNLOADING")
@@ -3473,15 +3493,13 @@ async def download_media_job(task_id: int, media_id: int) -> None:
             start_stage("telegram_download")
             started_at = stage_started_at["telegram_download"] or time.monotonic()
             last_persisted_at = 0.0
-            last_persisted_bytes = 0
 
             def progress(current: int, total: int) -> None:
-                nonlocal last_persisted_at, last_persisted_bytes
-                current_time = asyncio.get_running_loop().time()
-                if not should_persist_download_progress(current, total, current_time, last_persisted_at, last_persisted_bytes):
+                nonlocal last_persisted_at
+                current_time = time.monotonic()
+                if not should_persist_download_progress(current, total, current_time, last_persisted_at):
                     return
                 last_persisted_at = current_time
-                last_persisted_bytes = current
                 update_parallel_download_progress(task_id, media_id, current, round(current / max(current_time - started_at, 0.001)))
 
             try:
