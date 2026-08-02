@@ -2919,13 +2919,21 @@ def media_payload(record: sqlite3.Row) -> dict[str, Any]:
     archive_thumbnail_status = item.pop("archive_thumbnail_status", None)
     archive_created_at = item.pop("archive_created_at", None)
     thumbnail_url = None
-    if item["status"] == "COMPLETED" and archive_item_id and archive_thumbnail_status == "READY":
+    content_url = None
+    download_url = None
+    if item["status"] == "COMPLETED" and item["media_type"] in {"PHOTO", "VIDEO"} and archive_item_id and archive_thumbnail_status == "READY":
         cache_key = archive_content_hash or archive_created_at or archive_item_id
-        thumbnail_url = f"/api/archives/media/{archive_item_id}/thumbnail?v={quote(str(cache_key), safe='')}"
+        cache_suffix = quote(str(cache_key), safe="")
+        archive_base_url = f"/api/archives/media/{archive_item_id}"
+        thumbnail_url = f"{archive_base_url}/thumbnail?v={cache_suffix}"
+        content_url = f"{archive_base_url}/content?v={cache_suffix}"
+        download_url = f"{archive_base_url}/download?v={cache_suffix}"
     downloaded = item["size_bytes"] if item["status"] == "COMPLETED" else min(item["downloaded_bytes"], item["size_bytes"])
     return {
         **item,
         "thumbnail_url": thumbnail_url,
+        "content_url": content_url,
+        "download_url": download_url,
         "downloaded_bytes": downloaded,
         "percent": min(100, int(downloaded / item["size_bytes"] * 100)) if item["size_bytes"] else 0,
     }

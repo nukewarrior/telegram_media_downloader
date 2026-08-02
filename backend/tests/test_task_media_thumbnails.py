@@ -43,7 +43,7 @@ class TaskMediaThumbnailTests(unittest.TestCase):
             task_id = db.execute(
                 """INSERT INTO tasks (chat_id, chat_title, destination_id, filters_json, status, total_count,
                    completed_count, total_bytes, created_at, updated_at)
-                   VALUES ('thumbnail-chat', '缩略图测试', ?, '{}', 'COMPLETED', 4, 3, 40, ?, ?)""",
+                   VALUES ('thumbnail-chat', '缩略图测试', ?, '{}', 'COMPLETED', 5, 4, 50, ?, ?)""",
                 (destination["id"], timestamp, timestamp),
             ).lastrowid
             media_ids: dict[str, int] = {}
@@ -52,17 +52,19 @@ class TaskMediaThumbnailTests(unittest.TestCase):
                 (102, "video.mp4", "VIDEO", "COMPLETED"),
                 (103, "document.pdf", "DOCUMENT", "COMPLETED"),
                 (104, "pending.jpg", "PHOTO", "DOWNLOADING"),
+                (105, "video-ready.mp4", "VIDEO", "COMPLETED"),
             ]:
                 media_ids[media_type + str(message_id)] = db.execute(
                     """INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes,
                        message_date, status, downloaded_bytes)
                        VALUES (?, ?, ?, ?, ?, 10, ?, ?, ?)""",
-                    (task_id, message_id, filename, media_type, "image/jpeg" if media_type == "PHOTO" else None, timestamp, status, 10 if status == "COMPLETED" else 3),
+                    (task_id, message_id, filename, media_type, "image/jpeg" if media_type == "PHOTO" else "video/mp4" if media_type == "VIDEO" else None, timestamp, status, 10 if status == "COMPLETED" else 3),
                 ).lastrowid
             for message_id, filename, media_type, thumbnail_status in [
                 (101, "photo.jpg", "PHOTO", "READY"),
                 (102, "video.mp4", "VIDEO", "FAILED"),
                 (103, "document.pdf", "DOCUMENT", "UNAVAILABLE"),
+                (105, "video-ready.mp4", "VIDEO", "READY"),
             ]:
                 blob_id = db.execute(
                     """INSERT INTO media_blobs (content_hash, canonical_path, thumbnail_path, thumbnail_status,
@@ -80,7 +82,8 @@ class TaskMediaThumbnailTests(unittest.TestCase):
                        VALUES (?, ?, 'thumbnail-chat', '缩略图测试', ?, ?, ?, ?, 10, ?, ?)""",
                     (blob_id, location_id, message_id, filename, media_type, "image/jpeg" if media_type == "PHOTO" else "video/mp4" if media_type == "VIDEO" else "application/pdf", timestamp, timestamp),
                 )
-        Image.new("RGB", (8, 8), (31, 117, 147)).save(main.THUMBNAIL_ROOT / "task-media-101.jpg", format="JPEG")
+        for message_id in (101, 105):
+            Image.new("RGB", (8, 8), (31, 117, 147)).save(main.THUMBNAIL_ROOT / f"task-media-{message_id}.jpg", format="JPEG")
         return int(task_id), media_ids
 
     def test_task_media_reuses_ready_archive_thumbnail_and_falls_back_safely(self) -> None:
@@ -94,9 +97,22 @@ class TaskMediaThumbnailTests(unittest.TestCase):
         self.assertIn("thumbnail_url", items[101])
         self.assertIn("/api/archives/media/", items[101]["thumbnail_url"])
         self.assertIn("?v=task-media-hash-101", items[101]["thumbnail_url"])
+        self.assertIn("/api/archives/media/", items[101]["content_url"])
+        self.assertIn("/content?v=task-media-hash-101", items[101]["content_url"])
+        self.assertIn("/api/archives/media/", items[101]["download_url"])
+        self.assertIn("/download?v=task-media-hash-101", items[101]["download_url"])
+        self.assertIn("/api/archives/media/", items[105]["thumbnail_url"])
+        self.assertIn("/content?v=task-media-hash-105", items[105]["content_url"])
+        self.assertIn("/download?v=task-media-hash-105", items[105]["download_url"])
         self.assertIsNone(items[102]["thumbnail_url"])
+        self.assertIsNone(items[102]["content_url"])
+        self.assertIsNone(items[102]["download_url"])
         self.assertIsNone(items[103]["thumbnail_url"])
+        self.assertIsNone(items[103]["content_url"])
+        self.assertIsNone(items[103]["download_url"])
         self.assertIsNone(items[104]["thumbnail_url"])
+        self.assertIsNone(items[104]["content_url"])
+        self.assertIsNone(items[104]["download_url"])
         self.assertNotIn("archive_item_id", items[101])
 
         with TestClient(main.app) as client:
@@ -112,6 +128,8 @@ class TaskMediaThumbnailTests(unittest.TestCase):
 
         photo = next(item for item in changed if item["message_id"] == 101)
         self.assertIn("/api/archives/media/", photo["thumbnail_url"])
+        self.assertIn("/content?v=task-media-hash-101", photo["content_url"])
+        self.assertIn("/download?v=task-media-hash-101", photo["download_url"])
 
 
 if __name__ == "__main__":
