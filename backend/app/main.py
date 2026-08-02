@@ -31,7 +31,7 @@ from PIL import ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError, RpcCallFailError, SessionPasswordNeededError, TimedOutError
-from app.storage import Destination, StorageError
+from app.storage import Destination, StorageError, webdav_client_manager
 
 try:
     import cryptg
@@ -410,6 +410,7 @@ def destination_from_version(destination: sqlite3.Row, version: sqlite3.Row | No
         remote_root=str(source["remote_root"] or ""),
         enabled=bool(destination["enabled"]),
         is_system=bool(destination["is_system"]),
+        version_id=int(version["id"]) if version is not None else None,
     )
 
 
@@ -1577,6 +1578,7 @@ async def lifespan(_: FastAPI):
     # dispatcher workers, rather than a previous loop.
     DOWNLOAD_WAKE = asyncio.Event()
     THUMBNAIL_WAKE = asyncio.Event()
+    await webdav_client_manager.start()
     log_event(
         logging.INFO,
         "telegram.crypto_acceleration",
@@ -1622,6 +1624,7 @@ async def lifespan(_: FastAPI):
     for worker in tuple(TASK_WORKERS.values()):
         worker.cancel()
     await asyncio.gather(*tuple(TASK_WORKERS.values()), return_exceptions=True)
+    await webdav_client_manager.close()
     log_event(logging.INFO, "service.stopped", "Telegram media archiver stopped")
 
 

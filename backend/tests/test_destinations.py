@@ -20,8 +20,9 @@ os.environ["DOWNLOAD_ROOT"] = str(TEST_DATA / "downloads")
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from app import storage
 from app import main
-from app.storage import Destination, StorageError
+from app.storage import Destination, StorageError, WebDAVClientManager
 
 
 class MockWebDAV:
@@ -96,6 +97,7 @@ class DestinationTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        asyncio.run(storage.webdav_client_manager.close())
         shutil.rmtree(TEST_DATA, ignore_errors=True)
 
     def create_local_destination(self, name: str) -> int:
@@ -928,6 +930,214 @@ class DestinationTests(unittest.TestCase):
         self.assertTrue(any(method == "DELETE" for method, _ in server.requests))
         self.assertIn(("PUT", "/dav/archive/root/nested/file.bin.part"), server.requests)
         self.assertIn(("MOVE", "/dav/archive/root/nested/file.bin.part"), server.requests)
+
+    def test_webdav_client_manager_reuses_one_client_per_version_and_closes_streams_before_clients(self) -> None:
+        server = MockWebDAV()
+        created: list[tuple[int | None, str | None, str | None]] = []
+        closed: list[httpx.AsyncClient] = []
+
+        class CountingClient(httpx.AsyncClient):
+            async def aclose(self) -> None:
+                closed.append(self)
+                await super().aclose()
+
+        async def factory(destination: Destination) -> httpx.AsyncClient:
+            created.append((destination.version_id, destination.webdav_url, destination.webdav_password))
+            return CountingClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        manager = WebDAVClientManager(factory)
+        destination = Destination(
+            id=91,
+            name="versioned-dav",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            webdav_username="user-v1",
+            webdav_password="password-v1",
+            remote_root="archive/root",
+            version_id=1,
+        )
+        source_a = TEST_DATA / "pool-a.bin"
+        source_b = TEST_DATA / "pool-b.bin"
+        source_a.write_bytes(b"pool-a")
+        source_b.write_bytes(b"pool-b")
+
+        async def exercise() -> None:
+            with patch.object(storage, "webdav_client_manager", manager):
+                await destination.upload_file(source_a, "pool-a.bin")
+                await destination.upload_file(source_b, "pool-b.bin")
+                target = TEST_DATA / "pool-download.bin"
+                await destination.download_to_file("pool-a.bin", target)
+                client, response = await destination.open_remote_stream("pool-a.bin", "bytes=0-3")
+                self.assertEqual(b"".join([chunk async for chunk in response.aiter_bytes()]), b"pool")
+                self.assertEqual(manager.active_stream_count, 1)
+                await destination.close_remote_stream(client, response)
+                self.assertEqual(manager.active_stream_count, 0)
+                self.assertEqual(len(created), 1)
+                self.assertEqual(len(closed), 0)
+                await manager.close()
+
+        asyncio.run(exercise())
+        self.assertEqual(created, [(1, "https://dav.example.test/dav", "password-v1")])
+        self.assertEqual(len(closed), 1)
+
+    def test_webdav_client_manager_isolates_destination_versions_and_passwords(self) -> None:
+        created: list[tuple[int | None, str | None, str | None]] = []
+        closed: list[httpx.AsyncClient] = []
+
+        class CountingClient(httpx.AsyncClient):
+            async def aclose(self) -> None:
+                closed.append(self)
+                await super().aclose()
+
+        async def factory(destination: Destination) -> httpx.AsyncClient:
+            created.append((destination.version_id, destination.webdav_url, destination.webdav_password))
+            return CountingClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)))
+
+        manager = WebDAVClientManager(factory)
+        old = Destination(
+            id=92,
+            name="versioned-dav",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/old-dav",
+            webdav_username="old-user",
+            webdav_password="old-password",
+            remote_root="archive/old",
+            version_id=11,
+        )
+        new = Destination(
+            id=92,
+            name="versioned-dav",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/new-dav",
+            webdav_username="new-user",
+            webdav_password="new-password",
+            remote_root="archive/new",
+            version_id=12,
+        )
+
+        async def exercise() -> None:
+            first = await manager.get_client(old)
+            second = await manager.get_client(new)
+            old_again = await manager.get_client(old)
+            self.assertIs(first, old_again)
+            self.assertIsNot(first, second)
+            self.assertEqual(manager.cache_keys, (("version", 92, 11), ("version", 92, 12)))
+            await manager.close()
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            created,
+            [
+                (11, "https://dav.example.test/old-dav", "old-password"),
+                (12, "https://dav.example.test/new-dav", "new-password"),
+            ],
+        )
+        self.assertEqual(len(closed), 2)
+
+    def test_webdav_client_manager_uses_configuration_fallback_without_version_id(self) -> None:
+        created: list[Destination] = []
+
+        async def factory(destination: Destination) -> httpx.AsyncClient:
+            created.append(destination)
+            return httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)))
+
+        manager = WebDAVClientManager(factory)
+        first = Destination(
+            id=101,
+            name="test-dav-a",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav/",
+            webdav_username="same-user",
+            webdav_password="same-password",
+            remote_root="/archive/root/",
+        )
+        same_configuration = Destination(
+            id=102,
+            name="test-dav-b",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            webdav_username="same-user",
+            webdav_password="same-password",
+            remote_root="archive/root",
+        )
+        changed_password = Destination(
+            id=102,
+            name="test-dav-b",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            webdav_username="same-user",
+            webdav_password="changed-password",
+            remote_root="archive/root",
+        )
+
+        async def exercise() -> None:
+            first_client = await manager.get_client(first)
+            same_client = await manager.get_client(same_configuration)
+            changed_client = await manager.get_client(changed_password)
+            self.assertIs(first_client, same_client)
+            self.assertIsNot(first_client, changed_client)
+            self.assertEqual(len(created), 2)
+            await manager.close()
+
+        asyncio.run(exercise())
+
+    def test_webdav_connection_test_uses_one_shot_client_without_manager_cache(self) -> None:
+        created: list[httpx.AsyncClient] = []
+        server = MockWebDAV()
+
+        async def factory(_: Destination) -> httpx.AsyncClient:
+            client = httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+            created.append(client)
+            return client
+
+        destination = Destination(
+            id=103,
+            name="candidate-dav",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            webdav_username="candidate-user",
+            webdav_password="candidate-password",
+            remote_root="archive/root",
+        )
+
+        async def exercise() -> None:
+            with patch.object(Destination, "_client", factory):
+                await destination.test_connection()
+
+        asyncio.run(exercise())
+        self.assertEqual(len(created), 1)
+        self.assertEqual(storage.webdav_client_manager.cached_client_count, 0)
+
+    def test_lifespan_shutdown_closes_all_webdav_clients(self) -> None:
+        closed: list[httpx.AsyncClient] = []
+
+        class CountingClient(httpx.AsyncClient):
+            async def aclose(self) -> None:
+                closed.append(self)
+                await super().aclose()
+
+        async def factory(_: Destination) -> httpx.AsyncClient:
+            return CountingClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)))
+
+        manager = WebDAVClientManager(factory)
+        destination = Destination(
+            id=104,
+            name="lifespan-dav",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            remote_root="archive/root",
+            version_id=1041,
+        )
+
+        async def exercise() -> None:
+            with patch.object(main, "webdav_client_manager", manager):
+                async with main.lifespan(main.app):
+                    client = await manager.get_client(destination)
+                    self.assertFalse(client.is_closed)
+                self.assertTrue(client.is_closed)
+
+        asyncio.run(exercise())
+        self.assertEqual(len(closed), 1)
 
     def test_webdav_mkcol_405_is_confirmed_with_propfind(self) -> None:
         server = MockWebDAV()
