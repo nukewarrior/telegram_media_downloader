@@ -4,6 +4,7 @@ import asyncio
 import os
 import secrets
 import shutil
+import stat
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -430,6 +431,40 @@ class Destination:
             raise StorageError(f"WebDAV 上传失败：{error}") from error
         finally:
             _LAST_UPLOAD_DIRECTORY_CACHE_METRICS.set(cache_metrics)
+
+    async def delete_file(self, relative: str | Path) -> None:
+        """Delete exactly one archived regular file.
+
+        This method is intentionally separate from the best-effort cleanup used
+        by connection probes.  Archive deletion needs to surface permissions,
+        transport failures, and unexpected server responses so the index can be
+        kept for a retry instead of silently drifting from storage.
+        """
+        if Path(relative).is_absolute():
+            raise StorageError("归档删除路径必须是安全相对路径")
+        relative_text = _relative_text(relative)
+        if relative_text.endswith(".part"):
+            raise StorageError("不允许删除临时归档文件")
+        if self.is_local:
+            target = self.local_path(relative_text)
+            try:
+                info = await asyncio.to_thread(target.lstat)
+                if not stat.S_ISREG(info.st_mode):
+                    raise StorageError("归档位置不是普通文件")
+                await asyncio.to_thread(target.unlink)
+            except FileNotFoundError:
+                return
+            except StorageError:
+                raise
+            except OSError as error:
+                raise StorageError(f"本地归档删除失败：{error}") from error
+            return
+        try:
+            client = await webdav_client_manager.get_client(self)
+            response = await client.request("DELETE", self.remote_url(relative_text))
+            self._check_response(response, "删除归档文件", accepted=set(range(200, 300)) | {404})
+        except httpx.HTTPError as error:
+            raise StorageError(f"WebDAV 删除失败：{error}") from error
 
     @staticmethod
     def _should_retry_directory_state(error: _WebDAVResponseError) -> bool:

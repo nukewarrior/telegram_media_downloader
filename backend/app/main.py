@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image as PillowImage
 from PIL import ImageOps, UnidentifiedImageError
@@ -83,6 +83,8 @@ DOWNLOAD_LAST_ERROR_AT: float | None = None
 DOWNLOAD_ROUND_ROBIN_OFFSET = 0
 DOWNLOAD_CLIENT_LOCK = asyncio.Lock()
 ARCHIVE_DELIVERY_LOCKS: dict[tuple[int, str], tuple[asyncio.Lock, int]] = {}
+ARCHIVE_BLOB_LOCKS: dict[int, tuple[asyncio.Lock, int]] = {}
+DELETE_OPERATION_WORKERS: dict[str, asyncio.Task[None]] = {}
 CHAT_CACHE_REFRESH_LOCK = asyncio.Lock()
 CHAT_CACHE_SYNC_WORKER: asyncio.Task[None] | None = None
 CHAT_CACHE_REFRESH_TASK: asyncio.Task[None] | None = None
@@ -621,6 +623,47 @@ def backfill_archive_locations(db: sqlite3.Connection, local_destination_id: int
             db.execute("UPDATE archive_items SET location_id = ? WHERE blob_id = ? AND location_id IS NULL", (location["id"], blob["id"]))
 
 
+def backfill_task_media_archive_links(db: sqlite3.Connection, local_destination_id: int) -> None:
+    """Link only legacy task media with one exact archive candidate.
+
+    The migration is deliberately conservative.  The runtime deletion path
+    only trusts ``task_media.archive_item_id``; this one-time pass is the only
+    place where the old chat/message matching is allowed to establish that
+    relationship.
+    """
+    media_rows = db.execute(
+        """SELECT m.id, m.message_id, m.media_type, m.size_bytes, m.message_date,
+                  t.chat_id, COALESCE(t.destination_id, ?) AS destination_id
+           FROM task_media m JOIN tasks t ON t.id = m.task_id
+           WHERE m.archive_item_id IS NULL""",
+        (local_destination_id,),
+    ).fetchall()
+    for media in media_rows:
+        candidates = db.execute(
+            """SELECT a.id
+               FROM archive_items a
+               LEFT JOIN archive_locations l ON l.id = a.location_id
+               WHERE a.chat_id = ?
+                 AND a.message_id = ?
+                 AND a.media_type = ?
+                 AND a.size_bytes = ?
+                 AND a.message_date = ?
+                 AND NOT EXISTS (SELECT 1 FROM task_media linked WHERE linked.archive_item_id = a.id)
+                 AND COALESCE(l.destination_id, ?) = ?""",
+            (
+                media["chat_id"],
+                media["message_id"],
+                media["media_type"],
+                media["size_bytes"],
+                media["message_date"],
+                local_destination_id,
+                media["destination_id"],
+            ),
+        ).fetchall()
+        if len(candidates) == 1:
+            db.execute("UPDATE task_media SET archive_item_id = ? WHERE id = ? AND archive_item_id IS NULL", (candidates[0]["id"], media["id"]))
+
+
 def destination_row(destination_id: int | None = None, *, include_disabled: bool = False) -> sqlite3.Row | None:
     with connection() as db:
         if destination_id is None:
@@ -855,6 +898,10 @@ def initialize_database() -> None:
               updated_at TEXT NOT NULL
             );
             INSERT OR IGNORE INTO app_settings (id, updated_at) VALUES (1, CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS migration_markers (
+              name TEXT PRIMARY KEY,
+              applied_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS login_attempts (
               id TEXT PRIMARY KEY,
               phone TEXT NOT NULL,
@@ -905,6 +952,7 @@ def initialize_database() -> None:
               total_count INTEGER NOT NULL DEFAULT 0,
               completed_count INTEGER NOT NULL DEFAULT 0,
               failed_count INTEGER NOT NULL DEFAULT 0,
+              deleted_count INTEGER NOT NULL DEFAULT 0,
               total_bytes INTEGER NOT NULL DEFAULT 0,
               downloaded_bytes INTEGER NOT NULL DEFAULT 0,
               current_file TEXT,
@@ -970,8 +1018,40 @@ def initialize_database() -> None:
               next_retry_at TEXT,
               failure_category TEXT,
               preview_cache_id INTEGER,
+              archive_item_id INTEGER REFERENCES archive_items(id) ON DELETE SET NULL,
               UNIQUE(task_id, message_id)
             );
+            CREATE TABLE IF NOT EXISTS delete_operations (
+              id TEXT PRIMARY KEY,
+              operation_kind TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'PENDING',
+              total_count INTEGER NOT NULL DEFAULT 0,
+              success_count INTEGER NOT NULL DEFAULT 0,
+              failed_count INTEGER NOT NULL DEFAULT 0,
+              preserved_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              error_message TEXT
+            );
+            CREATE TABLE IF NOT EXISTS delete_operation_items (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              operation_id TEXT NOT NULL REFERENCES delete_operations(id) ON DELETE CASCADE,
+              parent_id INTEGER REFERENCES delete_operation_items(id) ON DELETE CASCADE,
+              target_kind TEXT NOT NULL,
+              target_id INTEGER NOT NULL,
+              task_id INTEGER,
+              status TEXT NOT NULL DEFAULT 'PENDING',
+              retryable INTEGER NOT NULL DEFAULT 0,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              preserved_count INTEGER NOT NULL DEFAULT 0,
+              error_code TEXT,
+              error_message TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(operation_id, parent_id, target_kind, target_id, task_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_delete_operation_items_pending
+              ON delete_operation_items(operation_id, status);
             CREATE TABLE IF NOT EXISTS preview_cache (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               chat_id TEXT NOT NULL,
@@ -1066,6 +1146,8 @@ def initialize_database() -> None:
             db.execute("ALTER TABLE tasks ADD COLUMN media_revision INTEGER NOT NULL DEFAULT 0")
         if "download_wait_until" not in task_columns:
             db.execute("ALTER TABLE tasks ADD COLUMN download_wait_until TEXT")
+        if "deleted_count" not in task_columns:
+            db.execute("ALTER TABLE tasks ADD COLUMN deleted_count INTEGER NOT NULL DEFAULT 0")
         task_media_columns = {column["name"] for column in db.execute("PRAGMA table_info(task_media)").fetchall()}
         blob_columns = {column["name"] for column in db.execute("PRAGMA table_info(media_blobs)").fetchall()}
         if "thumbnail_error" not in blob_columns:
@@ -1090,6 +1172,12 @@ def initialize_database() -> None:
             db.execute("ALTER TABLE task_media ADD COLUMN failure_category TEXT")
         if "preview_cache_id" not in task_media_columns:
             db.execute("ALTER TABLE task_media ADD COLUMN preview_cache_id INTEGER")
+        if "archive_item_id" not in task_media_columns:
+            db.execute("ALTER TABLE task_media ADD COLUMN archive_item_id INTEGER REFERENCES archive_items(id) ON DELETE SET NULL")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_task_media_archive_item_id ON task_media(archive_item_id) WHERE archive_item_id IS NOT NULL")
+        delete_item_columns = {column["name"] for column in db.execute("PRAGMA table_info(delete_operation_items)").fetchall()}
+        if delete_item_columns and "preserved_count" not in delete_item_columns:
+            db.execute("ALTER TABLE delete_operation_items ADD COLUMN preserved_count INTEGER NOT NULL DEFAULT 0")
         # A process restart cannot safely resume an in-flight Telethon transfer.
         # Keep completed work and return only the interrupted file to the queue.
         db.execute("UPDATE task_media SET status = 'PENDING', speed_bytes_per_second = 0 WHERE status = 'DOWNLOADING'")
@@ -1105,6 +1193,9 @@ def initialize_database() -> None:
                 version_id = ensure_destination_version(db, destination)
                 db.execute("UPDATE tasks SET destination_version_id = ? WHERE id = ?", (version_id, task["id"]))
         backfill_archive_locations(db, local_destination_id)
+        if not db.execute("SELECT 1 FROM migration_markers WHERE name = 'task_media_archive_links_v1'").fetchone():
+            backfill_task_media_archive_links(db, local_destination_id)
+            db.execute("INSERT INTO migration_markers (name, applied_at) VALUES ('task_media_archive_links_v1', ?)", (now(),))
     reconcile_thumbnail_records()
     cleanup_preview_cache()
     reconcile_source_thumbnail_records()
@@ -1416,6 +1507,11 @@ async def prepare_archive_thumbnail(source: Path, media_type: str, *, task_id: i
 
 
 async def generate_thumbnail(blob: sqlite3.Row) -> None:
+    async with archive_blob_guard(int(blob["id"])):
+        await _generate_thumbnail_unlocked(blob)
+
+
+async def _generate_thumbnail_unlocked(blob: sqlite3.Row) -> None:
     temporary_source: Path | None = None
     location_data = blob_location(blob["id"])
     if location_data:
@@ -1605,6 +1701,18 @@ class PreviewRequest(BaseModel):
     mime_type: str | None = Field(default=None, max_length=255)
     size_bytes: int = Field(ge=0)
     message_date: str
+
+
+class TaskDeleteRequest(BaseModel):
+    task_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+class TaskMediaDeleteRequest(BaseModel):
+    media_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+class ArchiveMediaDeleteRequest(BaseModel):
+    item_ids: list[int] = Field(min_length=1, max_length=500)
 
 
 def masked_api_id(api_id: str | None) -> str | None:
@@ -1861,6 +1969,7 @@ async def lifespan(_: FastAPI):
     wake_thumbnail_worker()
     if DEMO_MODE or app_state()["accountConnected"]:
         start_pending_task_workers()
+    resume_delete_operations()
     if app_state()["accountConnected"]:
         schedule_chat_cache_refresh("startup")
     yield
@@ -1887,6 +1996,9 @@ async def lifespan(_: FastAPI):
     for worker in tuple(SOURCE_THUMBNAIL_RUNNING.values()):
         worker.cancel()
     await asyncio.gather(*tuple(DOWNLOAD_RUNNING.values()), *tuple(PREVIEW_RUNNING.values()), *tuple(SOURCE_THUMBNAIL_RUNNING.values()), return_exceptions=True)
+    for worker in tuple(DELETE_OPERATION_WORKERS.values()):
+        worker.cancel()
+    await asyncio.gather(*tuple(DELETE_OPERATION_WORKERS.values()), return_exceptions=True)
     await close_download_client()
     for worker in tuple(TASK_WORKERS.values()):
         worker.cancel()
@@ -2582,6 +2694,27 @@ async def archive_delivery_guard(destination_id: int, base_path: Path) -> AsyncI
             ARCHIVE_DELIVERY_LOCKS[key] = (lock, users - 1)
 
 
+@asynccontextmanager
+async def archive_blob_guard(blob_id: int) -> AsyncIterator[None]:
+    """Serialize thumbnail generation with deletion for one shared blob."""
+    entry = ARCHIVE_BLOB_LOCKS.get(blob_id)
+    if entry:
+        lock, users = entry
+        ARCHIVE_BLOB_LOCKS[blob_id] = (lock, users + 1)
+    else:
+        lock = asyncio.Lock()
+        ARCHIVE_BLOB_LOCKS[blob_id] = (lock, 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        lock, users = ARCHIVE_BLOB_LOCKS[blob_id]
+        if users <= 1:
+            ARCHIVE_BLOB_LOCKS.pop(blob_id, None)
+        else:
+            ARCHIVE_BLOB_LOCKS[blob_id] = (lock, users - 1)
+
+
 def scan_cache_key(payload: ScanRequest) -> str:
     return json.dumps(payload.model_dump(), ensure_ascii=False, sort_keys=True)
 
@@ -2889,23 +3022,29 @@ def update_task(task_id: int, **values: Any) -> None:
 
 TASK_MEDIA_WITH_ARCHIVE_SQL = """
     SELECT m.*,
-           archive.id AS archive_item_id,
+           archive.id AS resolved_archive_item_id,
+           CASE WHEN m.archive_item_id IS NOT NULL THEN 1 ELSE 0 END AS archive_link_reliable,
            blob.content_hash AS archive_content_hash,
            blob.thumbnail_status AS archive_thumbnail_status,
            archive.created_at AS archive_created_at
     FROM task_media m
     JOIN tasks t ON t.id = m.task_id
     LEFT JOIN archive_items archive ON archive.id = (
-        SELECT candidate.id
-        FROM archive_items candidate
-        LEFT JOIN archive_locations location ON location.id = candidate.location_id
-        WHERE candidate.chat_id = t.chat_id
-          AND candidate.message_id = m.message_id
-          AND candidate.media_type = m.media_type
-          AND COALESCE(location.destination_id, (SELECT id FROM destinations WHERE is_system = 1 AND kind = 'LOCAL' ORDER BY id LIMIT 1))
-              = COALESCE(t.destination_id, (SELECT id FROM destinations WHERE is_system = 1 AND kind = 'LOCAL' ORDER BY id LIMIT 1))
-        ORDER BY candidate.id DESC
-        LIMIT 1
+        COALESCE(
+            m.archive_item_id,
+            (
+                SELECT candidate.id
+                FROM archive_items candidate
+                LEFT JOIN archive_locations location ON location.id = candidate.location_id
+                WHERE candidate.chat_id = t.chat_id
+                  AND candidate.message_id = m.message_id
+                  AND candidate.media_type = m.media_type
+                  AND COALESCE(location.destination_id, (SELECT id FROM destinations WHERE is_system = 1 AND kind = 'LOCAL' ORDER BY id LIMIT 1))
+                      = COALESCE(t.destination_id, (SELECT id FROM destinations WHERE is_system = 1 AND kind = 'LOCAL' ORDER BY id LIMIT 1))
+                ORDER BY candidate.id DESC
+                LIMIT 1
+            )
+        )
     )
     LEFT JOIN media_blobs blob ON blob.id = archive.blob_id
     WHERE m.task_id = ?
@@ -2914,10 +3053,12 @@ TASK_MEDIA_WITH_ARCHIVE_SQL = """
 
 def media_payload(record: sqlite3.Row) -> dict[str, Any]:
     item = dict(record)
-    archive_item_id = item.pop("archive_item_id", None)
+    direct_archive_item_id = item.pop("archive_item_id", None)
+    archive_item_id = item.pop("resolved_archive_item_id", None)
     archive_content_hash = item.pop("archive_content_hash", None)
     archive_thumbnail_status = item.pop("archive_thumbnail_status", None)
     archive_created_at = item.pop("archive_created_at", None)
+    archive_link_reliable = bool(item.pop("archive_link_reliable", False) and direct_archive_item_id)
     thumbnail_url = None
     content_url = None
     download_url = None
@@ -2929,11 +3070,14 @@ def media_payload(record: sqlite3.Row) -> dict[str, Any]:
         content_url = f"{archive_base_url}/content?v={cache_suffix}"
         download_url = f"{archive_base_url}/download?v={cache_suffix}"
     downloaded = item["size_bytes"] if item["status"] == "COMPLETED" else min(item["downloaded_bytes"], item["size_bytes"])
+    if item["status"] == "DELETED":
+        downloaded = 0
     return {
         **item,
         "thumbnail_url": thumbnail_url,
         "content_url": content_url,
         "download_url": download_url,
+        "deletable": bool(item["status"] == "COMPLETED" and archive_item_id and archive_link_reliable),
         "downloaded_bytes": downloaded,
         "percent": min(100, int(downloaded / item["size_bytes"] * 100)) if item["size_bytes"] else 0,
     }
@@ -2983,6 +3127,9 @@ def update_download_progress(task_id: int, media_id: int, task_downloaded_bytes:
         if not task or not media:
             db.rollback()
             return
+        if db.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"] == "DELETING":
+            db.rollback()
+            return
         file_bytes = min(max(0, file_downloaded_bytes), media["size_bytes"])
         db.execute(
             """UPDATE task_media SET status = 'DOWNLOADING', downloaded_bytes = ?, speed_bytes_per_second = ?,
@@ -3007,6 +3154,9 @@ def update_parallel_download_progress(task_id: int, media_id: int, file_download
         task = db.execute("SELECT total_bytes FROM tasks WHERE id = ?", (task_id,)).fetchone()
         media = db.execute("SELECT size_bytes FROM task_media WHERE id = ? AND task_id = ?", (media_id, task_id)).fetchone()
         if not task or not media:
+            db.rollback()
+            return
+        if db.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"] == "DELETING":
             db.rollback()
             return
         file_bytes = min(max(0, file_downloaded_bytes), media["size_bytes"])
@@ -3128,8 +3278,10 @@ def claim_next_media(task_id: int) -> sqlite3.Row | None:
     timestamp = now()
     with connection() as db:
         db.execute("BEGIN IMMEDIATE")
-        task = db.execute("SELECT chat_id, chat_title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        task = db.execute("SELECT chat_id, chat_title, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not task:
+            return None
+        if task["status"] not in {"DOWNLOADING", "RETRYING"}:
             return None
         media = db.execute("""SELECT * FROM task_media WHERE task_id = ? AND
             (status = 'PENDING' OR (status = 'RETRY_WAIT' AND (next_retry_at IS NULL OR next_retry_at <= ?)))
@@ -3167,19 +3319,21 @@ def finalize_task_status(task_id: int) -> None:
         counts = {record["status"]: record["count"] for record in db.execute(
             "SELECT status, COUNT(*) AS count FROM task_media WHERE task_id = ? GROUP BY status", (task_id,)).fetchall()}
         completed = counts.get("COMPLETED", 0)
+        deleted = counts.get("DELETED", 0)
         failed = counts.get("FAILED", 0)
         active = counts.get("DOWNLOADING", 0)
         pending = counts.get("PENDING", 0)
         retrying = counts.get("RETRY_WAIT", 0)
         task = db.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if not task or task["status"] in {"PAUSED", "CANCELLED", "FAILED", "WAITING_RATE_LIMIT"}:
+    if not task or task["status"] in {"PAUSED", "CANCELLED", "FAILED", "WAITING_RATE_LIMIT", "DELETING"}:
         return
     if active or pending:
-        update_task(task_id, status="DOWNLOADING", completed_count=completed, failed_count=failed)
+        update_task(task_id, status="DOWNLOADING", completed_count=completed, failed_count=failed, deleted_count=deleted)
     elif retrying:
-        update_task(task_id, status="RETRYING", completed_count=completed, failed_count=failed, speed_bytes_per_second=0)
+        update_task(task_id, status="RETRYING", completed_count=completed, failed_count=failed, deleted_count=deleted, speed_bytes_per_second=0)
     else:
-        update_task(task_id, status="PARTIAL_FAILED" if failed else "COMPLETED", completed_count=completed, failed_count=failed, current_file=None, speed_bytes_per_second=0)
+        final_status = "PARTIAL_FAILED" if failed else "ARCHIVE_INCOMPLETE" if deleted else "COMPLETED"
+        update_task(task_id, status=final_status, completed_count=completed, failed_count=failed, deleted_count=deleted, current_file=None, speed_bytes_per_second=0)
 
 
 def classify_download_error(error: Exception) -> tuple[str, bool, str]:
@@ -3781,19 +3935,45 @@ async def download_media_job(task_id: int, media_id: int) -> None:
                     finish_stage("delivery", "completed")
                     log_webdav_delivery("success")
                 archive_path = final_path if final_path else part
-                record_archive(
-                    task,
-                    media,
-                    archive_path,
-                    relative_path,
-                    destination=destination,
-                    destination_version_id=destination_version_id,
-                    content_hash=content_hash,
-                    content_fingerprint=content_fingerprint,
-                    prepared_thumbnail=prepared_thumbnail,
-                    thumbnail_error=thumbnail_error,
-                    thumbnail_attempted=thumbnail_attempted,
-                )
+                if current_task_status(task_id) == "DELETING":
+                    try:
+                        await destination.delete_file(relative_path)
+                    except Exception as cleanup_error:
+                        log_event(logging.ERROR, "archive.late_delivery_cleanup_failed", "Late archive delivery could not be removed after task deletion began", exc_info=True, task_id=task_id, media_id=media_id, error_type=type(cleanup_error).__name__)
+                    raise StorageError("任务正在删除，已拒绝写入归档索引")
+                try:
+                    record_archive(
+                        task,
+                        media,
+                        archive_path,
+                        relative_path,
+                        destination=destination,
+                        destination_version_id=destination_version_id,
+                        content_hash=content_hash,
+                        content_fingerprint=content_fingerprint,
+                        prepared_thumbnail=prepared_thumbnail,
+                        thumbnail_error=thumbnail_error,
+                        thumbnail_attempted=thumbnail_attempted,
+                    )
+                except Exception:
+                    # The delete operation can win the SQLite transaction race
+                    # after the pre-index status check but before record_archive
+                    # commits. Never leave that late physical delivery behind.
+                    if current_task_status(task_id) in {"DELETING", None}:
+                        with connection() as db:
+                            indexed_location = db.execute(
+                                "SELECT id FROM archive_locations WHERE destination_id = ? AND canonical_path = ?",
+                                (destination.id, archive_path_text(relative_path)),
+                            ).fetchone()
+                        # A shared-content delivery may have reused an existing
+                        # location. Never remove that physical file on behalf
+                        # of a task whose index insert lost the race.
+                        if not indexed_location:
+                            try:
+                                await destination.delete_file(relative_path)
+                            except Exception as cleanup_error:
+                                log_event(logging.ERROR, "archive.late_delivery_cleanup_failed", "Late archive delivery could not be removed after task deletion won the index race", exc_info=True, task_id=task_id, media_id=media_id, error_type=type(cleanup_error).__name__)
+                    raise
             prepared_thumbnail = None
             if not destination.is_local:
                 part.unlink(missing_ok=True)
@@ -3821,6 +4001,9 @@ async def download_media_job(task_id: int, media_id: int) -> None:
         register_flood_wait(seconds)
         update_media(task_id, media_id, status="RETRY_WAIT", speed_bytes_per_second=0, next_retry_at=DOWNLOAD_FLOOD_UNTIL.isoformat() if DOWNLOAD_FLOOD_UNTIL else now(), failure_category="RATE_LIMIT", error_message=f"Telegram 限流，约 {seconds} 秒后自动继续")
     except Exception as error:
+        if current_task_status(task_id) == "DELETING":
+            log_event(logging.INFO, "download.aborted_for_task_deletion", "Media download stopped because its task is being deleted", task_id=task_id, media_id=media_id, error_type=type(error).__name__)
+            return
         if type(error).__name__ in {"FloodPremiumWaitError", "FloodWaitError"}:
             finish_active_stages("rate_limited")
             seconds = max(1, int(getattr(error, "seconds", 1)))
@@ -3983,6 +4166,13 @@ def record_archive(
     if thumbnail_attempted and thumbnail_capable:
         thumbnail_status = "PROCESSING"
     with connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        current_task = db.execute("SELECT status FROM tasks WHERE id = ?", (task["id"],)).fetchone()
+        current_media = db.execute("SELECT status, archive_item_id FROM task_media WHERE id = ? AND task_id = ?", (media["id"], task["id"])).fetchone()
+        if not current_task or not current_media:
+            raise StorageError("任务媒体不存在，已拒绝写入归档索引")
+        if current_task["status"] == "DELETING" or current_media["status"] == "DELETED":
+            raise StorageError("任务正在删除，已拒绝写入归档索引")
         version = db.execute(
             "SELECT id FROM destination_versions WHERE id = ? AND destination_id = ?",
             (destination_version_id, destination.id),
@@ -4058,14 +4248,559 @@ def record_archive(
             ).lastrowid
         else:
             location_id = location["id"]
-        db.execute("""INSERT INTO archive_items (blob_id, location_id, chat_id, chat_title, message_id, filename, media_type, mime_type, size_bytes, message_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (blob_id, location_id, task["chat_id"], task["chat_title"], media["message_id"], media["filename"], media_type, media["mime_type"], media["size_bytes"], media["message_date"], now()))
+        archive_item_id = db.execute("""INSERT INTO archive_items (blob_id, location_id, chat_id, chat_title, message_id, filename, media_type, mime_type, size_bytes, message_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (blob_id, location_id, task["chat_id"], task["chat_title"], media["message_id"], media["filename"], media_type, media["mime_type"], media["size_bytes"], media["message_date"], now())).lastrowid
+        revision = next_media_revision(db, int(task["id"]), now())
+        if revision is None:
+            raise StorageError("任务在写入归档关联时已不存在")
+        db.execute(
+            """UPDATE task_media
+               SET archive_item_id = ?, status = 'COMPLETED', downloaded_bytes = size_bytes,
+                   speed_bytes_per_second = 0, error_message = NULL, failure_category = NULL,
+                   next_retry_at = NULL, updated_at = ?, revision = ?
+               WHERE id = ? AND task_id = ?""",
+            (archive_item_id, now(), revision, media["id"], task["id"]),
+        )
+        aggregates = db.execute(
+            """SELECT
+                 COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0) AS completed_count,
+                 COALESCE(SUM(CASE WHEN status IN ('FAILED', 'RETRY_WAIT') THEN 1 ELSE 0 END), 0) AS failed_count,
+                 COALESCE(SUM(CASE WHEN status = 'DELETED' THEN 1 ELSE 0 END), 0) AS deleted_count,
+                 COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN size_bytes ELSE 0 END), 0) AS downloaded_bytes
+               FROM task_media WHERE task_id = ?""",
+            (task["id"],),
+        ).fetchone()
+        db.execute(
+            """UPDATE tasks SET completed_count = ?, failed_count = ?, deleted_count = ?,
+                      downloaded_bytes = ?, updated_at = ? WHERE id = ?""",
+            (aggregates["completed_count"], aggregates["failed_count"], aggregates["deleted_count"], aggregates["downloaded_bytes"], now(), task["id"]),
+        )
     if not thumbnail_attempted:
         wake_thumbnail_worker()
     if prepared_thumbnail:
         prepared_thumbnail.unlink(missing_ok=True)
-    log_event(logging.INFO, "archive.recorded", "Downloaded media recorded in archive", task_id=task["id"], media_id=media["id"], blob_id=blob_id, destination_id=destination.id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], archive_path=location_path, duplicate_blob=bool(existing), thumbnail_status=thumbnail_status)
+    log_event(logging.INFO, "archive.recorded", "Downloaded media recorded in archive", task_id=task["id"], media_id=media["id"], archive_item_id=archive_item_id, blob_id=blob_id, destination_id=destination.id, chat_id=task["chat_id"], chat_title=task["chat_title"], message_id=media["message_id"], filename=media["filename"], archive_path=location_path, duplicate_blob=bool(existing), thumbnail_status=thumbnail_status)
     return blob_id
+
+
+DELETE_TERMINAL_RESULTS = frozenset({"DELETED", "ALREADY_DELETED", "PRESERVED_LEGACY", "FAILED"})
+
+
+def unique_positive_ids(values: list[int], label: str) -> list[int]:
+    result = list(dict.fromkeys(values))
+    if not result or any(value <= 0 for value in result):
+        raise HTTPException(400, f"{label}无效")
+    return result
+
+
+def insert_delete_operation_item(
+    db: sqlite3.Connection,
+    operation_id: str,
+    target_kind: str,
+    target_id: int,
+    *,
+    task_id: int | None = None,
+    parent_id: int | None = None,
+    status: str = "PENDING",
+    retryable: bool = False,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    preserved_count: int = 0,
+) -> int:
+    item_id = db.execute(
+        """INSERT INTO delete_operation_items
+           (operation_id, parent_id, target_kind, target_id, task_id, status, retryable,
+            error_code, error_message, preserved_count, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (operation_id, parent_id, target_kind, target_id, task_id, status, int(retryable), error_code, error_message, preserved_count, now(), now()),
+    ).lastrowid
+    return int(item_id)
+
+
+def create_delete_operation(operation_kind: str, target_ids: list[int], *, task_id: int | None = None) -> str:
+    """Persist an operation and its exact targets before doing any I/O."""
+    operation_id = secrets.token_urlsafe(18)
+    target_ids = unique_positive_ids(target_ids, "删除目标")
+    timestamp = now()
+    with connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            """INSERT INTO delete_operations (id, operation_kind, status, total_count, created_at, updated_at)
+               VALUES (?, ?, 'PENDING', ?, ?, ?)""",
+            (operation_id, operation_kind, len(target_ids), timestamp, timestamp),
+        )
+        for target_id in target_ids:
+            if operation_kind == "TASK":
+                task = db.execute("SELECT id, status FROM tasks WHERE id = ?", (target_id,)).fetchone()
+                if not task:
+                    insert_delete_operation_item(db, operation_id, "TASK", target_id, status="ALREADY_DELETED")
+                    continue
+                db.execute("UPDATE tasks SET status = 'DELETING', current_file = NULL, speed_bytes_per_second = 0, error_message = NULL, updated_at = ? WHERE id = ?", (timestamp, target_id))
+                legacy_count = db.execute(
+                    "SELECT COUNT(*) FROM task_media WHERE task_id = ? AND status = 'COMPLETED' AND archive_item_id IS NULL",
+                    (target_id,),
+                ).fetchone()[0]
+                parent_id = insert_delete_operation_item(db, operation_id, "TASK", target_id, task_id=target_id, preserved_count=int(legacy_count))
+                linked_archive_ids = [
+                    int(row["archive_item_id"])
+                    for row in db.execute(
+                        "SELECT archive_item_id FROM task_media WHERE task_id = ? AND archive_item_id IS NOT NULL",
+                        (target_id,),
+                    ).fetchall()
+                ]
+                for archive_item_id in linked_archive_ids:
+                    insert_delete_operation_item(db, operation_id, "ARCHIVE_ITEM", archive_item_id, task_id=target_id, parent_id=parent_id)
+            elif operation_kind == "TASK_MEDIA":
+                media = db.execute(
+                    "SELECT id, task_id, status, archive_item_id FROM task_media WHERE id = ?",
+                    (target_id,),
+                ).fetchone()
+                if not media:
+                    insert_delete_operation_item(db, operation_id, "TASK_MEDIA", target_id, status="ALREADY_DELETED")
+                elif media["status"] == "DELETED":
+                    insert_delete_operation_item(db, operation_id, "TASK_MEDIA", target_id, task_id=media["task_id"], status="ALREADY_DELETED")
+                elif media["status"] != "COMPLETED":
+                    insert_delete_operation_item(
+                        db,
+                        operation_id,
+                        "TASK_MEDIA",
+                        target_id,
+                        task_id=media["task_id"],
+                        status="FAILED",
+                        error_code="MEDIA_NOT_COMPLETED",
+                        error_message="只有已完成媒体可以删除",
+                    )
+                elif not media["archive_item_id"]:
+                    insert_delete_operation_item(
+                        db,
+                        operation_id,
+                        "TASK_MEDIA",
+                        target_id,
+                        task_id=media["task_id"],
+                        status="PRESERVED_LEGACY",
+                        error_code="LEGACY_UNCERTAIN",
+                        error_message="旧归档缺少可靠任务关联，已保留",
+                        preserved_count=1,
+                    )
+                else:
+                    parent_id = insert_delete_operation_item(db, operation_id, "TASK_MEDIA", target_id, task_id=media["task_id"])
+                    insert_delete_operation_item(db, operation_id, "ARCHIVE_ITEM", int(media["archive_item_id"]), task_id=media["task_id"], parent_id=parent_id)
+            else:
+                archive = db.execute("SELECT id FROM archive_items WHERE id = ?", (target_id,)).fetchone()
+                status = "PENDING" if archive else "ALREADY_DELETED"
+                insert_delete_operation_item(db, operation_id, "ARCHIVE_ITEM", target_id, status=status)
+        refresh_delete_operation(db, operation_id)
+    return operation_id
+
+
+def set_delete_item_result(
+    item_id: int,
+    status: str,
+    *,
+    retryable: bool = False,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    preserved_count: int | None = None,
+) -> None:
+    assignments = ["status = ?", "retryable = ?", "error_code = ?", "error_message = ?", "updated_at = ?"]
+    values: list[Any] = [status, int(retryable), error_code, error_message, now()]
+    if preserved_count is not None:
+        assignments.append("preserved_count = ?")
+        values.append(preserved_count)
+    values.append(item_id)
+    with connection() as db:
+        db.execute(f"UPDATE delete_operation_items SET {', '.join(assignments)} WHERE id = ?", values)
+
+
+def refresh_delete_operation(db: sqlite3.Connection, operation_id: str) -> dict[str, Any]:
+    top_items = db.execute(
+        "SELECT * FROM delete_operation_items WHERE operation_id = ? AND parent_id IS NULL ORDER BY id",
+        (operation_id,),
+    ).fetchall()
+    child_items = db.execute(
+        "SELECT * FROM delete_operation_items WHERE operation_id = ? AND parent_id IS NOT NULL",
+        (operation_id,),
+    ).fetchall()
+    all_items = [*top_items, *child_items]
+    child_map: dict[int, list[sqlite3.Row]] = {}
+    for child in child_items:
+        child_map.setdefault(int(child["parent_id"]), []).append(child)
+    pending = any(item["status"] in {"PENDING", "RUNNING"} for item in all_items)
+    failed_count = 0
+    for item in top_items:
+        nested_failures = [child for child in child_map.get(int(item["id"]), []) if child["status"] == "FAILED"]
+        failed_count += len(nested_failures) if nested_failures else int(item["status"] == "FAILED")
+    success = sum(item["status"] in {"DELETED", "ALREADY_DELETED"} for item in top_items)
+    preserved = 0
+    for item in top_items:
+        nested = child_map.get(int(item["id"]), [])
+        preserved += int(item["preserved_count"] or 0)
+        if item["status"] == "PRESERVED_LEGACY" and not item["preserved_count"] and not nested:
+            preserved += 1
+        preserved += sum(int(child["preserved_count"] or 0) for child in nested)
+    status = "PENDING" if pending else "FAILED" if failed_count else "COMPLETED"
+    operation = db.execute("SELECT * FROM delete_operations WHERE id = ?", (operation_id,)).fetchone()
+    if not operation:
+        return {"status": status, "success_count": success, "failed_count": failed_count, "preserved_count": preserved}
+    db.execute(
+        """UPDATE delete_operations SET status = ?, success_count = ?, failed_count = ?, preserved_count = ?, updated_at = ?
+           WHERE id = ?""",
+        (status, success, failed_count, preserved, now(), operation_id),
+    )
+    return {"status": status, "success_count": success, "failed_count": failed_count, "preserved_count": preserved}
+
+
+def delete_operation_payload(operation_id: str) -> dict[str, Any]:
+    with connection() as db:
+        operation = db.execute("SELECT * FROM delete_operations WHERE id = ?", (operation_id,)).fetchone()
+        if not operation:
+            raise HTTPException(404, "删除操作不存在")
+        top_items = db.execute(
+            "SELECT * FROM delete_operation_items WHERE operation_id = ? AND parent_id IS NULL ORDER BY id",
+            (operation_id,),
+        ).fetchall()
+        children = db.execute(
+            "SELECT * FROM delete_operation_items WHERE operation_id = ? AND parent_id IS NOT NULL ORDER BY id",
+            (operation_id,),
+        ).fetchall()
+    child_map: dict[int, list[sqlite3.Row]] = {}
+    for child in children:
+        child_map.setdefault(int(child["parent_id"]), []).append(child)
+
+    def item_payload(item: sqlite3.Row) -> dict[str, Any]:
+        payload = {
+            "id": item["target_id"],
+            "target_kind": item["target_kind"],
+            "status": item["status"],
+            "retryable": bool(item["retryable"]),
+            "attempt_count": item["attempt_count"],
+            "error_code": item["error_code"],
+            "error_message": item["error_message"],
+            "preserved_legacy_count": item["preserved_count"],
+        }
+        nested = child_map.get(int(item["id"]), [])
+        if nested:
+            payload["archive_results"] = [item_payload(child) for child in nested]
+            payload["failed_archive_count"] = sum(child["status"] == "FAILED" for child in nested)
+        return payload
+
+    return {
+        "operation_id": operation_id,
+        "operation_kind": operation["operation_kind"],
+        "status": operation["status"],
+        "total_count": operation["total_count"],
+        "success_count": operation["success_count"],
+        "failed_count": operation["failed_count"],
+        "preserved_legacy_count": operation["preserved_count"],
+        "created_at": operation["created_at"],
+        "updated_at": operation["updated_at"],
+        "items": [item_payload(item) for item in top_items],
+    }
+
+
+def deletion_error(error: Exception) -> tuple[str, bool, str]:
+    status_code = getattr(error, "status_code", None)
+    if status_code in {401, 403}:
+        return f"WEBDAV_{status_code}", True, str(error)
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return "TIMEOUT", True, "删除归档文件超时，可重试"
+    if isinstance(error, StorageError):
+        message = str(error) or "归档存储暂时不可用，可重试"
+        retryable = "路径超出" not in message and "临时归档文件" not in message and "不是普通文件" not in message
+        return "STORAGE", retryable, message
+    return "DELETE_FAILED", True, str(error) or "删除归档文件失败，可重试"
+
+
+def deletion_relative_location(destination: Destination, location_path: str) -> Path:
+    if destination.is_local:
+        resolved = destination.resolve_local_location(location_path)
+        if not destination.local_root:
+            raise StorageError("本地归档目的地缺少目录")
+        return resolved.relative_to(destination.local_root.resolve())
+    if Path(location_path).is_absolute():
+        raise StorageError("旧 WebDAV 归档缺少安全相对路径")
+    return Path(location_path)
+
+
+def cleanup_task_staging(task_id: int) -> int:
+    removed = 0
+    prefix = f"task-{task_id}-media-"
+    try:
+        entries = tuple(STAGING_ROOT.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(prefix) or not entry.name.endswith(".part"):
+            continue
+        try:
+            if entry.is_file():
+                entry.unlink()
+                removed += 1
+        except OSError as error:
+            log_event(logging.WARNING, "task.staging_cleanup_failed", "Task staging file could not be removed", task_id=task_id, error_type=type(error).__name__)
+    return removed
+
+
+async def stop_task_runtime(task_id: int) -> None:
+    workers: list[asyncio.Task[Any]] = []
+    task_worker = TASK_WORKERS.get(task_id)
+    if task_worker:
+        task_worker.cancel()
+        workers.append(task_worker)
+    for (running_task_id, _), worker in tuple(DOWNLOAD_RUNNING.items()):
+        if running_task_id == task_id:
+            worker.cancel()
+            workers.append(worker)
+    if workers:
+        await asyncio.gather(*workers, return_exceptions=True)
+
+
+def refresh_task_aggregates_in_transaction(db: sqlite3.Connection, task_id: int, timestamp: str) -> None:
+    counts = db.execute(
+        """SELECT
+             COALESCE(SUM(status = 'COMPLETED'), 0) AS completed_count,
+             COALESCE(SUM(status IN ('FAILED', 'RETRY_WAIT')), 0) AS failed_count,
+             COALESCE(SUM(status = 'DELETED'), 0) AS deleted_count,
+             COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN size_bytes ELSE 0 END), 0) AS downloaded_bytes,
+             COALESCE(SUM(status IN ('DOWNLOADING', 'PENDING', 'RETRY_WAIT')), 0) AS active_count
+           FROM task_media WHERE task_id = ?""",
+        (task_id,),
+    ).fetchone()
+    task = db.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not task:
+        return
+    next_status = task["status"]
+    if counts["deleted_count"] and not counts["active_count"] and task["status"] not in {"DELETING", "PAUSED", "CANCELLED"}:
+        next_status = "PARTIAL_FAILED" if counts["failed_count"] else "ARCHIVE_INCOMPLETE"
+    db.execute(
+        """UPDATE tasks SET completed_count = ?, failed_count = ?, deleted_count = ?, downloaded_bytes = ?, status = ?, updated_at = ?
+           WHERE id = ?""",
+        (counts["completed_count"], counts["failed_count"], counts["deleted_count"], counts["downloaded_bytes"], next_status, timestamp, task_id),
+    )
+
+
+def finalize_archive_item_delete(item_id: int) -> tuple[str, str | None]:
+    """Remove the logical item and clean only unreferenced location/blob data."""
+    thumbnail_path: str | None = None
+    with connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        item = db.execute(
+            """SELECT a.id, a.blob_id, a.location_id, b.thumbnail_path
+               FROM archive_items a LEFT JOIN media_blobs b ON b.id = a.blob_id WHERE a.id = ?""",
+            (item_id,),
+        ).fetchone()
+        if not item:
+            return "ALREADY_DELETED", None
+        linked_tasks = db.execute("SELECT DISTINCT task_id FROM task_media WHERE archive_item_id = ?", (item_id,)).fetchall()
+        timestamp = now()
+        for task in linked_tasks:
+            revision = next_media_revision(db, int(task["task_id"]), timestamp)
+            if revision is not None:
+                db.execute(
+                    """UPDATE task_media SET status = 'DELETED', archive_item_id = NULL, downloaded_bytes = 0,
+                           speed_bytes_per_second = 0, error_message = NULL, failure_category = NULL,
+                           next_retry_at = NULL, updated_at = ?, revision = ?
+                       WHERE task_id = ? AND archive_item_id = ?""",
+                    (timestamp, revision, task["task_id"], item_id),
+                )
+        db.execute("UPDATE archive_items SET duplicate_of = NULL WHERE duplicate_of = ?", (item_id,))
+        db.execute("DELETE FROM archive_items WHERE id = ?", (item_id,))
+        if item["location_id"]:
+            remaining_at_location = db.execute("SELECT COUNT(*) FROM archive_items WHERE location_id = ?", (item["location_id"],)).fetchone()[0]
+            if not remaining_at_location:
+                db.execute("DELETE FROM archive_locations WHERE id = ?", (item["location_id"],))
+        if item["blob_id"]:
+            remaining_blob = db.execute("SELECT COUNT(*) FROM archive_items WHERE blob_id = ?", (item["blob_id"],)).fetchone()[0]
+            remaining_locations = db.execute("SELECT COUNT(*) FROM archive_locations WHERE blob_id = ?", (item["blob_id"],)).fetchone()[0]
+            if not remaining_blob and not remaining_locations:
+                db.execute("DELETE FROM media_blobs WHERE id = ?", (item["blob_id"],))
+                thumbnail_path = item["thumbnail_path"]
+        for task in linked_tasks:
+            refresh_task_aggregates_in_transaction(db, int(task["task_id"]), timestamp)
+    if thumbnail_path:
+        safe_thumbnail = path_in_root(thumbnail_path, THUMBNAIL_ROOT)
+        if safe_thumbnail and safe_thumbnail.is_file():
+            try:
+                safe_thumbnail.unlink()
+            except OSError as error:
+                log_event(logging.WARNING, "archive.thumbnail_cleanup_failed", "Archive thumbnail could not be removed after its blob became unreferenced", blob_thumbnail_path=str(safe_thumbnail), error_type=type(error).__name__)
+    return "DELETED", None
+
+
+async def process_archive_delete_item(item_id: int) -> tuple[str, bool, str | None, str | None]:
+    with connection() as db:
+        row = db.execute(
+            """SELECT a.id, a.blob_id, a.location_id, l.canonical_path AS location_path,
+                      l.destination_id, l.destination_version_id, d.kind AS destination_kind,
+                      b.thumbnail_path
+               FROM archive_items a
+               LEFT JOIN archive_locations l ON l.id = a.location_id
+               LEFT JOIN destinations d ON d.id = l.destination_id
+               LEFT JOIN media_blobs b ON b.id = a.blob_id
+               WHERE a.id = ?""",
+            (item_id,),
+        ).fetchone()
+    if not row:
+        return "ALREADY_DELETED", False, None, None
+    if not row["blob_id"] or not row["location_id"] or not row["location_path"]:
+        return "PRESERVED_LEGACY", False, "LEGACY_UNCERTAIN", "旧归档缺少可靠物理位置，已保留"
+    destination_record = destination_row(row["destination_id"], include_disabled=True) if row["destination_id"] else None
+    if not destination_record or not row["destination_version_id"]:
+        return "PRESERVED_LEGACY", False, "LEGACY_UNCERTAIN", "旧归档缺少不可变目的地版本，已保留"
+    with connection() as db:
+        version = db.execute("SELECT * FROM destination_versions WHERE id = ? AND destination_id = ?", (row["destination_version_id"], row["destination_id"])).fetchone()
+        reference_count = db.execute("SELECT COUNT(*) FROM archive_items WHERE location_id = ?", (row["location_id"],)).fetchone()[0]
+    if not version:
+        return "PRESERVED_LEGACY", False, "LEGACY_UNCERTAIN", "旧归档目的地版本不存在，已保留"
+    destination = destination_from_version(destination_record, version)
+    try:
+        relative_path = deletion_relative_location(destination, str(row["location_path"]))
+    except Exception as error:
+        code, retryable, message = deletion_error(error)
+        return "FAILED", retryable, code, message
+
+    async with archive_delivery_guard(destination.id, relative_path):
+        async with archive_blob_guard(int(row["blob_id"])):
+            # A second operation may have completed while this one was waiting.
+            with connection() as db:
+                current = db.execute("SELECT id, location_id FROM archive_items WHERE id = ?", (item_id,)).fetchone()
+                reference_count = db.execute("SELECT COUNT(*) FROM archive_items WHERE location_id = ?", (row["location_id"],)).fetchone()[0] if current else 0
+            if not current:
+                return "ALREADY_DELETED", False, None, None
+            if reference_count <= 1:
+                try:
+                    await destination.delete_file(relative_path)
+                except Exception as error:
+                    code, retryable, message = deletion_error(error)
+                    return "FAILED", retryable, code, message
+            result, _ = finalize_archive_item_delete(item_id)
+            return result, False, None, None
+
+
+async def process_delete_operation_item(item: sqlite3.Row) -> None:
+    item_id = int(item["id"])
+    with connection() as db:
+        current = db.execute("SELECT * FROM delete_operation_items WHERE id = ?", (item_id,)).fetchone()
+    if not current:
+        return
+    if current["status"] in {"DELETED", "ALREADY_DELETED", "PRESERVED_LEGACY"}:
+        if current["target_kind"] != "TASK":
+            return
+        with connection() as db:
+            has_retryable_child = db.execute(
+                "SELECT COUNT(*) FROM delete_operation_items WHERE parent_id = ? AND status IN ('PENDING', 'RUNNING') OR parent_id = ? AND status = 'FAILED' AND retryable = 1",
+                (item_id, item_id),
+            ).fetchone()[0]
+        if not has_retryable_child:
+            return
+    if current["status"] == "FAILED" and not current["retryable"]:
+        return
+    with connection() as db:
+        db.execute(
+            "UPDATE delete_operation_items SET status = 'RUNNING', attempt_count = attempt_count + 1, updated_at = ? WHERE id = ?",
+            (now(), item_id),
+        )
+    if current["target_kind"] == "ARCHIVE_ITEM":
+        result, retryable, error_code, error_message = await process_archive_delete_item(int(current["target_id"]))
+        set_delete_item_result(item_id, result, retryable=retryable, error_code=error_code, error_message=error_message, preserved_count=1 if result == "PRESERVED_LEGACY" else 0)
+        return
+    if current["target_kind"] == "TASK_MEDIA":
+        with connection() as db:
+            media = db.execute("SELECT status, archive_item_id FROM task_media WHERE id = ? AND task_id = ?", (current["target_id"], current["task_id"])).fetchone()
+        if not media or media["status"] == "DELETED":
+            set_delete_item_result(item_id, "ALREADY_DELETED")
+            return
+        child = None
+        with connection() as db:
+            child = db.execute("SELECT * FROM delete_operation_items WHERE parent_id = ? ORDER BY id LIMIT 1", (item_id,)).fetchone()
+        if child:
+            await process_delete_operation_item(child)
+            with connection() as db:
+                child = db.execute("SELECT * FROM delete_operation_items WHERE id = ?", (child["id"],)).fetchone()
+            if child and child["status"] == "FAILED":
+                set_delete_item_result(item_id, "FAILED", retryable=bool(child["retryable"]), error_code=child["error_code"], error_message=child["error_message"])
+            elif child and child["status"] == "PRESERVED_LEGACY":
+                # The nested archive item already contributes the preserved
+                # count; do not count the task-media wrapper twice.
+                set_delete_item_result(item_id, "PRESERVED_LEGACY", error_code="LEGACY_UNCERTAIN", error_message="旧归档已保留", preserved_count=0)
+            else:
+                set_delete_item_result(item_id, "DELETED")
+        return
+    if current["target_kind"] == "TASK":
+        await stop_task_runtime(int(current["target_id"]))
+        cleanup_task_staging(int(current["target_id"]))
+        with connection() as db:
+            children = db.execute("SELECT * FROM delete_operation_items WHERE parent_id = ? ORDER BY id", (item_id,)).fetchall()
+        for child in children:
+            await process_delete_operation_item(child)
+        with connection() as db:
+            task_exists = db.execute("SELECT id FROM tasks WHERE id = ?", (current["target_id"],)).fetchone()
+            if task_exists:
+                db.execute("DELETE FROM tasks WHERE id = ?", (current["target_id"],))
+        with connection() as db:
+            failures = db.execute("SELECT COUNT(*) FROM delete_operation_items WHERE parent_id = ? AND status = 'FAILED'", (item_id,)).fetchone()[0]
+        set_delete_item_result(item_id, "DELETED" if task_exists else "ALREADY_DELETED", error_code="ARCHIVE_INCOMPLETE" if failures else None, error_message="任务已删除，但部分归档删除失败，可重试" if failures else None, preserved_count=current["preserved_count"])
+
+
+async def run_delete_operation(operation_id: str) -> None:
+    try:
+        with connection() as db:
+            db.execute("UPDATE delete_operations SET status = 'RUNNING', updated_at = ? WHERE id = ?", (now(), operation_id))
+            top_items = db.execute("SELECT * FROM delete_operation_items WHERE operation_id = ? AND parent_id IS NULL ORDER BY id", (operation_id,)).fetchall()
+        for item in top_items:
+            with connection() as db:
+                current = db.execute("SELECT * FROM delete_operation_items WHERE id = ?", (item["id"],)).fetchone()
+                pending_children = db.execute("SELECT COUNT(*) FROM delete_operation_items WHERE parent_id = ? AND status IN ('PENDING', 'RUNNING')", (item["id"],)).fetchone()[0]
+                retryable_children = db.execute("SELECT COUNT(*) FROM delete_operation_items WHERE parent_id = ? AND status = 'FAILED' AND retryable = 1", (item["id"],)).fetchone()[0]
+            if current and (current["status"] not in {"DELETED", "ALREADY_DELETED", "PRESERVED_LEGACY"} or pending_children or retryable_children):
+                await process_delete_operation_item(current)
+        with connection() as db:
+            refresh_delete_operation(db, operation_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        log_event(logging.ERROR, "delete.operation_failed", "Delete operation worker failed", exc_info=True, operation_id=operation_id, error_type=type(error).__name__)
+        with connection() as db:
+            db.execute("UPDATE delete_operation_items SET status = 'FAILED', retryable = 1, error_code = 'WORKER', error_message = ?, updated_at = ? WHERE operation_id = ? AND status IN ('PENDING', 'RUNNING')", (str(error) or "删除操作异常终止，可重试", now(), operation_id))
+            refresh_delete_operation(db, operation_id)
+    finally:
+        DELETE_OPERATION_WORKERS.pop(operation_id, None)
+
+
+def start_delete_operation(operation_id: str) -> None:
+    worker = DELETE_OPERATION_WORKERS.get(operation_id)
+    if not worker or worker.done():
+        DELETE_OPERATION_WORKERS[operation_id] = asyncio.create_task(run_delete_operation(operation_id), name=f"delete-operation-{operation_id}")
+
+
+def resume_delete_operations() -> None:
+    with connection() as db:
+        operation_ids = [row["id"] for row in db.execute("SELECT id FROM delete_operations WHERE status IN ('PENDING', 'RUNNING') ORDER BY created_at").fetchall()]
+    for operation_id in operation_ids:
+        start_delete_operation(operation_id)
+
+
+def operation_response(operation_id: str) -> JSONResponse | dict[str, Any]:
+    payload = delete_operation_payload(operation_id)
+    if payload["status"] in {"PENDING", "RUNNING"}:
+        return JSONResponse(status_code=202, content=payload)
+    return payload
+
+
+def retry_delete_operation(operation_id: str) -> None:
+    with connection() as db:
+        operation = db.execute("SELECT id FROM delete_operations WHERE id = ?", (operation_id,)).fetchone()
+        if not operation:
+            raise HTTPException(404, "删除操作不存在")
+        changed = db.execute(
+            """UPDATE delete_operation_items SET status = 'PENDING', error_code = NULL, error_message = NULL,
+                      retryable = 0, updated_at = ?
+               WHERE operation_id = ? AND status = 'FAILED' AND retryable = 1""",
+            (now(), operation_id),
+        ).rowcount
+        if not changed:
+            raise HTTPException(409, "当前删除操作没有可重试的失败项")
+        db.execute("UPDATE delete_operations SET status = 'PENDING', error_message = NULL, updated_at = ? WHERE id = ?", (now(), operation_id))
 
 
 async def download_demo_media_job(task_id: int, media_id: int) -> None:
@@ -4127,11 +4862,14 @@ async def run_task_worker(task_id: int) -> None:
             with connection() as db:
                 task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
                 planned = db.execute("SELECT COUNT(*) FROM task_media WHERE task_id = ?", (task_id,)).fetchone()[0]
-            if not task or task["status"] in {"PAUSED", "CANCELLED", "COMPLETED"}:
+            if not task or task["status"] in {"PAUSED", "CANCELLED", "COMPLETED", "DELETING"}:
                 return
             if not planned:
                 matched = await scan_messages(task_request(task))
                 with connection() as db:
+                    current = db.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                    if not current or current["status"] == "DELETING":
+                        return
                     db.executemany("""INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date)
                         VALUES (?, ?, ?, ?, ?, ?, ?)""", [(task_id, *item) for item in matched])
                 update_task(task_id, total_count=len(matched), total_bytes=sum(item[4] for item in matched), completed_count=0, downloaded_bytes=0)
@@ -4143,7 +4881,7 @@ async def run_task_worker(task_id: int) -> None:
         with connection() as db:
             task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             planned = db.execute("SELECT COUNT(*) FROM task_media WHERE task_id = ?", (task_id,)).fetchone()[0]
-        if not task or task["status"] in {"PAUSED", "CANCELLED", "COMPLETED"}:
+        if not task or task["status"] in {"PAUSED", "CANCELLED", "COMPLETED", "DELETING"}:
             return
         if not planned:
             update_task(task_id, status="SCANNING", current_file=None, speed_bytes_per_second=0)
@@ -4154,6 +4892,9 @@ async def run_task_worker(task_id: int) -> None:
             else:
                 matched = await scan_messages(payload)
             with connection() as db:
+                current = db.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if not current or current["status"] == "DELETING":
+                    return
                 db.executemany("""INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date)
                     VALUES (?, ?, ?, ?, ?, ?, ?)""", [(task_id, *item) for item in matched])
             update_task(task_id, status="DOWNLOADING", total_count=len(matched), total_bytes=sum(item[4] for item in matched), completed_count=0, downloaded_bytes=0, failed_count=0)
@@ -4376,6 +5117,61 @@ async def retry_task(task_id: int) -> dict[str, Any]:
     return get_task(task_id)
 
 
+async def dispatch_delete_operation(operation_id: str) -> Any:
+    start_delete_operation(operation_id)
+    # Let a small local operation reach a terminal state before choosing the
+    # response status, while active/WebDAV/batch work naturally remains 202.
+    await asyncio.sleep(0)
+    return operation_response(operation_id)
+
+
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: int) -> Any:
+    operation_id = create_delete_operation("TASK", [task_id])
+    return await dispatch_delete_operation(operation_id)
+
+
+@app.post("/api/tasks/bulk-delete")
+async def delete_tasks(payload: TaskDeleteRequest) -> Any:
+    operation_id = create_delete_operation("TASK", unique_positive_ids(payload.task_ids, "任务编号"))
+    return await dispatch_delete_operation(operation_id)
+
+
+@app.delete("/api/tasks/{task_id}/media/{media_id}")
+async def delete_task_media(task_id: int, media_id: int) -> Any:
+    with connection() as db:
+        record = db.execute("SELECT task_id FROM task_media WHERE id = ?", (media_id,)).fetchone()
+    if record and int(record["task_id"]) != task_id:
+        raise HTTPException(404, "媒体不存在")
+    operation_id = create_delete_operation("TASK_MEDIA", [media_id])
+    return await dispatch_delete_operation(operation_id)
+
+
+@app.post("/api/tasks/{task_id}/media/bulk-delete")
+async def delete_task_media_bulk(task_id: int, payload: TaskMediaDeleteRequest) -> Any:
+    media_ids = unique_positive_ids(payload.media_ids, "媒体编号")
+    with connection() as db:
+        invalid = db.execute(
+            f"SELECT COUNT(*) FROM task_media WHERE id IN ({', '.join('?' for _ in media_ids)}) AND task_id = ?",
+            (*media_ids, task_id),
+        ).fetchone()[0]
+    if invalid != len(media_ids):
+        raise HTTPException(404, "所选媒体不属于当前任务")
+    operation_id = create_delete_operation("TASK_MEDIA", media_ids)
+    return await dispatch_delete_operation(operation_id)
+
+
+@app.get("/api/delete-operations/{operation_id}")
+def get_delete_operation(operation_id: str) -> dict[str, Any]:
+    return delete_operation_payload(operation_id)
+
+
+@app.post("/api/delete-operations/{operation_id}/retry")
+async def retry_delete_operation_route(operation_id: str) -> Any:
+    retry_delete_operation(operation_id)
+    return await dispatch_delete_operation(operation_id)
+
+
 @app.get("/api/tasks/{task_id}/events")
 async def task_events(request: Request, task_id: int, after_revision: int = 0) -> StreamingResponse:
     async def event_stream():
@@ -4590,6 +5386,18 @@ async def archive_download(request: Request, item_id: int) -> Any:
 @app.get("/api/archives/media/{item_id}")
 def archive_media_detail(item_id: int) -> dict[str, Any]:
     return archive_payload(archive_record(item_id))
+
+
+@app.delete("/api/archives/media/{item_id}")
+async def delete_archive_media(item_id: int) -> Any:
+    operation_id = create_delete_operation("ARCHIVE_ITEM", [item_id])
+    return await dispatch_delete_operation(operation_id)
+
+
+@app.post("/api/archives/media/bulk-delete")
+async def delete_archive_media_bulk(payload: ArchiveMediaDeleteRequest) -> Any:
+    operation_id = create_delete_operation("ARCHIVE_ITEM", unique_positive_ids(payload.item_ids, "归档编号"))
+    return await dispatch_delete_operation(operation_id)
 
 
 if STATIC_DIR.exists():

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
-import { CalendarDays, FileAudio, FileText, Filter, Image, Search, Video, X } from 'lucide-vue-next'
-import { api, apiResourceUrl, type ArchiveItem, type Destination } from '../api'
+import { CalendarDays, FileAudio, FileText, Filter, Image, Search, Trash2, Video, X } from 'lucide-vue-next'
+import DeleteConfirmDialog from '../components/DeleteConfirmDialog.vue'
+import DeleteResultPanel from '../components/DeleteResultPanel.vue'
+import { api, apiResourceUrl, type ArchiveItem, type DeleteOperation, type Destination } from '../api'
 import MediaViewer, { type MediaViewerItem } from '../components/MediaViewer.vue'
 
 type ArchiveDay = { key: string; label: string; fullLabel: string; year: number; items: ArchiveItem[] }
@@ -14,6 +16,11 @@ const selectedChat = ref('')
 const selectedType = ref('')
 const selectedDestination = ref('')
 const selected = ref<ArchiveItem | null>(null)
+const selectedIds = ref(new Set<number>())
+const confirmDeleteOpen = ref(false)
+const deleting = ref(false)
+const deleteOperation = ref<DeleteOperation | null>(null)
+const deleteError = ref('')
 const selectionError = ref('')
 const selectionLoading = ref(false)
 const loading = ref(true)
@@ -76,6 +83,8 @@ const focusedDay = computed(() => archiveDays.value.find((day) => day.key === fo
 const activeFilterCount = computed(() => Number(Boolean(selectedChat.value)) + Number(Boolean(selectedType.value)) + Number(Boolean(selectedDestination.value)))
 const archiveTypes = ['', 'PHOTO', 'VIDEO', 'AUDIO', 'DOCUMENT']
 const selectedIndex = computed(() => selected.value ? items.value.findIndex((item) => item.id === selected.value?.id) : -1)
+const selectedCount = computed(() => selectedIds.value.size)
+const allLoadedSelected = computed(() => items.value.length > 0 && selectedCount.value === items.value.length)
 const viewerItem = computed<MediaViewerItem | null>(() => {
   const item = selected.value
   if (!item) return null
@@ -95,11 +104,15 @@ const viewerItem = computed<MediaViewerItem | null>(() => {
   }
 })
 const viewerError = computed(() => selectionError.value || (selected.value && !['PHOTO', 'VIDEO'].includes(selected.value.media_type) ? '此归档文件没有可用的浏览器预览。' : null))
+const viewerDeleteTarget = computed(() => selected.value ? { kind: 'archive' as const, id: selected.value.id } : null)
 
 async function load() {
   loading.value = true
   try {
     items.value = await api.archiveMedia({ ...(selectedChat.value ? { chat_id: selectedChat.value } : {}), ...(selectedType.value ? { media_type: selectedType.value } : {}), ...(selectedDestination.value ? { destination_id: selectedDestination.value } : {}) })
+    const available = new Set(items.value.map((item) => item.id))
+    selectedIds.value = new Set([...selectedIds.value].filter((id) => available.has(id)))
+    if (selected.value && !available.has(selected.value.id)) close()
   } finally {
     loading.value = false
   }
@@ -127,9 +140,73 @@ async function clearFilters() {
   await applyFilters()
 }
 
+function toggleSelection(item: ArchiveItem) {
+  if (deleting.value) return
+  const next = new Set(selectedIds.value)
+  if (next.has(item.id)) next.delete(item.id)
+  else next.add(item.id)
+  selectedIds.value = next
+}
+function selectAllLoaded() {
+  selectedIds.value = allLoadedSelected.value ? new Set() : new Set(items.value.map((item) => item.id))
+}
+function requestSelectedDelete() { if (selectedCount.value && !deleting.value) confirmDeleteOpen.value = true }
+function requestViewerDelete() {
+  if (!selected.value || deleting.value) return
+  deleteError.value = ''
+  selectedIds.value = new Set([selected.value.id])
+  confirmDeleteOpen.value = true
+}
+function delay(ms: number) { return new Promise((resolve) => window.setTimeout(resolve, ms)) }
+async function waitForDelete(operation: DeleteOperation) {
+  let current = operation
+  while (current.status === 'PENDING' || current.status === 'RUNNING') {
+    await delay(650)
+    current = await api.deleteOperation(operation.operation_id)
+    deleteOperation.value = current
+  }
+  return current
+}
+function removeDeletedItems(operation: DeleteOperation) {
+  const removed = new Set(operation.items.filter((item) => item.status === 'DELETED' || item.status === 'ALREADY_DELETED').map((item) => item.id))
+  items.value = items.value.filter((item) => !removed.has(item.id))
+  if (selected.value && removed.has(selected.value.id)) close()
+  selectedIds.value = new Set([...selectedIds.value].filter((id) => !removed.has(id)))
+}
+async function confirmDelete() {
+  const ids = [...selectedIds.value]
+  if (!ids.length || deleting.value) return
+  deleting.value = true
+  deleteError.value = ''
+  try {
+    const operation = await api.deleteArchiveMedia(ids)
+    deleteOperation.value = operation
+    const finalOperation = operation.status === 'PENDING' || operation.status === 'RUNNING' ? await waitForDelete(operation) : operation
+    deleteError.value = finalOperation.failed_count ? `${finalOperation.failed_count} 项删除失败，归档索引已保留，可在结果面板重试。` : ''
+    removeDeletedItems(finalOperation)
+    await load()
+  } catch (reason) { deleteError.value = reason instanceof Error ? reason.message : '删除归档失败'; selectionError.value = deleteError.value }
+  finally { deleting.value = false; confirmDeleteOpen.value = false }
+}
+async function retryDelete() {
+  if (!deleteOperation.value || deleting.value) return
+  deleting.value = true
+  deleteError.value = ''
+  try {
+    const operation = await api.retryDeleteOperation(deleteOperation.value.operation_id)
+    deleteOperation.value = operation
+    const finalOperation = operation.status === 'PENDING' || operation.status === 'RUNNING' ? await waitForDelete(operation) : operation
+    deleteError.value = finalOperation.failed_count ? `${finalOperation.failed_count} 项删除失败，归档索引已保留，可在结果面板重试。` : ''
+    removeDeletedItems(finalOperation)
+    await load()
+  } catch (reason) { deleteError.value = reason instanceof Error ? reason.message : '重试删除失败'; selectionError.value = deleteError.value }
+  finally { deleting.value = false }
+}
+
 async function select(item: ArchiveItem) {
   const requestId = ++selectionRequestId
   selectionError.value = ''
+  deleteError.value = ''
   selectionLoading.value = true
   selected.value = item
   try {
@@ -278,6 +355,7 @@ function showYearMarker(index: number) {
 
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== 'Escape') return
+  if (confirmDeleteOpen.value || deleting.value) return
   if (selected.value) close()
   else if (filterOpen.value) filterOpen.value = false
   else if (mobileDateMenuOpen.value) mobileDateMenuOpen.value = false
@@ -306,6 +384,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('scroll', onScroll)
   window.removeEventListener('resize', updateActiveDay)
   if (scrollFrame !== null) window.cancelAnimationFrame(scrollFrame)
+  selectedIds.value = new Set()
 })
 </script>
 
@@ -323,6 +402,8 @@ onBeforeUnmount(() => {
       <button class="archive-filter-clear" :disabled="!activeFilterCount" @click="clearFilters">清除筛选</button>
     </section>
     <section v-if="mobileDateMenuOpen && archiveMonths.length" id="archive-mobile-date-menu" class="archive-mobile-date-menu" aria-label="按日期跳转"><div v-for="month in archiveMonths" :key="month.key" class="archive-mobile-month"><strong>{{ month.label }}</strong><div><button v-for="day in month.days" :key="day.key" :class="{ active: day.key === activeDayKey }" @click="scrollToDay(day.key); mobileDateMenuOpen = false">{{ day.label }}</button></div></div></section>
+    <div v-if="selectedCount" class="bulk-action-bar archive-bulk-action"><span>已选择 {{ selectedCount }} 个归档文件</span><button class="quiet-button" type="button" @click="selectedIds = new Set()">取消选择</button><button class="quiet-button" type="button" :disabled="deleting" @click="selectAllLoaded">{{ allLoadedSelected ? '取消全选' : '全选当前已载入项' }}</button><button class="danger-button" type="button" :disabled="deleting" @click="requestSelectedDelete"><Trash2 :size="16" />删除归档</button></div>
+    <div v-else-if="items.length" class="archive-select-all"><button class="quiet-button" type="button" :disabled="deleting" @click="selectAllLoaded">全选当前已载入项（{{ items.length }}）</button></div>
     <section v-if="loading" class="loading-block">正在读取归档索引…</section>
     <section v-else-if="!items.length" class="empty-state compact"><div class="empty-icon"><Search :size="26" /></div><h2>没有匹配的归档文件</h2><p>完成下载后的图片和视频会在这里生成缩略图。</p></section>
     <section v-else class="archive-scroll-region">
@@ -331,7 +412,7 @@ onBeforeUnmount(() => {
           <div class="archive-month-heading"><h2>{{ month.label }}</h2><span>{{ month.items.length }} 个文件</span></div>
           <div v-for="day in month.days" :key="day.key" :ref="(element) => setDayAnchor(day.key, element)" class="archive-day" :data-day-key="day.key">
             <div class="archive-day-heading"><h3>{{ day.label }}</h3><span>{{ day.items.length }} 个文件</span></div>
-            <div class="archive-grid"><button v-for="item in day.items" :key="item.id" class="archive-card" :aria-label="cardLabel(item)" @click="select(item)"><div :class="['media-preview', item.media_type.toLowerCase()]"><img v-if="item.thumbnail_url" :src="resource(item.thumbnail_url) ?? undefined" alt="" /><template v-else><Image v-if="item.media_type === 'PHOTO'" :size="34" aria-hidden="true" /><Video v-else-if="item.media_type === 'VIDEO'" :size="34" aria-hidden="true" /><FileAudio v-else-if="item.media_type === 'AUDIO'" :size="34" aria-hidden="true" /><FileText v-else :size="34" aria-hidden="true" /><small v-if="previewStatus[item.thumbnail_status]" class="sr-only">{{ previewStatus[item.thumbnail_status] }}</small></template><span v-if="item.media_type === 'VIDEO'" class="play-badge" aria-hidden="true">▶</span><span class="archive-card-overlay" aria-hidden="true"><b>{{ item.filename }}</b><span class="archive-card-chat">{{ item.chat_title }} · {{ item.destination?.name ?? '本地归档' }}</span><small>{{ formattedDate(item.message_date) }} · {{ bytes(item.size_bytes) }}</small></span></div></button></div>
+            <div class="archive-grid"><div v-for="item in day.items" :key="item.id" class="archive-card" :class="{ selected: selectedIds.has(item.id) }"><label class="selection-checkbox archive-selection" @click.stop><input type="checkbox" :checked="selectedIds.has(item.id)" :aria-label="`选择归档 ${item.filename}`" :disabled="deleting" @change="toggleSelection(item)" /><span></span></label><button class="archive-card-open" :aria-label="cardLabel(item)" @click="select(item)"><div :class="['media-preview', item.media_type.toLowerCase()]"><img v-if="item.thumbnail_url" :src="resource(item.thumbnail_url) ?? undefined" alt="" /><template v-else><Image v-if="item.media_type === 'PHOTO'" :size="34" aria-hidden="true" /><Video v-else-if="item.media_type === 'VIDEO'" :size="34" aria-hidden="true" /><FileAudio v-else-if="item.media_type === 'AUDIO'" :size="34" aria-hidden="true" /><FileText v-else :size="34" aria-hidden="true" /><small v-if="previewStatus[item.thumbnail_status]" class="sr-only">{{ previewStatus[item.thumbnail_status] }}</small></template><span v-if="item.media_type === 'VIDEO'" class="play-badge" aria-hidden="true">▶</span><span class="archive-card-overlay" aria-hidden="true"><b>{{ item.filename }}</b><span class="archive-card-chat">{{ item.chat_title }} · {{ item.destination?.name ?? '本地归档' }}</span><small>{{ formattedDate(item.message_date) }} · {{ bytes(item.size_bytes) }}</small></span></div></button></div></div>
           </div>
         </section>
       </section>
@@ -342,6 +423,8 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </section>
-    <MediaViewer :open="Boolean(selected)" :item="viewerItem" :loading="selectionLoading" :error="viewerError" :has-previous="selectedIndex > 0" :has-next="selectedIndex >= 0 && selectedIndex < items.length - 1" @close="close" @previous="navigateSelection(-1)" @next="navigateSelection(1)" />
+    <DeleteResultPanel :operation="deleteOperation" :busy="deleting" @retry="retryDelete" @close="deleteOperation = null" />
+    <DeleteConfirmDialog :open="confirmDeleteOpen" :count="selectedCount" subject="归档媒体" :busy="deleting" @cancel="confirmDeleteOpen = false" @confirm="confirmDelete" />
+    <MediaViewer :open="Boolean(selected)" :item="viewerItem" :loading="selectionLoading" :error="viewerError" :delete-error="deleteError || null" :has-previous="selectedIndex > 0" :has-next="selectedIndex >= 0 && selectedIndex < items.length - 1" :delete-target="viewerDeleteTarget" :deleting="deleting" @close="close" @previous="navigateSelection(-1)" @next="navigateSelection(1)" @delete="requestViewerDelete" />
   </main>
 </template>

@@ -24,20 +24,25 @@ const props = withDefaults(defineProps<{
   statusDetail?: string | null
   hasPrevious?: boolean
   hasNext?: boolean
-  deletable?: boolean
+  deleteTarget?: { kind: 'archive' | 'task-media'; id: number } | null
+  deleting?: boolean
+  deleteError?: string | null
 }>(), {
   loading: false,
   error: null,
   statusDetail: null,
   hasPrevious: false,
   hasNext: false,
-  deletable: false,
+  deleteTarget: null,
+  deleting: false,
+  deleteError: null,
 })
 
 const emit = defineEmits<{
   close: []
   previous: []
   next: []
+  delete: []
 }>()
 
 const viewerRoot = ref<HTMLElement | null>(null)
@@ -113,6 +118,7 @@ function toggleSlideshow() {
 }
 
 function requestClose() {
+  if (props.deleting) return
   slideshow.value = false
   stopSlideshow()
   restoreFocus?.focus()
@@ -121,11 +127,11 @@ function requestClose() {
 }
 
 function goPrevious() {
-  if (props.hasPrevious) emit('previous')
+  if (props.hasPrevious && !props.deleting) emit('previous')
 }
 
 function goNext() {
-  if (props.hasNext) emit('next')
+  if (props.hasNext && !props.deleting) emit('next')
 }
 
 function trapTab(event: KeyboardEvent) {
@@ -199,7 +205,7 @@ onBeforeUnmount(() => {
       <div class="media-viewer-heading" aria-live="polite"><strong>{{ item.filename }}</strong><small>{{ item.sourceLabel || typeLabel[item.mediaType] || item.mediaType }}</small></div>
       <nav class="media-viewer-toolbar" aria-label="媒体工具">
         <button class="media-viewer-icon" type="button" :class="{ active: infoOpen }" :aria-expanded="infoOpen" aria-label="查看信息" title="信息" @click="infoOpen = !infoOpen"><Info :size="21" /></button>
-        <button class="media-viewer-icon" type="button" :disabled="!deletable" :aria-label="deletable ? '删除媒体' : '删除功能暂未开放'" :title="deletable ? '删除' : '删除功能暂未开放'"><Trash2 :size="21" /></button>
+        <button class="media-viewer-icon" type="button" :disabled="!deleteTarget || deleting" :aria-busy="deleting" :aria-label="deleting ? '删除处理中' : deleteTarget ? '删除媒体' : '当前媒体不可删除'" :title="deleting ? '删除处理中' : deleteTarget ? '删除' : '当前媒体不可删除'" @click="emit('delete')"><Trash2 :size="21" /></button>
         <a v-if="hasDownload" class="media-viewer-icon" :href="item.downloadUrl ?? undefined" aria-label="下载原文件" title="下载"><Download :size="21" /></a>
         <button v-else class="media-viewer-icon" type="button" disabled aria-label="当前媒体不可直接下载" title="当前媒体不可直接下载"><Download :size="21" /></button>
         <button class="media-viewer-icon" type="button" :disabled="!canRotate" :aria-label="canRotate ? '旋转图片' : '当前媒体不可旋转'" :title="canRotate ? '旋转' : '当前媒体不可旋转'" @click="rotation = (rotation + 90) % 360"><RotateCw :size="21" /></button>
@@ -207,8 +213,10 @@ onBeforeUnmount(() => {
       </nav>
     </header>
 
+    <p v-if="deleteError" class="media-viewer-delete-error" role="alert">{{ deleteError }}</p>
+
     <div class="media-viewer-body">
-      <button class="media-viewer-nav media-viewer-nav-previous" type="button" :disabled="!hasPrevious" aria-label="上一张" title="上一张" @click="goPrevious"><ChevronLeft :size="34" /></button>
+      <button class="media-viewer-nav media-viewer-nav-previous" type="button" :disabled="!hasPrevious || deleting" aria-label="上一张" title="上一张" @click="goPrevious"><ChevronLeft :size="34" /></button>
       <main class="media-viewer-stage" @click.self="requestClose">
         <div v-if="mediaReady" class="media-viewer-content">
           <img v-if="isImage" :src="item.contentUrl ?? undefined" :alt="item.filename" :style="{ transform: `rotate(${rotation}deg)` }" @error="mediaFailed = true" />
@@ -217,7 +225,7 @@ onBeforeUnmount(() => {
         </div>
         <div v-else class="media-viewer-fallback" role="status"><div class="media-viewer-fallback-icon"><RotateCw v-if="loading" class="media-viewer-spinner" :size="34" /><Info v-else :size="34" /></div><p>{{ fallbackMessage }}</p><small v-if="statusDetail">{{ statusDetail }}</small></div>
       </main>
-      <button class="media-viewer-nav media-viewer-nav-next" type="button" :disabled="!hasNext" aria-label="下一张" title="下一张" @click="goNext"><ChevronRight :size="34" /></button>
+      <button class="media-viewer-nav media-viewer-nav-next" type="button" :disabled="!hasNext || deleting" aria-label="下一张" title="下一张" @click="goNext"><ChevronRight :size="34" /></button>
 
       <aside v-if="infoOpen" class="media-viewer-info" aria-label="媒体信息">
         <div class="media-viewer-info-head"><h2>信息</h2><button class="media-viewer-info-close" type="button" aria-label="关闭信息" @click="infoOpen = false"><X :size="20" /></button></div>
