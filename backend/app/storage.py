@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
+import re
 import secrets
 import shutil
 import stat
+import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import httpx
 
@@ -45,6 +48,12 @@ def get_last_directory_cache_metrics() -> DirectoryCacheMetrics | None:
 
 _DIRECTORY_STATE_INVALIDATION_STATUSES = frozenset({404, 405, 409, 410, 412, 423})
 _UPLOAD_DIRECTORY_RETRY_STATUSES = frozenset({404, 409, 410, 412, 423})
+_ARCHIVE_YEAR_RE = re.compile(r"\d{4}\Z")
+_ARCHIVE_MONTH_RE = re.compile(r"(?:0[1-9]|1[0-2])\Z")
+_WEBDAV_PROPFIND_BODY = b"""<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<D:propfind xmlns:D=\"DAV:\"><D:prop><D:resourcetype/></D:prop></D:propfind>"""
+_MAX_WEBDAV_DIRECTORY_RESPONSE_BYTES = 512 * 1024
+_MAX_WEBDAV_DIRECTORY_ENTRIES = 2048
 
 
 class _WebDAVResponseError(StorageError):
@@ -92,6 +101,83 @@ def _safe_local_path(root: Path, relative: str | Path) -> Path:
     return candidate
 
 
+def _single_relative_segment(value: str | Path) -> str:
+    if Path(value).is_absolute():
+        raise StorageError("聊天归档目录必须是安全相对路径")
+    text = _relative_text(value)
+    if "/" in text:
+        raise StorageError("聊天归档目录必须是单个路径段")
+    return text
+
+
+def _local_directory_is_empty(path: Path) -> bool:
+    try:
+        with os.scandir(path) as entries:
+            return next(entries, None) is None
+    except FileNotFoundError:
+        return True
+
+
+def _remove_empty_local_directory(path: Path) -> bool:
+    try:
+        path.rmdir()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as error:
+        if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+            return False
+        raise
+
+
+def _cleanup_local_empty_chat_tree(root: Path) -> None:
+    """Remove only an empty archive chat tree, without following symlinks."""
+    if root.is_symlink() or not root.is_dir():
+        return
+
+    root_blocked = False
+    with os.scandir(root) as year_entries:
+        years = list(year_entries)
+    for year_entry in years:
+        if year_entry.is_symlink() or not year_entry.is_dir(follow_symlinks=False) or not _ARCHIVE_YEAR_RE.fullmatch(year_entry.name):
+            root_blocked = True
+            continue
+
+        year_path = Path(year_entry.path)
+        year_blocked = False
+        with os.scandir(year_path) as month_entries:
+            months = list(month_entries)
+        for month_entry in months:
+            if month_entry.is_symlink() or not month_entry.is_dir(follow_symlinks=False) or not _ARCHIVE_MONTH_RE.fullmatch(month_entry.name):
+                year_blocked = True
+                continue
+            month_path = Path(month_entry.path)
+            if _local_directory_is_empty(month_path):
+                if not _remove_empty_local_directory(month_path):
+                    year_blocked = True
+            else:
+                year_blocked = True
+
+        if not year_blocked and _local_directory_is_empty(year_path):
+            if not _remove_empty_local_directory(year_path):
+                root_blocked = True
+        else:
+            root_blocked = True
+
+    if not root_blocked and _local_directory_is_empty(root):
+        _remove_empty_local_directory(root)
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+@dataclass(frozen=True)
+class _WebDAVResource:
+    name: str
+    is_collection: bool
+
+
 @dataclass(frozen=True)
 class Destination:
     id: int
@@ -133,6 +219,14 @@ class Destination:
     @property
     def is_local(self) -> bool:
         return self.kind == "LOCAL"
+
+    def storage_namespace(self) -> tuple[str, ...]:
+        """Identify the physical archive namespace used by in-process guards."""
+        if self.is_local:
+            if not self.local_root:
+                raise StorageError("本地目的地缺少目录")
+            return ("LOCAL", str(self.local_root.resolve()))
+        return ("WEBDAV", self._service_url(), "/".join(self._remote_root_parts()))
 
     def local_path(self, relative: str | Path) -> Path:
         if not self.is_local or not self.local_root:
@@ -465,6 +559,202 @@ class Destination:
             self._check_response(response, "删除归档文件", accepted=set(range(200, 300)) | {404})
         except httpx.HTTPError as error:
             raise StorageError(f"WebDAV 删除失败：{error}") from error
+
+    @staticmethod
+    def _normalize_webdav_candidate(target_url: str, candidate: str) -> tuple[str, list[str]]:
+        target = urlsplit(target_url)
+        parsed = urlsplit(candidate)
+        if (
+            parsed.scheme.casefold() != target.scheme.casefold()
+            or parsed.netloc.casefold() != target.netloc.casefold()
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise StorageError("WebDAV 目录响应链接超出当前存储范围")
+        decoded_path = unquote(parsed.path)
+        if not decoded_path.startswith("/"):
+            raise StorageError("WebDAV 目录响应链接无效")
+        raw_parts = decoded_path.split("/")
+        if any(part == "" for part in raw_parts[1:-1]) or any(part in {".", ".."} for part in raw_parts):
+            raise StorageError("WebDAV 目录响应链接包含非法路径段")
+        parts = [part for part in raw_parts if part]
+        normalized_path = "/" + "/".join(quote(part, safe="-._~") for part in parts)
+        return f"{target.scheme}://{target.netloc}{normalized_path}".rstrip("/"), parts
+
+    @classmethod
+    def _normalize_webdav_href_variants(cls, target_url: str, href: str) -> list[tuple[str, list[str]]]:
+        if not href or len(href) > 4096:
+            raise StorageError("WebDAV 目录响应包含无效链接")
+        raw_href = href.strip()
+        href_path = unquote(urlsplit(raw_href).path)
+        if any(part in {".", ".."} for part in href_path.split("/")):
+            raise StorageError("WebDAV 目录响应链接包含非法路径段")
+        parsed_href = urlsplit(raw_href)
+        if parsed_href.scheme or parsed_href.netloc or href_path.startswith("/"):
+            candidates = [urljoin(target_url.rstrip("/") + "/", raw_href)]
+        else:
+            candidates = [
+                urljoin(target_url.rstrip("/") + "/", raw_href),
+                urljoin(target_url.rsplit("/", 1)[0].rstrip("/") + "/", raw_href),
+            ]
+        variants: list[tuple[str, list[str]]] = []
+        for candidate in candidates:
+            normalized = cls._normalize_webdav_candidate(target_url, candidate)
+            if normalized not in variants:
+                variants.append(normalized)
+        return variants
+
+    @classmethod
+    def _normalize_webdav_href(cls, target_url: str, href: str) -> tuple[str, list[str]]:
+        return cls._normalize_webdav_href_variants(target_url, href)[0]
+
+    @classmethod
+    def _parse_webdav_directory_listing(
+        cls,
+        response: httpx.Response,
+        target_url: str,
+    ) -> tuple[bool, list[_WebDAVResource]] | None:
+        if response.status_code == 404:
+            return None
+        if response.status_code != 207:
+            cls._check_response(response, "读取 WebDAV 目录", accepted={207})
+        if len(response.content) > _MAX_WEBDAV_DIRECTORY_RESPONSE_BYTES:
+            raise StorageError("WebDAV 目录响应过大，已停止清理")
+        try:
+            document = ET.fromstring(response.content)
+        except (ET.ParseError, ValueError) as error:
+            raise StorageError("WebDAV 目录响应 XML 无法解析，已保留目录") from error
+
+        normalized_target, target_parts = cls._normalize_webdav_href(target_url, target_url)
+        target_is_collection: bool | None = None
+        children: list[_WebDAVResource] = []
+        seen_urls: set[str] = set()
+        response_nodes = [element for element in document.iter() if _xml_local_name(element.tag) == "response"]
+        if not response_nodes or len(response_nodes) > _MAX_WEBDAV_DIRECTORY_ENTRIES + 1:
+            raise StorageError("WebDAV 目录响应内容不明确，已保留目录")
+        for response_node in response_nodes:
+            href_node = next((element for element in response_node.iter() if _xml_local_name(element.tag) == "href"), None)
+            status_node = next((element for element in response_node.iter() if _xml_local_name(element.tag) == "status"), None)
+            resource_type_node = next((element for element in response_node.iter() if _xml_local_name(element.tag) == "resourcetype"), None)
+            if href_node is None or not (href_node.text or "").strip() or status_node is None or resource_type_node is None:
+                raise StorageError("WebDAV 目录响应缺少可靠属性，已保留目录")
+            status_text = (status_node.text or "").strip()
+            if not re.search(r"\b2\d{2}\b", status_text):
+                raise StorageError("WebDAV 目录响应包含异常资源状态，已保留目录")
+            href_variants = cls._normalize_webdav_href_variants(target_url, (href_node.text or "").strip())
+            normalized_url, parts = next(
+                (
+                    variant
+                    for variant in href_variants
+                    if variant[0] == normalized_target
+                    or (len(variant[1]) == len(target_parts) + 1 and variant[1][: len(target_parts)] == target_parts)
+                ),
+                ("", []),
+            )
+            if not normalized_url:
+                raise StorageError("WebDAV Depth:1 响应越出当前目录，已保留目录")
+            if normalized_url in seen_urls:
+                raise StorageError("WebDAV 目录响应包含重复资源，已保留目录")
+            seen_urls.add(normalized_url)
+            is_collection = any(_xml_local_name(element.tag) == "collection" for element in resource_type_node.iter())
+            if normalized_url == normalized_target:
+                if target_is_collection is not None:
+                    raise StorageError("WebDAV 目录响应包含重复目标，已保留目录")
+                target_is_collection = is_collection
+                continue
+            if len(parts) != len(target_parts) + 1 or parts[: len(target_parts)] != target_parts:
+                raise StorageError("WebDAV Depth:1 响应越出当前目录，已保留目录")
+            children.append(_WebDAVResource(name=parts[-1], is_collection=is_collection))
+        if target_is_collection is None:
+            raise StorageError("WebDAV 目录响应缺少目标集合，已保留目录")
+        return target_is_collection, children
+
+    async def _webdav_directory_listing(
+        self,
+        client: httpx.AsyncClient,
+        relative: str,
+    ) -> tuple[bool, list[_WebDAVResource]] | None:
+        url = self.remote_url(relative)
+        response = await client.request(
+            "PROPFIND",
+            url,
+            headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+            content=_WEBDAV_PROPFIND_BODY,
+        )
+        return self._parse_webdav_directory_listing(response, url)
+
+    async def _webdav_collection_exists(
+        self,
+        client: httpx.AsyncClient,
+        relative: str,
+    ) -> bool:
+        url = self.remote_url(relative)
+        response = await client.request("PROPFIND", url, headers={"Depth": "0"})
+        if response.status_code == 404:
+            return False
+        self._check_response(response, "确认 WebDAV 目录删除", accepted={207})
+        return True
+
+    async def _cleanup_webdav_directory(
+        self,
+        client: httpx.AsyncClient,
+        relative: str,
+        *,
+        level: int,
+    ) -> None:
+        listing = await self._webdav_directory_listing(client, relative)
+        if listing is None:
+            return
+        is_collection, children = listing
+        if not is_collection:
+            return
+
+        for child in children:
+            expected = (
+                level == 0 and child.is_collection and _ARCHIVE_YEAR_RE.fullmatch(child.name)
+            ) or (
+                level == 1 and child.is_collection and _ARCHIVE_MONTH_RE.fullmatch(child.name)
+            )
+            if expected:
+                await self._cleanup_webdav_directory(client, f"{relative}/{child.name}", level=level + 1)
+
+        # Re-list after every child operation.  WebDAV DELETE is recursive on
+        # many servers, so a stale listing must never authorize a parent delete.
+        refreshed = await self._webdav_directory_listing(client, relative)
+        if refreshed is None:
+            return
+        refreshed_is_collection, refreshed_children = refreshed
+        if not refreshed_is_collection or refreshed_children:
+            return
+
+        url = self.remote_url(relative)
+        response = await client.request("DELETE", url)
+        self._check_response(response, "删除空 WebDAV 目录", accepted=set(range(200, 300)) | {404})
+        webdav_client_manager.invalidate_directory(
+            self,
+            url,
+            include_descendants=True,
+            include_ancestors=True,
+        )
+        if await self._webdav_collection_exists(client, relative):
+            raise StorageError("WebDAV 目录删除后仍可见，已停止清理")
+
+    async def cleanup_empty_chat_tree(self, chat_root: str | Path) -> None:
+        """Best-effort removal of only an empty chat/year/month archive tree."""
+        chat_root_text = _single_relative_segment(chat_root)
+        if self.is_local:
+            if not self.local_root:
+                raise StorageError("本地目的地缺少目录")
+            # Do not use local_path() here: it resolves the final segment and
+            # would turn a chat-directory symlink into an external target.
+            root = self.local_root.resolve() / chat_root_text
+            await asyncio.to_thread(_cleanup_local_empty_chat_tree, root)
+            return
+        try:
+            client = await webdav_client_manager.get_client(self)
+            await self._cleanup_webdav_directory(client, chat_root_text, level=0)
+        except httpx.HTTPError as error:
+            raise StorageError(f"WebDAV 目录清理失败：{error}") from error
 
     @staticmethod
     def _should_retry_directory_state(error: _WebDAVResponseError) -> bool:

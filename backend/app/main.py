@@ -83,6 +83,7 @@ DOWNLOAD_LAST_ERROR_AT: float | None = None
 DOWNLOAD_ROUND_ROBIN_OFFSET = 0
 DOWNLOAD_CLIENT_LOCK = asyncio.Lock()
 ARCHIVE_DELIVERY_LOCKS: dict[tuple[int, str], tuple[asyncio.Lock, int]] = {}
+ARCHIVE_CHAT_LOCKS: dict[tuple[tuple[str, ...], str], tuple[asyncio.Lock, int]] = {}
 ARCHIVE_BLOB_LOCKS: dict[int, tuple[asyncio.Lock, int]] = {}
 DELETE_OPERATION_WORKERS: dict[str, asyncio.Task[None]] = {}
 CHAT_CACHE_REFRESH_LOCK = asyncio.Lock()
@@ -2673,7 +2674,29 @@ def resolve_archive_relative_path(destination: Destination, base_path: Path, con
 
 
 @asynccontextmanager
-async def archive_delivery_guard(destination_id: int, base_path: Path) -> AsyncIterator[None]:
+async def archive_chat_guard(destination: Destination, chat_root: str | Path) -> AsyncIterator[None]:
+    """Serialize archive uploads/deletes within one physical chat directory."""
+    key = (destination.storage_namespace(), archive_path_text(chat_root).strip("/"))
+    entry = ARCHIVE_CHAT_LOCKS.get(key)
+    if entry:
+        lock, users = entry
+        ARCHIVE_CHAT_LOCKS[key] = (lock, users + 1)
+    else:
+        lock = asyncio.Lock()
+        ARCHIVE_CHAT_LOCKS[key] = (lock, 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        lock, users = ARCHIVE_CHAT_LOCKS[key]
+        if users <= 1:
+            ARCHIVE_CHAT_LOCKS.pop(key, None)
+        else:
+            ARCHIVE_CHAT_LOCKS[key] = (lock, users - 1)
+
+
+@asynccontextmanager
+async def _archive_delivery_path_guard(destination_id: int, base_path: Path) -> AsyncIterator[None]:
     """Serialize path selection and delivery for one logical archive path."""
     key = (destination_id, archive_path_text(base_path))
     entry = ARCHIVE_DELIVERY_LOCKS.get(key)
@@ -2695,6 +2718,23 @@ async def archive_delivery_guard(destination_id: int, base_path: Path) -> AsyncI
 
 
 @asynccontextmanager
+async def archive_delivery_guard(
+    destination_id: int,
+    base_path: Path,
+    *,
+    destination: Destination | None = None,
+) -> AsyncIterator[None]:
+    """Guard a delivery path, optionally under its physical chat lock."""
+    if destination is not None:
+        async with archive_chat_guard(destination, base_path.parts[0]):
+            async with _archive_delivery_path_guard(destination_id, base_path):
+                yield
+        return
+    async with _archive_delivery_path_guard(destination_id, base_path):
+        yield
+
+
+@asynccontextmanager
 async def archive_blob_guard(blob_id: int) -> AsyncIterator[None]:
     """Serialize thumbnail generation with deletion for one shared blob."""
     entry = ARCHIVE_BLOB_LOCKS.get(blob_id)
@@ -2713,6 +2753,50 @@ async def archive_blob_guard(blob_id: int) -> AsyncIterator[None]:
             ARCHIVE_BLOB_LOCKS.pop(blob_id, None)
         else:
             ARCHIVE_BLOB_LOCKS[blob_id] = (lock, users - 1)
+
+
+def reliable_archive_chat_roots(chat_id: str, destination_id: int) -> set[str]:
+    """Return chat directory roots still derivable from reliable index rows."""
+    roots: set[str] = set()
+    with connection() as db:
+        rows = db.execute(
+            """SELECT l.canonical_path
+               FROM archive_items a
+               JOIN archive_locations l ON l.id = a.location_id
+               WHERE a.chat_id = ? AND l.destination_id = ? AND l.destination_version_id IS NOT NULL""",
+            (chat_id, destination_id),
+        ).fetchall()
+    for row in rows:
+        raw_path = str(row["canonical_path"] or "")
+        if Path(raw_path).is_absolute():
+            continue
+        path = raw_path.replace(os.sep, "/").strip("/")
+        parts = path.split("/") if path else []
+        if parts and all(part not in {"", ".", ".."} for part in parts):
+            roots.add(parts[0])
+    return roots
+
+
+def archive_root_has_reliable_references(destination_id: int, chat_root: str) -> bool:
+    root = archive_path_text(chat_root).strip("/")
+    if not root or "/" in root:
+        return True
+    with connection() as db:
+        rows = db.execute(
+            """SELECT l.canonical_path
+               FROM archive_items a
+               JOIN archive_locations l ON l.id = a.location_id
+               WHERE l.destination_id = ? AND l.destination_version_id IS NOT NULL""",
+            (destination_id,),
+        ).fetchall()
+    for row in rows:
+        raw_path = str(row["canonical_path"] or "")
+        if Path(raw_path).is_absolute():
+            continue
+        path = raw_path.replace(os.sep, "/").strip("/")
+        if path == root or path.startswith(f"{root}/"):
+            return True
+    return False
 
 
 def scan_cache_key(payload: ScanRequest) -> str:
@@ -3914,7 +3998,7 @@ async def download_media_job(task_id: int, media_id: int) -> None:
                 content_fingerprint,
                 "归档文件在交付前发生变化，已拒绝上传",
             )
-            async with archive_delivery_guard(destination.id, base_relative_path):
+            async with archive_delivery_guard(destination.id, base_relative_path, destination=destination):
                 relative_path = resolve_archive_relative_path(destination, base_relative_path, content_hash)
                 final_path = destination.local_path(relative_path) if destination.is_local else None
                 start_stage("delivery")
@@ -4630,7 +4714,7 @@ def finalize_archive_item_delete(item_id: int) -> tuple[str, str | None]:
 async def process_archive_delete_item(item_id: int) -> tuple[str, bool, str | None, str | None]:
     with connection() as db:
         row = db.execute(
-            """SELECT a.id, a.blob_id, a.location_id, l.canonical_path AS location_path,
+            """SELECT a.id, a.chat_id, a.blob_id, a.location_id, l.canonical_path AS location_path,
                       l.destination_id, l.destination_version_id, d.kind AS destination_kind,
                       b.thumbnail_path
                FROM archive_items a
@@ -4659,7 +4743,7 @@ async def process_archive_delete_item(item_id: int) -> tuple[str, bool, str | No
         code, retryable, message = deletion_error(error)
         return "FAILED", retryable, code, message
 
-    async with archive_delivery_guard(destination.id, relative_path):
+    async with archive_delivery_guard(destination.id, relative_path, destination=destination):
         async with archive_blob_guard(int(row["blob_id"])):
             # A second operation may have completed while this one was waiting.
             with connection() as db:
@@ -4667,13 +4751,35 @@ async def process_archive_delete_item(item_id: int) -> tuple[str, bool, str | No
                 reference_count = db.execute("SELECT COUNT(*) FROM archive_items WHERE location_id = ?", (row["location_id"],)).fetchone()[0] if current else 0
             if not current:
                 return "ALREADY_DELETED", False, None, None
+            cleanup_roots: set[str] = set()
             if reference_count <= 1:
+                cleanup_roots = reliable_archive_chat_roots(str(row["chat_id"]), destination.id)
+                if relative_path.parts:
+                    cleanup_roots.add(relative_path.parts[0])
                 try:
                     await destination.delete_file(relative_path)
                 except Exception as error:
                     code, retryable, message = deletion_error(error)
                     return "FAILED", retryable, code, message
             result, _ = finalize_archive_item_delete(item_id)
+            if result == "DELETED" and cleanup_roots:
+                for chat_root in sorted(cleanup_roots):
+                    if archive_root_has_reliable_references(destination.id, chat_root):
+                        continue
+                    try:
+                        await destination.cleanup_empty_chat_tree(chat_root)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as cleanup_error:
+                        log_event(
+                            logging.WARNING,
+                            "archive.chat_directory_cleanup_failed",
+                            "Empty archive chat directory could not be cleaned after media deletion",
+                            destination_id=destination.id,
+                            chat_id=str(row["chat_id"]),
+                            chat_root=chat_root,
+                            error_type=type(cleanup_error).__name__,
+                        )
             return result, False, None, None
 
 

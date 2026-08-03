@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
@@ -31,21 +31,51 @@ class MockWebDAV:
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
         self.requests: list[tuple[str, str]] = []
+        self.propfind_depths: list[tuple[str, str]] = []
         self.collections: set[str] = {"/dav", "/dav/archive", "/dav/archive/root"}
         self.propfind_overrides: dict[str, int] = {}
         self.propfind_sequences: dict[str, list[int]] = {}
+        self.propfind_bodies: dict[str, bytes] = {}
         self.mkcol_overrides: dict[str, int] = {"/dav": 403}
+
+    def _propfind_xml(self, path: str) -> bytes:
+        resources = [path]
+        resources.extend(
+            sorted(
+                candidate
+                for candidate in set(self.collections).union(self.files)
+                if candidate != path and candidate.rsplit("/", 1)[0] == path
+            )
+        )
+        body = [b'<?xml version="1.0" encoding="utf-8"?>', b'<D:multistatus xmlns:D="DAV:">']
+        for resource in resources:
+            resource_type = b"<D:collection/>" if resource in self.collections else b""
+            href = quote(resource, safe="/-._~").encode()
+            body.append(
+                b"<D:response><D:href>"
+                + href
+                + b"</D:href><D:propstat><D:prop><D:resourcetype>"
+                + resource_type
+                + b"</D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+            )
+        body.append(b"</D:multistatus>")
+        return b"".join(body)
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         path = unquote(urlsplit(str(request.url)).path)
         self.requests.append((request.method, path))
         if request.method == "PROPFIND":
+            depth = request.headers.get("Depth", "0")
+            self.propfind_depths.append((path, depth))
             sequence = self.propfind_sequences.get(path)
             if sequence:
                 status = sequence.pop(0)
             else:
                 status = self.propfind_overrides.get(path, 207 if path in self.collections else 404)
-            return httpx.Response(status, request=request)
+            if status != 207:
+                return httpx.Response(status, request=request)
+            content = self.propfind_bodies.get(path, self._propfind_xml(path))
+            return httpx.Response(status, content=content, headers={"Content-Type": "application/xml"}, request=request)
         if request.method == "MKCOL":
             if path in self.mkcol_overrides:
                 return httpx.Response(self.mkcol_overrides[path], request=request)
@@ -71,6 +101,16 @@ class MockWebDAV:
             self.files[target] = self.files.pop(source)
             return httpx.Response(201, request=request)
         if request.method == "DELETE":
+            if path in self.collections:
+                children = {
+                    candidate
+                    for candidate in set(self.collections).union(self.files)
+                    if candidate != path and candidate.rsplit("/", 1)[0] == path
+                }
+                if children:
+                    return httpx.Response(409, request=request)
+                self.collections.remove(path)
+                return httpx.Response(204, request=request)
             if path not in self.files:
                 return httpx.Response(404, request=request)
             self.files.pop(path)
@@ -136,6 +176,50 @@ class DestinationTests(unittest.TestCase):
             media = db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone()
         self.assertEqual(task_id, task_id_hint)
         return task, media
+
+    def create_indexed_local_archive(
+        self,
+        destination_id: int,
+        *,
+        chat_id: str,
+        chat_title: str,
+        relative: str,
+        content: bytes,
+    ) -> tuple[Destination, int]:
+        destination_record = main.destination_row(destination_id, include_disabled=True)
+        self.assertIsNotNone(destination_record)
+        version_id = main.current_destination_version_id(destination_id)
+        with main.connection() as db:
+            task_id = db.execute(
+                """INSERT INTO tasks (chat_id, chat_title, archive_timezone, destination_id, destination_version_id, filters_json, status, created_at, updated_at)
+                   VALUES (?, ?, 'Asia/Shanghai', ?, ?, '{}', 'DOWNLOADING', ?, ?)""",
+                (chat_id, chat_title, destination_id, version_id, main.now(), main.now()),
+            ).lastrowid
+            media_id = db.execute(
+                """INSERT INTO task_media (task_id, message_id, filename, media_type, mime_type, size_bytes, message_date)
+                   VALUES (?, ?, 'cleanup.bin', 'DOCUMENT', 'application/octet-stream', ?, ?)""",
+                (task_id, int(task_id), len(content), "2026-07-30T04:00:00+00:00"),
+            ).lastrowid
+            task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            media = db.execute("SELECT * FROM task_media WHERE id = ?", (media_id,)).fetchone()
+            version = db.execute("SELECT * FROM destination_versions WHERE id = ?", (version_id,)).fetchone()
+        destination = main.destination_from_version(destination_record, version)
+        path = destination.local_path(relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        main.record_archive(
+            task,
+            media,
+            path,
+            Path(relative),
+            destination=destination,
+            destination_version_id=version_id,
+            content_hash=main.file_sha256(path),
+        )
+        with main.connection() as db:
+            item = db.execute("SELECT id FROM archive_items WHERE chat_id = ? AND message_id = ? ORDER BY id DESC LIMIT 1", (chat_id, int(task_id))).fetchone()
+        self.assertIsNotNone(item)
+        return destination, int(item["id"])
 
     def test_legacy_local_destination_and_task_selection_are_persisted(self) -> None:
         system = main.destination_row()
@@ -1366,6 +1450,209 @@ class DestinationTests(unittest.TestCase):
         self.assertEqual(server.files["/dav/archive/root/mkcol-405/file.bin"], b"405-confirmed")
         self.assertEqual(server.requests.count(("MKCOL", directory)), 1)
         self.assertEqual(server.requests.count(("PROPFIND", directory)), 2)
+
+    def test_local_archive_delete_removes_empty_chat_history_but_keeps_other_chats(self) -> None:
+        destination_id = self.create_local_destination("cleanup-local")
+        destination, history_item = self.create_indexed_local_archive(
+            destination_id,
+            chat_id="cleanup-chat",
+            chat_title="旧标题",
+            relative="旧标题__chat-cleanup-chat/2025/12/history.bin",
+            content=b"history",
+        )
+        _, current_item = self.create_indexed_local_archive(
+            destination_id,
+            chat_id="cleanup-chat",
+            chat_title="新标题",
+            relative="新标题__chat-cleanup-chat/2026/08/current.bin",
+            content=b"current",
+        )
+        _, other_item = self.create_indexed_local_archive(
+            destination_id,
+            chat_id="other-chat",
+            chat_title="其他聊天",
+            relative="其他聊天__chat-other-chat/2026/08/other.bin",
+            content=b"other",
+        )
+        history_root = destination.local_path("旧标题__chat-cleanup-chat")
+        current_root = destination.local_path("新标题__chat-cleanup-chat")
+        other_root = destination.local_path("其他聊天__chat-other-chat")
+
+        self.assertEqual(asyncio.run(main.process_archive_delete_item(history_item))[0], "DELETED")
+        self.assertFalse(history_root.exists())
+        self.assertTrue(current_root.is_dir())
+        self.assertTrue(other_root.is_dir())
+        self.assertEqual(asyncio.run(main.process_archive_delete_item(current_item))[0], "DELETED")
+        self.assertFalse(current_root.exists())
+        self.assertTrue(other_root.is_dir())
+        self.assertEqual(asyncio.run(main.process_archive_delete_item(other_item))[0], "DELETED")
+        self.assertFalse(other_root.exists())
+        self.assertTrue(destination.local_root.is_dir())
+
+    def test_local_chat_tree_cleanup_preserves_unknown_part_and_symlink_resources(self) -> None:
+        destination_id = self.create_local_destination("cleanup-blocked-local")
+        destination_record = main.destination_row(destination_id, include_disabled=True)
+        version_id = main.current_destination_version_id(destination_id)
+        with main.connection() as db:
+            version = db.execute("SELECT * FROM destination_versions WHERE id = ?", (version_id,)).fetchone()
+        destination = main.destination_from_version(destination_record, version)
+        root = destination.local_path("blocked-chat")
+        month = root / "2026" / "08"
+        month.mkdir(parents=True)
+        (month / "orphan.part").write_bytes(b"partial")
+        external = TEST_DATA / "cleanup-blocked-external"
+        external.mkdir()
+        symlink = month / "external-link"
+        symlink.symlink_to(external, target_is_directory=True)
+        root_symlink = destination.local_root.resolve() / "linked-chat"
+        root_symlink.symlink_to(external, target_is_directory=True)
+        try:
+            asyncio.run(destination.cleanup_empty_chat_tree("blocked-chat"))
+            asyncio.run(destination.cleanup_empty_chat_tree("linked-chat"))
+            self.assertTrue(root.is_dir())
+            self.assertTrue((month / "orphan.part").is_file())
+            self.assertTrue(symlink.is_symlink())
+            self.assertTrue(root_symlink.is_symlink())
+            self.assertTrue(external.is_dir())
+        finally:
+            symlink.unlink(missing_ok=True)
+            root_symlink.unlink(missing_ok=True)
+
+    def test_archive_delete_success_is_not_changed_by_chat_tree_cleanup_warning(self) -> None:
+        destination_id = self.create_local_destination("cleanup-warning-local")
+        destination, item_id = self.create_indexed_local_archive(
+            destination_id,
+            chat_id="warning-chat",
+            chat_title="警告聊天",
+            relative="警告聊天__chat-warning-chat/2026/08/file.bin",
+            content=b"delete-me",
+        )
+        path = destination.local_path("警告聊天__chat-warning-chat/2026/08/file.bin")
+        with patch.object(Destination, "cleanup_empty_chat_tree", new=AsyncMock(side_effect=StorageError("cleanup unavailable"))):
+            result = asyncio.run(main.process_archive_delete_item(item_id))
+        self.assertEqual(result[0], "DELETED")
+        self.assertFalse(path.exists())
+        with main.connection() as db:
+            self.assertIsNone(db.execute("SELECT id FROM archive_items WHERE id = ?", (item_id,)).fetchone())
+
+    def test_shared_location_survives_first_logical_delete_and_cleans_after_last_reference(self) -> None:
+        destination_id = self.create_local_destination("cleanup-shared-local")
+        destination, first_item = self.create_indexed_local_archive(
+            destination_id,
+            chat_id="shared-chat-a",
+            chat_title="共享聊天 A",
+            relative="共享目录__chat-shared/2026/08/shared.bin",
+            content=b"shared-content",
+        )
+        _, second_item = self.create_indexed_local_archive(
+            destination_id,
+            chat_id="shared-chat-b",
+            chat_title="共享聊天 B",
+            relative="共享目录__chat-shared/2026/08/shared.bin",
+            content=b"shared-content",
+        )
+        root = destination.local_path("共享目录__chat-shared")
+        shared_file = destination.local_path("共享目录__chat-shared/2026/08/shared.bin")
+
+        self.assertEqual(asyncio.run(main.process_archive_delete_item(first_item))[0], "DELETED")
+        self.assertTrue(shared_file.is_file())
+        self.assertTrue(root.is_dir())
+        self.assertEqual(asyncio.run(main.process_archive_delete_item(second_item))[0], "DELETED")
+        self.assertFalse(shared_file.exists())
+        self.assertFalse(root.exists())
+
+    def test_webdav_cleanup_removes_only_empty_chat_tree_and_confirms_deletes(self) -> None:
+        server = MockWebDAV()
+
+        async def factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        manager = WebDAVClientManager(factory)
+        destination = Destination(
+            id=991,
+            name="cleanup-dav",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            remote_root="archive/root",
+        )
+        source = TEST_DATA / "cleanup-webdav.bin"
+        source.write_bytes(b"remote")
+
+        async def exercise() -> None:
+            with patch.object(storage, "webdav_client_manager", manager):
+                await destination.upload_file(source, "same-chat/2026/08/file.bin")
+                await destination.delete_file("same-chat/2026/08/file.bin")
+                await destination.cleanup_empty_chat_tree("same-chat")
+                await manager.close()
+
+        asyncio.run(exercise())
+        self.assertNotIn("/dav/archive/root/same-chat", server.collections)
+        self.assertNotIn("/dav/archive/root/same-chat/2026", server.collections)
+        self.assertNotIn("/dav/archive/root/same-chat/2026/08", server.collections)
+        self.assertIn("/dav/archive/root", server.collections)
+        self.assertTrue(any(path == "/dav/archive/root/same-chat" and depth == "1" for path, depth in server.propfind_depths))
+        self.assertTrue(any(path == "/dav/archive/root/same-chat/2026/08" and depth == "0" for path, depth in server.propfind_depths))
+
+    def test_webdav_cleanup_preserves_nonempty_and_rejects_ambiguous_listing(self) -> None:
+        server = MockWebDAV()
+        blocked = "/dav/archive/root/blocked-chat"
+        server.collections.update({blocked, f"{blocked}/2026", f"{blocked}/2026/08"})
+        server.files[f"{blocked}/2026/08/orphan.part"] = b"partial"
+
+        async def factory(_: Destination) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(server), follow_redirects=True)
+
+        manager = WebDAVClientManager(factory)
+        destination = Destination(
+            id=992,
+            name="cleanup-dav-blocked",
+            kind="WEBDAV",
+            webdav_url="https://dav.example.test/dav",
+            remote_root="archive/root",
+        )
+
+        async def exercise() -> None:
+            with patch.object(storage, "webdav_client_manager", manager):
+                await destination.cleanup_empty_chat_tree("blocked-chat")
+                self.assertIn(blocked, server.collections)
+                server.propfind_overrides[blocked] = 403
+                with self.assertRaisesRegex(StorageError, "权限不足"):
+                    await destination.cleanup_empty_chat_tree("blocked-chat")
+                server.propfind_overrides.pop(blocked)
+                server.propfind_bodies[blocked] = b"<not-xml"
+                with self.assertRaisesRegex(StorageError, "XML"):
+                    await destination.cleanup_empty_chat_tree("blocked-chat")
+                await manager.close()
+
+        asyncio.run(exercise())
+
+    def test_archive_chat_guard_serializes_same_physical_chat_namespace(self) -> None:
+        destination = Destination(id=993, name="lock-local", kind="LOCAL", local_root=TEST_DATA / "lock-local")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        active = 0
+        maximum = 0
+
+        async def worker() -> None:
+            nonlocal active, maximum
+            async with main.archive_chat_guard(destination, "same-chat"):
+                active += 1
+                maximum = max(maximum, active)
+                entered.set()
+                await release.wait()
+                active -= 1
+
+        async def exercise() -> None:
+            first = asyncio.create_task(worker())
+            await entered.wait()
+            second = asyncio.create_task(worker())
+            await asyncio.sleep(0)
+            self.assertEqual(active, 1)
+            release.set()
+            await asyncio.gather(first, second)
+
+        asyncio.run(exercise())
+        self.assertEqual(maximum, 1)
 
     def test_webdav_permission_and_missing_service_errors_are_actionable(self) -> None:
         source = TEST_DATA / "permission-probe.bin"
