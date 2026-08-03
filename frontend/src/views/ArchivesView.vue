@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
-import { CalendarDays, Download, FileAudio, FileText, Filter, Image, Search, Video, X } from 'lucide-vue-next'
+import { CalendarDays, FileAudio, FileText, Filter, Image, Search, Video, X } from 'lucide-vue-next'
 import { api, apiResourceUrl, type ArchiveItem, type Destination } from '../api'
+import MediaViewer, { type MediaViewerItem } from '../components/MediaViewer.vue'
 
 type ArchiveDay = { key: string; label: string; fullLabel: string; year: number; items: ArchiveItem[] }
 type ArchiveMonth = { key: string; label: string; year: number; items: ArchiveItem[]; days: ArchiveDay[] }
@@ -13,7 +14,8 @@ const selectedChat = ref('')
 const selectedType = ref('')
 const selectedDestination = ref('')
 const selected = ref<ArchiveItem | null>(null)
-const mediaFailed = ref(false)
+const selectionError = ref('')
+const selectionLoading = ref(false)
 const loading = ref(true)
 const activeDayKey = ref('')
 const hoveredDayKey = ref<string | null>(null)
@@ -73,6 +75,26 @@ const focusedDayKey = computed(() => hoveredDayKey.value ?? activeDayKey.value)
 const focusedDay = computed(() => archiveDays.value.find((day) => day.key === focusedDayKey.value) ?? archiveDays.value[0] ?? null)
 const activeFilterCount = computed(() => Number(Boolean(selectedChat.value)) + Number(Boolean(selectedType.value)) + Number(Boolean(selectedDestination.value)))
 const archiveTypes = ['', 'PHOTO', 'VIDEO', 'AUDIO', 'DOCUMENT']
+const selectedIndex = computed(() => selected.value ? items.value.findIndex((item) => item.id === selected.value?.id) : -1)
+const viewerItem = computed<MediaViewerItem | null>(() => {
+  const item = selected.value
+  if (!item) return null
+  const canRender = ['PHOTO', 'VIDEO'].includes(item.media_type)
+  return {
+    id: `archive-${item.id}`,
+    filename: item.filename,
+    mediaType: item.media_type,
+    mimeType: item.mime_type,
+    sizeBytes: item.size_bytes,
+    messageDate: item.message_date,
+    chatTitle: item.chat_title,
+    destinationName: item.destination?.name ?? '本地归档',
+    sourceLabel: `${mediaLabel[item.media_type] || item.media_type} · 已归档`,
+    contentUrl: canRender ? resource(item.content_url) : null,
+    downloadUrl: resource(item.download_url),
+  }
+})
+const viewerError = computed(() => selectionError.value || (selected.value && !['PHOTO', 'VIDEO'].includes(selected.value.media_type) ? '此归档文件没有可用的浏览器预览。' : null))
 
 async function load() {
   loading.value = true
@@ -107,15 +129,29 @@ async function clearFilters() {
 
 async function select(item: ArchiveItem) {
   const requestId = ++selectionRequestId
-  mediaFailed.value = false
-  const detail = await api.archiveDetail(item.id)
-  if (requestId === selectionRequestId) selected.value = detail
+  selectionError.value = ''
+  selectionLoading.value = true
+  selected.value = item
+  try {
+    const detail = await api.archiveDetail(item.id)
+    if (requestId === selectionRequestId) selected.value = detail
+  } catch (reason) {
+    if (requestId === selectionRequestId) selectionError.value = reason instanceof Error ? reason.message : '无法读取媒体详情'
+  } finally {
+    if (requestId === selectionRequestId) selectionLoading.value = false
+  }
+}
+
+function navigateSelection(direction: -1 | 1) {
+  const next = items.value[selectedIndex.value + direction]
+  if (next) void select(next)
 }
 
 function close() {
   selectionRequestId += 1
   selected.value = null
-  mediaFailed.value = false
+  selectionError.value = ''
+  selectionLoading.value = false
 }
 
 function setDayAnchor(key: string, element: Element | ComponentPublicInstance | null) {
@@ -306,6 +342,6 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </section>
-    <section v-if="selected" class="media-lightbox" role="dialog" aria-modal="true" :aria-label="`${selected.filename} 预览`" @click.self="close"><button class="lightbox-close" aria-label="关闭预览" @click="close"><X :size="24" /></button><div class="lightbox-panel"><div class="lightbox-media"><img v-if="selected.media_type === 'PHOTO' && selected.content_url && !mediaFailed" :src="resource(selected.content_url) ?? undefined" :alt="selected.filename" @error="mediaFailed = true" /><video v-else-if="selected.media_type === 'VIDEO' && selected.content_url && !mediaFailed" :src="resource(selected.content_url) ?? undefined" controls playsinline @error="mediaFailed = true" /><div v-else class="lightbox-fallback"><Image v-if="selected.media_type === 'PHOTO'" :size="46" /><Video v-else-if="selected.media_type === 'VIDEO'" :size="46" /><FileText v-else :size="46" /><p>{{ selected.media_type === 'VIDEO' && mediaFailed ? '此视频无法在当前浏览器播放' : '此文件没有可用的浏览器预览' }}</p></div></div><div class="lightbox-meta"><div><span class="eyebrow">{{ mediaLabel[selected.media_type] }} · 已归档</span><h2>{{ selected.filename }}</h2><p>{{ selected.chat_title }} · {{ formattedDate(selected.message_date) }} · {{ bytes(selected.size_bytes) }}</p></div><a class="quiet-button" :href="resource(selected.download_url) ?? undefined"><Download :size="17" />下载原文件</a></div></div></section>
+    <MediaViewer :open="Boolean(selected)" :item="viewerItem" :loading="selectionLoading" :error="viewerError" :has-previous="selectedIndex > 0" :has-next="selectedIndex >= 0 && selectedIndex < items.length - 1" @close="close" @previous="navigateSelection(-1)" @next="navigateSelection(1)" />
   </main>
 </template>
