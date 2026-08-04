@@ -406,6 +406,18 @@ input:focus-visible, select:focus-visible { outline-offset: 2px; }
 .active-task + .task-section { margin-top: 35px; }
 .task-new-button { white-space: nowrap; }
 
+.setting-form-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: end; gap: 18px; }
+.setting-form-row > label { width: 100%; min-width: 0; }
+.setting-form-row > div:last-child { grid-column: 3; min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 13px; }
+.setting-form-row > div:last-child button { flex: 0 0 auto; }
+.setting-form-row > div:last-child small { order: -1; min-width: 0; margin-top: 0; }
+
+@media (max-width: 767px) {
+  .setting-form-row { display: flex; align-items: stretch; flex-direction: column; }
+  .setting-form-row > div:last-child { width: 100%; display: flex; align-items: center; justify-content: stretch; flex-wrap: wrap; gap: 13px; }
+  .setting-form-row > div:last-child button { flex: 1 1 120px; }
+}
+
 /* Source media filter toolbar: group related controls before introducing
    responsive compression. The toolbar may grow vertically; controls never
    need to become too narrow to remain on one line. */
