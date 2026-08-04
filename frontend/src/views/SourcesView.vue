@@ -347,7 +347,6 @@ onBeforeUnmount(() => {
 
 <template>
   <div :class="['source-page', `source-panel-${sourcePanel}`]">
-    <div class="page-head source-head"><div><p class="eyebrow">Telegram 来源浏览</p><h1>群组与频道</h1><p class="subhead">选择媒体后会创建可暂停、可重试的下载任务。</p></div></div>
     <div v-if="sourcesError" class="form-error" role="alert">无法读取群组与频道：{{ sourcesError }} <button class="quiet-button" type="button" :disabled="loadingSources" @click="loadSources">{{ loadingSources ? '正在重试…' : '重试加载' }}</button></div>
     <p v-if="error" class="form-error" role="alert">{{ error }}</p>
     <p v-if="successTaskId" class="success-note source-success">已加入下载队列。<RouterLink :to="`/tasks/${successTaskId}`">查看任务详情</RouterLink></p>
