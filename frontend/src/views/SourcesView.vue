@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Archive, Check, ChevronRight, Download, FileAudio, FileText, Image, LoaderCircle, Play, RefreshCw, Search, Video, X } from 'lucide-vue-next'
+import { Archive, Check, ChevronDown, ChevronRight, ChevronUp, Download, FileAudio, FileText, Image, LoaderCircle, Play, RefreshCw, Search, Video, X } from 'lucide-vue-next'
 import { api, apiResourceUrl, type Chat, type ChatListSnapshot, type Destination, type SourceMedia, type SourcePreview } from '../api'
 import { clearChatCache, readChatCache, writeChatCache } from '../chatCache'
 import { isCurrentSourceRequest, retainSourceChatSelection, shouldPreloadSourceMedia } from '../sourcePreload'
@@ -32,6 +32,7 @@ const preview = ref<SourcePreview | null>(null)
 const previewRequestError = ref('')
 const successTaskId = ref<number | null>(null)
 const sourcePanel = ref<'media' | 'sources' | 'selection'>('sources')
+const filtersExpanded = ref(false)
 const mediaScroll = ref<HTMLElement | null>(null)
 const loadSentinel = ref<HTMLElement | null>(null)
 let previewTimer: number | null = null
@@ -53,6 +54,12 @@ const groupedItems = computed(() => items.value.reduce<Record<string, SourceMedi
 
 const bytes = (value: number) => value >= 1_000_000_000 ? `${(value / 1_000_000_000).toFixed(1)} GB` : value >= 1_000_000 ? `${(value / 1_000_000).toFixed(value >= 100_000_000 ? 0 : 1)} MB` : `${Math.max(1, Math.round(value / 1_000))} KB`
 const typeLabel: Record<string, string> = { PHOTO: '图片', VIDEO: '视频', AUDIO: '音频', DOCUMENT: '文件' }
+const filterDestinationLabel = computed(() => destinations.value.find((destination) => destination.id === selectedDestinationId.value)?.name ?? '未指定')
+const filterMediaLabel = computed(() => mediaType.value ? typeLabel[mediaType.value] || mediaType.value : '全部')
+const filterDateLabel = computed(() => {
+  if (!dateStart.value && !dateEnd.value) return '不限日期'
+  return `${dateStart.value || '不限起始'} 至 ${dateEnd.value || '不限结束'}`
+})
 const resource = (path: string | null) => apiResourceUrl(path)
 const viewerItems = computed(() => items.value.filter((item) => !item.archived && !item.queued))
 const previewIndex = computed(() => previewItem.value ? viewerItems.value.findIndex((item) => item.message_id === previewItem.value?.message_id) : -1)
@@ -352,30 +359,48 @@ onBeforeUnmount(() => {
             <div><span class="eyebrow">{{ currentChat.type === 'CHANNEL' ? '频道' : '群组' }}</span><h2>{{ currentChat.title }}</h2></div>
             <div class="source-title-actions"><span>{{ items.length }} 项已载入</span><button class="quiet-button mobile-source-switch" type="button" @click="sourcePanel = 'sources'">切换来源</button></div>
           </header>
-          <div class="source-filters" role="region" aria-label="媒体筛选">
-            <fieldset class="filter-group filter-group-destination">
-              <legend>归档目标</legend>
-              <label class="filter-control filter-select-control">
-                <select v-model.number="selectedDestinationId" aria-label="归档目标" @change="changeDestination">
-                  <option v-for="destination in destinations" :key="destination.id" :value="destination.id">{{ destination.name }}</option>
-                </select>
-              </label>
-            </fieldset>
-            <fieldset class="filter-group filter-group-media">
-              <legend>媒体类型</legend>
-              <div class="type-filters" role="group" aria-label="媒体类型">
-                <button v-for="type in ['', 'PHOTO', 'VIDEO', 'DOCUMENT']" :key="type" type="button" :class="{ selected: mediaType === type }" :aria-pressed="mediaType === type" @click="changeMediaType(type)">{{ type ? typeLabel[type] : '全部' }}</button>
+          <section class="source-filter-toolbar" aria-label="媒体筛选">
+            <div class="source-filter-toolbar-head">
+              <div class="source-filter-summary" aria-label="当前筛选条件">
+                <span class="source-filter-summary-title">筛选</span>
+                <span class="source-filter-summary-item"><b>目标</b><span>{{ filterDestinationLabel }}</span></span>
+                <span class="source-filter-summary-item"><b>类型</b><span>{{ filterMediaLabel }}</span></span>
+                <span class="source-filter-summary-item"><b>日期</b><span>{{ filterDateLabel }}</span></span>
               </div>
-            </fieldset>
-            <fieldset class="filter-group filter-group-date">
-              <legend>日期范围</legend>
-              <div class="filter-date-fields">
-                <label class="filter-date-field"><span>开始</span><input v-model="dateStart" aria-label="开始日期" type="date" @change="changeDateFilter" /></label>
-                <span class="filter-date-separator" aria-hidden="true">至</span>
-                <label class="filter-date-field"><span>结束</span><input v-model="dateEnd" aria-label="结束日期" type="date" @change="changeDateFilter" /></label>
+              <button class="source-filter-toggle" type="button" :aria-expanded="filtersExpanded" aria-controls="source-filter-panel" :aria-label="filtersExpanded ? '收起媒体筛选' : '展开媒体筛选'" @click="filtersExpanded = !filtersExpanded">
+                <span>{{ filtersExpanded ? '收起筛选' : '展开筛选' }}</span>
+                <ChevronUp v-if="filtersExpanded" :size="16" aria-hidden="true" /><ChevronDown v-else :size="16" aria-hidden="true" />
+              </button>
+            </div>
+            <Transition name="source-filter-panel">
+              <div v-if="filtersExpanded" id="source-filter-panel" class="source-filter-body">
+                <div class="source-filters" role="region" aria-label="媒体筛选控件">
+                  <fieldset class="filter-group filter-group-destination">
+                    <legend>归档目标</legend>
+                    <label class="filter-control filter-select-control">
+                      <select v-model.number="selectedDestinationId" aria-label="归档目标" @change="changeDestination">
+                        <option v-for="destination in destinations" :key="destination.id" :value="destination.id">{{ destination.name }}</option>
+                      </select>
+                    </label>
+                  </fieldset>
+                  <fieldset class="filter-group filter-group-media">
+                    <legend>媒体类型</legend>
+                    <div class="type-filters" role="group" aria-label="媒体类型">
+                      <button v-for="type in ['', 'PHOTO', 'VIDEO', 'DOCUMENT']" :key="type" type="button" :class="{ selected: mediaType === type }" :aria-pressed="mediaType === type" @click="changeMediaType(type)">{{ type ? typeLabel[type] : '全部' }}</button>
+                    </div>
+                  </fieldset>
+                  <fieldset class="filter-group filter-group-date">
+                    <legend>日期范围</legend>
+                    <div class="filter-date-fields">
+                      <label class="filter-date-field"><span>开始</span><input v-model="dateStart" aria-label="开始日期" type="date" @change="changeDateFilter" /></label>
+                      <span class="filter-date-separator" aria-hidden="true">至</span>
+                      <label class="filter-date-field"><span>结束</span><input v-model="dateEnd" aria-label="结束日期" type="date" @change="changeDateFilter" /></label>
+                    </div>
+                  </fieldset>
+                </div>
               </div>
-            </fieldset>
-          </div>
+            </Transition>
+          </section>
           <section ref="mediaScroll" class="source-media-scroll">
             <section v-if="loading" class="loading-block">正在读取媒体时间流…</section>
             <section v-else-if="mediaError && !items.length" class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>媒体时间流加载失败</h2><p>{{ mediaError }}</p><button class="quiet-button" type="button" @click="load()">重试加载</button></section>
