@@ -95,7 +95,7 @@ onMounted(async () => { await load() })
 </script>
 
 <template>
-  <div class="page-head"><div><p class="eyebrow">今日概览 · 2026 年 7 月 30 日</p><h1>任务中心</h1></div><RouterLink v-if="props.appState?.accountConnected" to="/tasks/new" class="primary-button"><Plus :size="18" />新建归档</RouterLink></div>
+  <h1 class="sr-only">任务中心</h1>
   <p v-if="error" class="form-error" role="alert">{{ error }}</p>
   <section v-if="!props.appState?.accountConnected" class="empty-state">
     <div class="empty-icon"><Wifi :size="28" /></div><span class="eyebrow">{{ props.appState?.connectionStatus === 'invalid' ? '登录状态已失效' : '服务已就绪' }}</span><h2>{{ props.appState?.connectionStatus === 'invalid' ? '请重新连接 Telegram' : '连接 Telegram 后开始归档' }}</h2><p>{{ props.appState?.connectionStatus === 'invalid' ? 'Telegram 不再接受本服务的登录会话。归档文件不会受影响，重新连接即可继续使用。' : '你的 API 凭据已保存。连接账号后，即可选择已加入的聊天并安全下载媒体。' }}</p><button class="primary-button" @click="loginOpen = true"><Cloud :size="18" />{{ props.appState?.connectionStatus === 'invalid' ? '重新连接 Telegram' : '连接 Telegram' }}</button>
@@ -110,7 +110,7 @@ onMounted(async () => { await load() })
       <div class="current-file"><span>当前文件：<b>{{ activeTask.current_file }}</b></span><div><RouterLink :to="`/tasks/${activeTask.id}`" class="quiet-button">查看详情</RouterLink><button class="quiet-button" @click="taskAction(activeTask, 'pause')"><Pause :size="16" />暂停</button><button class="danger-button" :disabled="deleting" @click="requestSingleDelete(activeTask.id)"><Trash2 :size="16" />删除任务</button></div></div>
     </section>
     <section v-if="loading" class="loading-block">正在读取任务…</section>
-    <section v-else class="task-section"><div class="section-title"><h2>最近任务</h2><span>{{ recentTasks.length }} 个任务</span></div><div class="task-list">
+    <section v-else class="task-section"><div class="section-title"><div><h2>最近任务</h2><span>{{ recentTasks.length }} 个任务</span></div><RouterLink v-if="props.appState?.accountConnected" to="/tasks/new" class="primary-button task-new-button"><Plus :size="18" />新建归档</RouterLink></div><div class="task-list">
       <div v-for="task in recentTasks" :key="task.id" class="task-row" :class="{ selected: isSelected(task.id) }"><label class="selection-checkbox"><input type="checkbox" :checked="isSelected(task.id)" :aria-label="`选择任务 ${task.chat_title}`" :disabled="deleting" @change="toggleTask(task.id)" /><span></span></label><RouterLink :to="`/tasks/${task.id}`" class="task-row-link"><span :class="['task-dot', statusClass(task.status)]"></span><div class="task-main"><b>{{ task.chat_title }}</b><small>{{ task.chat_handle || 'Telegram 聊天' }}</small></div><span>{{ task.completed_count.toLocaleString() }} 文件</span><span>{{ bytes(task.total_bytes) }}</span><span :class="['status-text', statusClass(task.status)]">{{ statusLabel[task.status] }}</span><ArrowRight :size="17" /></RouterLink><button class="task-row-delete" type="button" :disabled="deleting" :aria-label="`删除任务 ${task.chat_title}`" @click="requestSingleDelete(task.id)"><Trash2 :size="17" /></button></div>
     </div></section>
   </template>
