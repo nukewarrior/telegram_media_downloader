@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Archive, Check, ChevronDown, ChevronRight, ChevronUp, Download, FileAudio, FileText, Image, LoaderCircle, Play, RefreshCw, Search, Video, X } from 'lucide-vue-next'
 import { api, apiResourceUrl, type Chat, type ChatListSnapshot, type Destination, type SourceMedia, type SourcePreview } from '../api'
@@ -35,6 +35,8 @@ const sourcePanel = ref<'media' | 'sources' | 'selection'>('sources')
 const filtersExpanded = ref(false)
 const mediaScroll = ref<HTMLElement | null>(null)
 const loadSentinel = ref<HTMLElement | null>(null)
+const basketDestination = ref<HTMLSelectElement | null>(null)
+const selectionLauncher = ref<HTMLButtonElement | null>(null)
 let previewTimer: number | null = null
 let thumbnailTimer: number | null = null
 let loadObserver: IntersectionObserver | null = null
@@ -54,7 +56,6 @@ const groupedItems = computed(() => items.value.reduce<Record<string, SourceMedi
 
 const bytes = (value: number) => value >= 1_000_000_000 ? `${(value / 1_000_000_000).toFixed(1)} GB` : value >= 1_000_000 ? `${(value / 1_000_000).toFixed(value >= 100_000_000 ? 0 : 1)} MB` : `${Math.max(1, Math.round(value / 1_000))} KB`
 const typeLabel: Record<string, string> = { PHOTO: '图片', VIDEO: '视频', AUDIO: '音频', DOCUMENT: '文件' }
-const filterDestinationLabel = computed(() => destinations.value.find((destination) => destination.id === selectedDestinationId.value)?.name ?? '未指定')
 const filterMediaLabel = computed(() => mediaType.value ? typeLabel[mediaType.value] || mediaType.value : '全部')
 const filterDateLabel = computed(() => {
   if (!dateStart.value && !dateEnd.value) return '不限日期'
@@ -249,7 +250,6 @@ function changeMediaType(type: string) {
   void load()
 }
 function changeDateFilter() { void load() }
-function changeDestination() { selected.value = new Map(); void load() }
 function toggle(item: SourceMedia) {
   if (item.archived || item.queued) return
   const next = new Map(selected.value)
@@ -257,6 +257,11 @@ function toggle(item: SourceMedia) {
   selected.value = next
 }
 function selectedState(item: SourceMedia) { return selected.value.has(item.message_id) }
+watch(sourcePanel, async (panel, previousPanel) => {
+  await nextTick()
+  if (panel === 'selection') basketDestination.value?.focus()
+  else if (previousPanel === 'selection' && panel === 'media') selectionLauncher.value?.focus()
+})
 function closePanelOnEscape(event: KeyboardEvent) {
   if (event.key !== 'Escape') return
   if (previewItem.value) { void closePreview(); return }
@@ -362,7 +367,6 @@ onBeforeUnmount(() => {
             <div class="source-filter-toolbar-head">
               <div class="source-filter-summary" aria-label="当前筛选条件">
                 <span class="source-filter-summary-title">筛选</span>
-                <span class="source-filter-summary-item"><b>目标</b><span>{{ filterDestinationLabel }}</span></span>
                 <span class="source-filter-summary-item"><b>类型</b><span>{{ filterMediaLabel }}</span></span>
                 <span class="source-filter-summary-item"><b>日期</b><span>{{ filterDateLabel }}</span></span>
               </div>
@@ -374,14 +378,6 @@ onBeforeUnmount(() => {
             <Transition name="source-filter-panel">
               <div v-if="filtersExpanded" id="source-filter-panel" class="source-filter-body">
                 <div class="source-filters" role="region" aria-label="媒体筛选控件">
-                  <fieldset class="filter-group filter-group-destination">
-                    <legend>归档目标</legend>
-                    <label class="filter-control filter-select-control">
-                      <select v-model.number="selectedDestinationId" aria-label="归档目标" @change="changeDestination">
-                        <option v-for="destination in destinations" :key="destination.id" :value="destination.id">{{ destination.name }}</option>
-                      </select>
-                    </label>
-                  </fieldset>
                   <fieldset class="filter-group filter-group-media">
                     <legend>媒体类型</legend>
                     <div class="type-filters" role="group" aria-label="媒体类型">
@@ -424,9 +420,22 @@ onBeforeUnmount(() => {
         <template v-else-if="sourceChats.length"><section class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>请选择一个群组或频道</h2><p>从左侧选择会话后加载媒体缩略图。</p><button class="quiet-button mobile-source-switch" type="button" @click="sourcePanel = 'sources'">选择来源</button></section></template>
         <section v-else class="empty-state compact"><div class="empty-icon"><Archive :size="25" /></div><h2>没有可用来源</h2><p>连接 Telegram 后会显示已加入的群组与频道。</p></section>
       </main>
-      <aside class="selection-basket"><div class="selection-basket-head"><div><span class="eyebrow">待下载</span><h2>{{ selectedItems.length }} 项</h2></div><button class="quiet-button mobile-selection-close" type="button" aria-label="返回媒体列表" @click="sourcePanel = 'media'">返回</button></div><p>{{ selectedItems.length ? bytes(selectedBytes) : '从时间流中选择文件' }}</p><div v-if="selectedItems.length" class="basket-list"><button v-for="item in selectedItems" :key="item.message_id" type="button" @click="toggle(item)"><span>{{ item.filename }}</span><X :size="15" /></button></div><p v-else class="basket-empty">选择会跨日期和分页保留。</p><button class="primary-button wide" type="button" :disabled="!selectedItems.length" @click="queueSelection"><Download :size="17" />加入下载队列</button><small>文件按来源顺序加入统一下载队列。</small></aside>
+      <aside id="selection-basket" class="selection-basket">
+        <div class="selection-basket-head"><div><span class="eyebrow">待下载</span><h2>{{ selectedItems.length }} 项</h2></div><button class="quiet-button mobile-selection-close" type="button" aria-label="返回媒体列表" @click="sourcePanel = 'media'">返回</button></div>
+        <label class="basket-destination">
+          <span>归档目标</span>
+          <select ref="basketDestination" v-model.number="selectedDestinationId" aria-label="归档目标">
+            <option v-for="destination in destinations" :key="destination.id" :value="destination.id">{{ destination.name }}</option>
+          </select>
+        </label>
+        <p>{{ selectedItems.length ? bytes(selectedBytes) : '从时间流中选择文件' }}</p>
+        <div v-if="selectedItems.length" class="basket-list"><button v-for="item in selectedItems" :key="item.message_id" type="button" @click="toggle(item)"><span>{{ item.filename }}</span><X :size="15" /></button></div>
+        <p v-else class="basket-empty">选择会跨日期和分页保留。</p>
+        <button class="primary-button wide" type="button" :disabled="!selectedItems.length" @click="queueSelection"><Download :size="17" />加入下载队列</button>
+        <small>文件按来源顺序加入统一下载队列。</small>
+      </aside>
     </section>
-    <button v-if="selectedItems.length" class="selection-launcher primary-button" type="button" @click="sourcePanel = 'selection'"><span>已选 {{ selectedItems.length }} 项 · {{ bytes(selectedBytes) }}</span><span>查看并继续</span></button>
+    <button v-if="selectedItems.length" ref="selectionLauncher" class="selection-launcher primary-button" type="button" aria-controls="selection-basket" :aria-expanded="sourcePanel === 'selection'" @click="sourcePanel = 'selection'"><span>已选 {{ selectedItems.length }} 项 · {{ bytes(selectedBytes) }}</span><span>查看并继续</span></button>
     <MediaViewer :open="Boolean(previewItem)" :item="previewViewerItem" :loading="previewLoading" :error="previewError" :status-detail="previewStatusDetail" :has-previous="previewIndex > 0" :has-next="previewIndex >= 0 && previewIndex < viewerItems.length - 1" @close="closePreview" @previous="navigatePreview(-1)" @next="navigatePreview(1)" />
   </div>
 </template>
